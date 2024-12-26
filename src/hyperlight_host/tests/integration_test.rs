@@ -22,7 +22,7 @@ use hyperlight_host::mem::memory_region::MemoryRegionFlags;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
-use hyperlight_host::{GuestBinary, HyperlightError, SingleUseSandbox, UninitializedSandbox};
+use hyperlight_host::{GuestBinary, HyperlightError, UninitializedSandbox};
 use hyperlight_testing::{c_simple_guest_as_string, simple_guest_as_string};
 
 pub mod common; // pub to disable dead_code warning
@@ -33,7 +33,7 @@ fn print_four_args_c_guest() {
     let path = c_simple_guest_as_string().unwrap();
     let guest_path = GuestBinary::FilePath(path);
     let uninit = UninitializedSandbox::new(guest_path, None, None, None);
-    let sbox1: SingleUseSandbox = uninit.unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1.call_guest_function_by_name(
         "PrintFourArgs",
@@ -52,7 +52,7 @@ fn print_four_args_c_guest() {
 // Checks that guest can abort with a specific code.
 #[test]
 fn guest_abort() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
     let error_code: u8 = 13; // this is arbitrary
     let res = sbox1
         .call_guest_function_by_name(
@@ -69,7 +69,7 @@ fn guest_abort() {
 
 #[test]
 fn guest_abort_with_context1() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
         .call_guest_function_by_name(
@@ -89,7 +89,7 @@ fn guest_abort_with_context1() {
 
 #[test]
 fn guest_abort_with_context2() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     // The buffer size for the panic context is 1024 bytes.
     // This test will see what happens if the panic message is longer than that
@@ -147,7 +147,7 @@ fn guest_abort_c_guest() {
     let path = c_simple_guest_as_string().unwrap();
     let guest_path = GuestBinary::FilePath(path);
     let uninit = UninitializedSandbox::new(guest_path, None, None, None);
-    let sbox1: SingleUseSandbox = uninit.unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
         .call_guest_function_by_name(
@@ -168,7 +168,7 @@ fn guest_abort_c_guest() {
 #[test]
 fn guest_panic() {
     // this test is rust-specific
-    let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
         .call_guest_function_by_name(
@@ -188,7 +188,7 @@ fn guest_panic() {
 #[test]
 fn guest_malloc() {
     // this test is rust-only
-    let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
     let size_to_allocate = 2000;
     let res = sbox1
@@ -203,7 +203,7 @@ fn guest_malloc() {
 
 #[test]
 fn guest_allocate_vec() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let size_to_allocate = 2000;
 
@@ -221,7 +221,7 @@ fn guest_allocate_vec() {
 // checks that malloc failures are captured correctly
 #[test]
 fn guest_malloc_abort() {
-    let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
     let size = 20000000; // some big number that should fail when allocated
 
@@ -251,7 +251,7 @@ fn guest_malloc_abort() {
         None,
     )
     .unwrap();
-    let sbox2: SingleUseSandbox = uninit.evolve(Noop::default()).unwrap();
+    let mut sbox2 = uninit.evolve(Noop::default()).unwrap();
 
     let res = sbox2.call_guest_function_by_name(
         "CallMalloc", // uses the rust allocator to allocate a vector on heap
@@ -269,7 +269,7 @@ fn guest_malloc_abort() {
 // checks that alloca works
 #[test]
 fn dynamic_stack_allocate() {
-    let sbox: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let bytes = 10_000; // some low number that can be allocated on stack
 
@@ -284,7 +284,7 @@ fn dynamic_stack_allocate() {
 // checks alloca fails with stackoverflow for large allocations
 #[test]
 fn dynamic_stack_allocate_overflow() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     // zero is handled as special case in guest,
     // will turn DEFAULT_GUEST_STACK_SIZE + 1
@@ -304,7 +304,7 @@ fn dynamic_stack_allocate_overflow() {
 // checks alloca fails with overflow when stack pointer overflows
 #[test]
 fn dynamic_stack_allocate_pointer_overflow() {
-    let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
     let bytes = 10 * 1024 * 1024; // 10Mb
 
     let res = sbox1
@@ -324,7 +324,7 @@ fn dynamic_stack_allocate_overflow_c_guest() {
     let path = c_simple_guest_as_string().unwrap();
     let guest_path = GuestBinary::FilePath(path);
     let uninit = UninitializedSandbox::new(guest_path, None, None, None);
-    let sbox1: SingleUseSandbox = uninit.unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let bytes = 0; // zero is handled as special case in guest, will turn into large number
 
@@ -342,7 +342,7 @@ fn dynamic_stack_allocate_overflow_c_guest() {
 // checks that a small buffer on stack works
 #[test]
 fn static_stack_allocate() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
         .call_guest_function_by_name("SmallVar", ReturnType::Int, Some(Vec::new()))
@@ -353,7 +353,7 @@ fn static_stack_allocate() {
 // checks that a huge buffer on stack fails with stackoverflow
 #[test]
 fn static_stack_allocate_overflow() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
     let res = sbox1
         .call_guest_function_by_name("LargeVar", ReturnType::Int, Some(Vec::new()))
         .unwrap_err();
@@ -363,7 +363,7 @@ fn static_stack_allocate_overflow() {
 // checks that a recursive function with stack allocation works, (that chkstk can be called without overflowing)
 #[test]
 fn recursive_stack_allocate() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let iterations = 1;
 
@@ -397,7 +397,7 @@ fn guard_page_check() {
     for offset in offsets_from_page_guard_start {
         // we have to create a sandbox each iteration because can't reuse after MMIO error in release mode
 
-        let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+        let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
         let result = sbox1.call_guest_function_by_name(
             "test_write_raw_ptr",
             ReturnType::String,
@@ -418,7 +418,7 @@ fn guard_page_check() {
 #[test]
 fn guard_page_check_2() {
     // this test is rust-guest only
-    let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
     let result = sbox1
         .call_guest_function_by_name("InfiniteRecursion", ReturnType::Void, Some(vec![]))
@@ -428,7 +428,7 @@ fn guard_page_check_2() {
 
 #[test]
 fn execute_on_stack() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let result = sbox1
         .call_guest_function_by_name("ExecuteOnStack", ReturnType::String, Some(vec![]))
@@ -453,7 +453,7 @@ fn execute_on_stack() {
 #[test]
 #[ignore] // ran from Justfile because requires feature "executable_heap"
 fn execute_on_heap() {
-    let sbox1: SingleUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
     let result =
         sbox1.call_guest_function_by_name("ExecuteOnHeap", ReturnType::String, Some(vec![]));
 
@@ -478,7 +478,7 @@ fn execute_on_heap() {
 // checks that a recursive function with stack allocation eventually fails with stackoverflow
 #[test]
 fn recursive_stack_allocate_overflow() {
-    let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let iterations = 10;
 
@@ -563,7 +563,7 @@ fn log_message() {
 
 fn log_test_messages() {
     for level in log::LevelFilter::iter() {
-        let sbox1: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+        let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
         let message = format!("Hello from log_message level {}", level as i32);
         sbox1

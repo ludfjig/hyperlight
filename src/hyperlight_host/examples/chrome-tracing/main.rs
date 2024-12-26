@@ -36,9 +36,6 @@ fn main() -> Result<()> {
     let usandbox =
         UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_path), None, None, None)?;
 
-    // NOTE: if replacing MultiUseSandbox with SingleUseSandbox, the function call will take ~50x longer because the drop
-    // happens inside `call_guest_function_by_name` rather than at the end of of this `main` block.
-
     let mut sbox = usandbox
         .evolve(Noop::<UninitializedSandbox, MultiUseSandbox>::default())
         .unwrap();

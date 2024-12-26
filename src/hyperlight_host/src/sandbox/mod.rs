@@ -23,9 +23,6 @@ pub(crate) mod hypervisor;
 /// Functionality for dealing with initialized sandboxes that can
 /// call 0 or more guest functions
 pub mod initialized_multi_use;
-/// Functionality for dealing with initialized sandboxes that can
-/// call 0 or 1 guest functions, but no more
-pub mod initialized_single_use;
 /// A container to leak, store and manage outb handlers for in-process
 /// executions. On non-in-process executions (e.g. windows without
 /// in-process mode turned on, or linux), the same container is just
@@ -57,8 +54,6 @@ use std::collections::HashMap;
 pub use config::SandboxConfiguration;
 /// Re-export for the `MultiUseSandbox` type
 pub use initialized_multi_use::MultiUseSandbox;
-/// Re-export for `SingleUseSandbox` type
-pub use initialized_single_use::SingleUseSandbox;
 /// Re-export for `SandboxRunOptions` type
 pub use run_options::SandboxRunOptions;
 use tracing::{instrument, Span};

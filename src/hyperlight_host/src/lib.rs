@@ -101,9 +101,6 @@ pub use sandbox::uninitialized::GuestBinary;
 pub use sandbox::MultiUseSandbox;
 /// The re-export for the `SandboxRunOptions` type
 pub use sandbox::SandboxRunOptions;
-/// A sandbox that can be used at most once to call a guest function, and
-/// then must be discarded.
-pub use sandbox::SingleUseSandbox;
 /// The re-export for the `UninitializedSandbox` type
 pub use sandbox::UninitializedSandbox;
 

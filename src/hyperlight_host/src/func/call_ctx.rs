@@ -20,7 +20,7 @@ use hyperlight_common::flatbuffer_wrappers::function_types::{
 use tracing::{instrument, Span};
 
 use super::guest_dispatch::call_function_on_guest;
-use crate::{MultiUseSandbox, Result, SingleUseSandbox};
+use crate::{MultiUseSandbox, Result};
 /// A context for calling guest functions.
 ///
 /// Takes ownership of an existing `MultiUseSandbox`.
@@ -99,100 +99,6 @@ impl MultiUseGuestCallContext {
     }
 }
 
-/// A context for calling guest functions. Can only be created from an existing
-/// `SingleUseSandbox`, and once created, guest functions against that sandbox
-/// can be made from this until it is dropped.
-#[derive(Debug)]
-pub struct SingleUseGuestCallContext {
-    sbox: SingleUseSandbox,
-}
-
-impl SingleUseGuestCallContext {
-    /// Take ownership  of a `SingleUseSandbox` and
-    /// return a new `SingleUseGuestCallContext` instance.
-    ///     
-    #[instrument(skip_all, parent = Span::current())]
-    pub(crate) fn start(sbox: SingleUseSandbox) -> Self {
-        Self { sbox }
-    }
-
-    /// Call the guest function called `func_name` with the given arguments
-    /// `args`, and expect the return value have the same type as
-    /// `func_ret_type`.
-    ///
-    /// Once the call is complete, the 'SingleUseSandbox' will no longer be useable and a new one will need to be created.
-    ///
-    /// Rather than call this method directly, consider using the `call_guest_function_by_name` method on the `SingleUseSandbox`
-
-    #[instrument(err(Debug),skip(self, args),parent = Span::current())]
-    pub(crate) fn call(
-        mut self,
-        func_name: &str,
-        func_ret_type: ReturnType,
-        args: Option<Vec<ParameterValue>>,
-    ) -> Result<ReturnValue> {
-        self.call_internal(func_name, func_ret_type, args)
-    }
-
-    // Internal call function that takes a mutable reference to self
-    // This function allows a SingleUseMultiGuestCallContext to be used to make multiple calls to guest functions
-    // before it is no longer usable.
-    #[instrument(skip_all, parent = Span::current())]
-    fn call_internal(
-        &mut self,
-        func_name: &str,
-        func_ret_type: ReturnType,
-        args: Option<Vec<ParameterValue>>,
-    ) -> Result<ReturnValue> {
-        // We are guaranteed to be holding a lock now, since `self` can't
-        // exist without doing so. since GuestCallContext is effectively
-        // !Send (and !Sync), we also don't need to worry about
-        // synchronization
-
-        call_function_on_guest(&mut self.sbox, func_name, func_ret_type, args)
-    }
-
-    /// This function allows for a `SingleUseSandbox` to be used to make multiple calls to guest functions before it is dropped.
-    ///
-    /// The function is passed a callback function that it then callsd with a reference to a 'SingleUseMultiGuestCallContext'
-    /// that can be used to make multiple calls to guest functions.
-    ///
-    pub fn call_from_func<
-        Fn: FnOnce(&mut SingleUseMultiGuestCallContext) -> Result<ReturnValue>,
-    >(
-        self,
-        f: Fn,
-    ) -> Result<ReturnValue> {
-        let mut ctx = SingleUseMultiGuestCallContext::new(self);
-        f(&mut ctx)
-    }
-}
-
-/// A context for making multiple calls to guest functions in a SingleUseSandbox. Can only be created
-/// from an existing SingleUseGuestCallContext using the `call_using_closure` method.
-/// Once created, calls to guest functions may be made through this context until it is dropped.
-/// Once dropped the underlying `SingleUseGuestCallContext` and associated `SingleUseSandbox` will be dropped
-pub struct SingleUseMultiGuestCallContext {
-    call_context: SingleUseGuestCallContext,
-}
-
-impl SingleUseMultiGuestCallContext {
-    fn new(call_context: SingleUseGuestCallContext) -> Self {
-        Self { call_context }
-    }
-
-    /// Call the guest function called `func_name` with the given arguments
-    pub fn call(
-        &mut self,
-        func_name: &str,
-        func_ret_type: ReturnType,
-        args: Option<Vec<ParameterValue>>,
-    ) -> Result<ReturnValue> {
-        self.call_context
-            .call_internal(func_name, func_ret_type, args)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
@@ -203,81 +109,15 @@ mod tests {
     };
     use hyperlight_testing::simple_guest_as_string;
 
-    use crate::func::call_ctx::SingleUseMultiGuestCallContext;
     use crate::sandbox_state::sandbox::EvolvableSandbox;
     use crate::sandbox_state::transition::Noop;
-    use crate::{
-        GuestBinary, HyperlightError, MultiUseSandbox, Result, SingleUseSandbox,
-        UninitializedSandbox,
-    };
+    use crate::{GuestBinary, HyperlightError, MultiUseSandbox, Result, UninitializedSandbox};
 
     fn new_uninit() -> Result<UninitializedSandbox> {
         let path = simple_guest_as_string().map_err(|e| {
             HyperlightError::Error(format!("failed to get simple guest path ({e:?})"))
         })?;
         UninitializedSandbox::new(GuestBinary::FilePath(path), None, None, None)
-    }
-
-    /// Test to create a `SingleUseSandbox`, then call several guest
-    /// functions sequentially.
-    #[test]
-    fn singleusesandbox_single_call() {
-        let calls = [
-            (
-                "StackAllocate",
-                ReturnType::Int,
-                Some(vec![ParameterValue::Int(1)]),
-                ReturnValue::Int(1),
-            ),
-            (
-                "CallMalloc",
-                ReturnType::Int,
-                Some(vec![ParameterValue::Int(200)]),
-                ReturnValue::Int(200),
-            ),
-        ];
-
-        for call in calls.iter() {
-            let sbox: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
-            let ctx = sbox.new_call_context();
-            let res = ctx.call(call.0, call.1, call.2.clone()).unwrap();
-            assert_eq!(call.3, res);
-        }
-    }
-
-    #[test]
-    fn singleusesandbox_multi_call() {
-        let calls = [
-            (
-                "StackAllocate",
-                ReturnType::Int,
-                Some(vec![ParameterValue::Int(1)]),
-                ReturnValue::Int(1),
-            ),
-            (
-                "CallMalloc",
-                ReturnType::Int,
-                Some(vec![ParameterValue::Int(200)]),
-                ReturnValue::Int(200),
-            ),
-        ];
-
-        let sbox: SingleUseSandbox = new_uninit().unwrap().evolve(Noop::default()).unwrap();
-        let ctx = sbox.new_call_context();
-
-        let callback_closure = |ctx: &mut SingleUseMultiGuestCallContext| {
-            let mut res: ReturnValue = ReturnValue::Int(0);
-            for call in calls.iter() {
-                res = ctx
-                    .call(call.0, call.1, call.2.clone())
-                    .expect("failed to call guest function");
-                assert_eq!(call.3, res);
-            }
-            Ok(res)
-        };
-
-        let res = ctx.call_from_func(callback_closure).unwrap();
-        assert_eq!(calls.last().unwrap().3, res);
     }
 
     /// Test to create a `MultiUseSandbox`, then call several guest functions

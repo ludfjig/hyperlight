@@ -111,15 +111,13 @@ mod tests {
     use hyperlight_testing::{callback_guest_as_string, simple_guest_as_string};
 
     use super::*;
-    use crate::func::call_ctx::{MultiUseGuestCallContext, SingleUseGuestCallContext};
+    use crate::func::call_ctx::MultiUseGuestCallContext;
     use crate::func::host_functions::HostFunction0;
     use crate::sandbox::is_hypervisor_present;
     use crate::sandbox::uninitialized::GuestBinary;
     use crate::sandbox_state::sandbox::EvolvableSandbox;
     use crate::sandbox_state::transition::Noop;
-    use crate::{
-        new_error, HyperlightError, MultiUseSandbox, Result, SingleUseSandbox, UninitializedSandbox,
-    };
+    use crate::{new_error, HyperlightError, MultiUseSandbox, Result, UninitializedSandbox};
 
     // simple function
     fn test_function0(_: MultiUseGuestCallContext) -> Result<i32> {
@@ -129,7 +127,7 @@ mod tests {
     struct GuestStruct;
 
     // function that return type unsupported by the host
-    fn test_function1(_: SingleUseGuestCallContext) -> Result<GuestStruct> {
+    fn test_function1(_: MultiUseGuestCallContext) -> Result<GuestStruct> {
         Ok(GuestStruct)
     }
 
@@ -246,7 +244,7 @@ mod tests {
         // test_function1
         {
             let usbox = uninitialized_sandbox();
-            let sandbox: SingleUseSandbox = usbox
+            let sandbox: MultiUseSandbox = usbox
                 .evolve(Noop::default())
                 .expect("Failed to initialize sandbox");
             let result = test_function1(sandbox.new_call_context());

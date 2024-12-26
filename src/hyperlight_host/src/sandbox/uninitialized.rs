@@ -25,7 +25,7 @@ use tracing::{instrument, Span};
 use super::host_funcs::{default_writer_func, HostFuncsWrapper};
 use super::mem_mgr::MemMgrWrapper;
 use super::run_options::SandboxRunOptions;
-use super::uninitialized_evolve::{evolve_impl_multi_use, evolve_impl_single_use};
+use super::uninitialized_evolve::evolve_impl_multi_use;
 use crate::error::HyperlightError::GuestBinaryShouldBeAFile;
 use crate::func::host_functions::HostFunction1;
 use crate::mem::exe::ExeInfo;
@@ -34,9 +34,7 @@ use crate::mem::shared_mem::ExclusiveSharedMemory;
 use crate::sandbox::SandboxConfiguration;
 use crate::sandbox_state::sandbox::EvolvableSandbox;
 use crate::sandbox_state::transition::Noop;
-use crate::{
-    log_build_details, log_then_return, new_error, MultiUseSandbox, Result, SingleUseSandbox,
-};
+use crate::{log_build_details, log_then_return, new_error, MultiUseSandbox, Result};
 
 /// A preliminary `Sandbox`, not yet ready to execute guest code.
 ///
@@ -81,20 +79,6 @@ impl crate::sandbox_state::sandbox::Sandbox for UninitializedSandbox {
         log_then_return!(
             "Checking the stack cookie before the sandbox is initialized is unsupported"
         );
-    }
-}
-
-impl
-    EvolvableSandbox<
-        UninitializedSandbox,
-        SingleUseSandbox,
-        Noop<UninitializedSandbox, SingleUseSandbox>,
-    > for UninitializedSandbox
-{
-    /// Evolve `self` to a `SingleUseSandbox` without any additional metadata.
-    #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-    fn evolve(self, _: Noop<UninitializedSandbox, SingleUseSandbox>) -> Result<SingleUseSandbox> {
-        evolve_impl_single_use(self)
     }
 }
 

@@ -31,7 +31,7 @@ use crate::sandbox::mem_access::mem_access_handler_wrapper;
 use crate::sandbox::outb::outb_handler_wrapper;
 use crate::sandbox::{HostSharedMemory, MemMgrWrapper};
 use crate::sandbox_state::sandbox::Sandbox;
-use crate::{new_error, MultiUseSandbox, Result, SingleUseSandbox, UninitializedSandbox};
+use crate::{new_error, MultiUseSandbox, Result, UninitializedSandbox};
 
 /// The implementation for evolving `UninitializedSandbox`es to
 /// `Sandbox`es.
@@ -87,16 +87,6 @@ pub(super) fn evolve_impl_multi_use(u_sbox: UninitializedSandbox) -> Result<Mult
             hshm.as_mut().push_state()?;
         }
         Ok(MultiUseSandbox::from_uninit(hf, hshm, hv_handler))
-    })
-}
-
-#[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-pub(super) fn evolve_impl_single_use(u_sbox: UninitializedSandbox) -> Result<SingleUseSandbox> {
-    evolve_impl(u_sbox, |_hf, hshm, hv_handler| {
-        // Its intentional not to snapshot state here. This is because
-        // single use sandboxes are not reusable and so there is no need
-        // to snapshot state as they cannot be devolved back to an uninitialized sandbox.
-        Ok(SingleUseSandbox::from_uninit(hshm, hv_handler))
     })
 }
 

@@ -17,8 +17,7 @@ limitations under the License.
 use tracing::{instrument, Span};
 
 /// Configuration options for setting up a new `UninitializedSandbox` and
-/// subsequent inititialized sandboxes, including `MultiUseSandbox` and
-/// `SingleUseSandbox`.
+/// subsequent inititialized sandboxes, including `MultiUseSandbox`.
 ///
 /// A `SandboxRunOptions` instance must be created with either in-process
 /// or in-hypervisor execution mode, and then can optionally be augmented
