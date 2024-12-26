@@ -1071,6 +1071,7 @@ dependencies = [
  "buddy_system_allocator",
  "cc",
  "cfg-if",
+ "glob",
  "hyperlight-common",
  "log",
  "serde_json",
