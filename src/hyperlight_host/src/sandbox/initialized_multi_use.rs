@@ -163,9 +163,9 @@ impl MultiUseSandbox {
         func_ret_type: ReturnType,
         args: Option<Vec<ParameterValue>>,
     ) -> Result<ReturnValue> {
-        let res = call_function_on_guest(self, func_name, func_ret_type, args)?;
+        let res = call_function_on_guest(self, func_name, func_ret_type, args);
         self.restore_state()?;
-        Ok(res)
+        res
     }
 
     /// Restore the Sandbox's state

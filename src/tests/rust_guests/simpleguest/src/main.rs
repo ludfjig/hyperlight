@@ -665,6 +665,16 @@ fn get_static(function_call: &FunctionCall) -> Result<Vec<u8>> {
     }
 }
 
+fn add_to_static_and_fail(_: &FunctionCall) -> Result<Vec<u8>> {
+    unsafe {
+        COUNTER += 10;
+    };
+    Err(HyperlightGuestError::new(
+        ErrorCode::GuestError,
+        "Crash on purpose".to_string(),
+    ))
+}
+
 fn violate_seccomp_filters(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if function_call.parameters.is_none() {
         call_host_function("MakeGetpidSyscall", None, ReturnType::ULong)?;
@@ -1036,6 +1046,7 @@ pub extern "C" fn hyperlight_main() {
         add_to_static as i64,
     );
     register_function(add_to_static_def);
+
     let get_static_def = GuestFunctionDefinition::new(
         "GetStatic".to_string(),
         Vec::new(),
@@ -1043,6 +1054,14 @@ pub extern "C" fn hyperlight_main() {
         get_static as i64,
     );
     register_function(get_static_def);
+
+    let add_to_static_and_fail_def = GuestFunctionDefinition::new(
+        "AddToStaticAndFail".to_string(),
+        Vec::new(),
+        ReturnType::Int,
+        add_to_static_and_fail as i64,
+    );
+    register_function(add_to_static_and_fail_def);
 
     let violate_seccomp_filters_def = GuestFunctionDefinition::new(
         "ViolateSeccompFilters".to_string(),
