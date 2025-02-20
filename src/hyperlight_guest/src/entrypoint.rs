@@ -40,11 +40,6 @@ pub fn halt() {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn abort() -> ! {
-    abort_with_code(0)
-}
-
 pub fn abort_with_code(code: i32) -> ! {
     outb(OutBAction::Abort as u16, code as u8);
     unreachable!()

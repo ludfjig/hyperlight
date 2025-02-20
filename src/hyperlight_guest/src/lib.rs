@@ -43,7 +43,6 @@ pub mod host_function_call;
 pub mod host_functions;
 
 pub(crate) mod guest_logger;
-pub mod memory;
 pub mod print;
 pub(crate) mod security_check;
 pub mod setjmp;
@@ -51,6 +50,9 @@ pub mod setjmp;
 pub mod chkstk;
 pub mod error;
 pub mod logging;
+
+#[cfg(feature = "libc")]
+pub mod libc;
 
 // Unresolved symbols
 ///cbindgen:ignore

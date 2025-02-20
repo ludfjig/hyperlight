@@ -1159,6 +1159,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperlight-libc"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "glob",
+ "hyperlight-common",
+ "hyperlight-guest",
+]
+
+[[package]]
 name = "hyperlight-testing"
 version = "0.0.0"
 dependencies = [

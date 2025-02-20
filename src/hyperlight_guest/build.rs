@@ -237,61 +237,61 @@ fn find_next(root_dir: &Path, tool_name: &str) -> PathBuf {
     panic!("Could not find another implementation of {}", tool_name);
 }
 
-fn main() -> std::process::ExitCode {
-    let exe = env::current_exe().expect("expected program name");
-    let name = Path::file_name(exe.as_ref()).expect("program name should not be directory");
-    let tool: Tool = name.into();
-    if tool == Tool::CargoBuildScript {
-        cargo_main();
-        return std::process::ExitCode::SUCCESS;
-    }
-    let exe_abs = fs::canonicalize(&exe).expect("program name should be possible to canonicalize");
-    let root_dir = exe_abs
-        .parent()
-        .expect("program name should be in a directory");
-    let out_dir = std::fs::read_to_string(root_dir.join(".out_dir"))
-        .expect(".out_dir should have a valid path in it");
-    let mut args = env::args();
-    args.next(); // ignore the exe name
-    let include_dir = <String as AsRef<Path>>::as_ref(&out_dir).join("include");
-    match tool {
-        Tool::Ml64 => std::process::Command::new("llvm-ml")
-            .arg("-m64")
-            .args(args)
-            .status()
-            .ok()
-            .and_then(|x| (x.code()))
-            .map(|x| (x as u8).into())
-            .unwrap_or(std::process::ExitCode::FAILURE),
-        Tool::Clang => std::process::Command::new(find_next(root_dir, "clang"))
-            // terrible hack, see above
-            .arg("--target=x86_64-unknown-linux-none")
-            .args([
-                // We don't support stack protectors at the moment, but Arch Linux clang
-                // auto-enables them for -linux platforms, so explicitly disable them.
-                "-fno-stack-protector",
-                "-fstack-clash-protection",
-                "-mstack-probe-size=4096",
-            ])
-            .arg("-nostdinc")
-            .arg("-isystem")
-            .arg(include_dir)
-            .args(args)
-            .status()
-            .ok()
-            .and_then(|x| (x.code()))
-            .map(|x| (x as u8).into())
-            .unwrap_or(std::process::ExitCode::FAILURE),
-        Tool::ClangCl => std::process::Command::new(find_next(root_dir, "clang-cl"))
-            .arg("-nostdinc")
-            .arg("/external:I")
-            .arg(include_dir)
-            .args(args)
-            .status()
-            .ok()
-            .and_then(|x| (x.code()))
-            .map(|x| (x as u8).into())
-            .unwrap_or(std::process::ExitCode::FAILURE),
-        _ => std::process::ExitCode::FAILURE,
-    }
+fn main() {
+    // let exe = env::current_exe().expect("expected program name");
+    // let name = Path::file_name(exe.as_ref()).expect("program name should not be directory");
+    // let tool: Tool = name.into();
+    // if tool == Tool::CargoBuildScript {
+    //     cargo_main();
+    //     return std::process::ExitCode::SUCCESS;
+    // }
+    // let exe_abs = fs::canonicalize(&exe).expect("program name should be possible to canonicalize");
+    // let root_dir = exe_abs
+    //     .parent()
+    //     .expect("program name should be in a directory");
+    // let out_dir = std::fs::read_to_string(root_dir.join(".out_dir"))
+    //     .expect(".out_dir should have a valid path in it");
+    // let mut args = env::args();
+    // args.next(); // ignore the exe name
+    // let include_dir = <String as AsRef<Path>>::as_ref(&out_dir).join("include");
+    // match tool {
+    //     Tool::Ml64 => std::process::Command::new("llvm-ml")
+    //         .arg("-m64")
+    //         .args(args)
+    //         .status()
+    //         .ok()
+    //         .and_then(|x| (x.code()))
+    //         .map(|x| (x as u8).into())
+    //         .unwrap_or(std::process::ExitCode::FAILURE),
+    //     Tool::Clang => std::process::Command::new(find_next(root_dir, "clang"))
+    //         // terrible hack, see above
+    //         .arg("--target=x86_64-unknown-linux-none")
+    //         .args([
+    //             // We don't support stack protectors at the moment, but Arch Linux clang
+    //             // auto-enables them for -linux platforms, so explicitly disable them.
+    //             "-fno-stack-protector",
+    //             "-fstack-clash-protection",
+    //             "-mstack-probe-size=4096",
+    //         ])
+    //         .arg("-nostdinc")
+    //         .arg("-isystem")
+    //         .arg(include_dir)
+    //         .args(args)
+    //         .status()
+    //         .ok()
+    //         .and_then(|x| (x.code()))
+    //         .map(|x| (x as u8).into())
+    //         .unwrap_or(std::process::ExitCode::FAILURE),
+    //     Tool::ClangCl => std::process::Command::new(find_next(root_dir, "clang-cl"))
+    //         .arg("-nostdinc")
+    //         .arg("/external:I")
+    //         .arg(include_dir)
+    //         .args(args)
+    //         .status()
+    //         .ok()
+    //         .and_then(|x| (x.code()))
+    //         .map(|x| (x as u8).into())
+    //         .unwrap_or(std::process::ExitCode::FAILURE),
+    //     _ => std::process::ExitCode::FAILURE,
+    // }
 }

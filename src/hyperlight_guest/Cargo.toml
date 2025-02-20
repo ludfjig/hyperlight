@@ -1,6 +1,5 @@
 [package]
 name = "hyperlight-guest"
-links = "c"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +12,8 @@ Library to build guest applications for hyperlight.
 """
 
 [features]
-default = ["libc", "printf"]
+default = ["core", "libc", "printf"]
+core = [] # compile hl-guest specific code
 libc = [] # compile musl libc
 printf = [] # compile printf
 
