@@ -94,7 +94,7 @@ impl FunctionRegistry {
     /// and `Err` otherwise.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     #[allow(dead_code)]
-    pub(super) fn host_print(&mut self, msg: String) -> Result<i32> {
+    pub(super) fn host_print(&mut self, msg: &str) -> Result<i32> {
         let res = self.call_host_func_impl("HostPrint", vec![ParameterValue::String(msg)])?;
         res.try_into()
             .map_err(|_| HostFunctionNotFound("HostPrint".to_string()))
@@ -136,7 +136,7 @@ impl FunctionRegistry {
 
 /// The default writer function is to write to stdout with green text.
 #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-pub(super) fn default_writer_func(s: String) -> Result<i32> {
+pub(super) fn default_writer_func<'a>(s: &'a str) -> Result<i32> {
     match std::io::stdout().is_terminal() {
         false => {
             print!("{}", s);

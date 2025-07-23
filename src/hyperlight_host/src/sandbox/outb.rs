@@ -280,7 +280,7 @@ pub(crate) fn handle_outb(
         OutBAction::CallFunction => {
             let call = mem_mgr.as_mut().get_host_function_call()?; // pop output buffer
             let name = call.function_name.clone();
-            let args: Vec<ParameterValue> = call.parameters.unwrap_or(vec![]);
+            let args: Vec<ParameterValue<'_>> = call.parameters.unwrap_or(vec![]);
             let res = host_funcs
                 .try_lock()
                 .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?

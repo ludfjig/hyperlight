@@ -115,9 +115,7 @@ mod tests {
                 assert!(interrupt_handle.kill());
             });
 
-            multi
-                .call::<i32>("PrintOutput", "Hello".to_string())
-                .unwrap();
+            multi.call::<i32>("PrintOutput", "Hello").unwrap();
 
             multi.call::<i32>("Spin", ()).unwrap_err();
             thread.join().unwrap();

@@ -19,8 +19,6 @@ use alloc::vec::Vec;
 
 use anyhow::{Error, Result, bail};
 use flatbuffers::{WIPOffset, size_prefixed_root};
-#[cfg(feature = "tracing")]
-use tracing::{Span, instrument};
 
 use super::function_types::{ParameterValue, ReturnType};
 use crate::flatbuffers::hyperlight::generated::{
@@ -42,21 +40,20 @@ pub enum FunctionCallType {
 
 /// `Functioncall` represents a call to a function in the guest or host.
 #[derive(Clone)]
-pub struct FunctionCall {
+pub struct FunctionCall<'a> {
     /// The function name
     pub function_name: String,
     /// The parameters for the function call.
-    pub parameters: Option<Vec<ParameterValue>>,
+    pub parameters: Option<Vec<ParameterValue<'a>>>,
     function_call_type: FunctionCallType,
     /// The return type of the function call
     pub expected_return_type: ReturnType,
 }
 
-impl FunctionCall {
-    #[cfg_attr(feature = "tracing", instrument(skip_all, parent = Span::current(), level= "Trace"))]
+impl<'a> FunctionCall<'a> {
     pub fn new(
         function_name: String,
-        parameters: Option<Vec<ParameterValue>>,
+        parameters: Option<Vec<ParameterValue<'a>>>,
         function_call_type: FunctionCallType,
         expected_return_type: ReturnType,
     ) -> Self {
@@ -74,7 +71,6 @@ impl FunctionCall {
     }
 }
 
-#[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
 pub fn validate_guest_function_call_buffer(function_call_buffer: &[u8]) -> Result<()> {
     let guest_function_call_fb = size_prefixed_root::<FbFunctionCall>(function_call_buffer)
         .map_err(|e| anyhow::anyhow!("Error reading function call buffer: {:?}", e))?;
@@ -86,7 +82,6 @@ pub fn validate_guest_function_call_buffer(function_call_buffer: &[u8]) -> Resul
     }
 }
 
-#[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
 pub fn validate_host_function_call_buffer(function_call_buffer: &[u8]) -> Result<()> {
     let host_function_call_fb = size_prefixed_root::<FbFunctionCall>(function_call_buffer)
         .map_err(|e| anyhow::anyhow!("Error reading function call buffer: {:?}", e))?;
@@ -98,10 +93,9 @@ pub fn validate_host_function_call_buffer(function_call_buffer: &[u8]) -> Result
     }
 }
 
-impl TryFrom<&[u8]> for FunctionCall {
+impl<'a> TryFrom<&'a [u8]> for FunctionCall<'a> {
     type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: &[u8]) -> Result<Self> {
+    fn try_from(value: &'a [u8]) -> Result<Self> {
         let function_call_fb = size_prefixed_root::<FbFunctionCall>(value)
             .map_err(|e| anyhow::anyhow!("Error reading function call buffer: {:?}", e))?;
         let function_name = function_call_fb.function_name();
@@ -132,10 +126,9 @@ impl TryFrom<&[u8]> for FunctionCall {
     }
 }
 
-impl TryFrom<FunctionCall> for Vec<u8> {
+impl<'a> TryFrom<FunctionCall<'a>> for Vec<u8> {
     type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: FunctionCall) -> Result<Vec<u8>> {
+    fn try_from(value: FunctionCall<'a>) -> Result<Vec<u8>> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         let function_name = builder.create_string(&value.function_name);
 
@@ -235,7 +228,7 @@ impl TryFrom<FunctionCall> for Vec<u8> {
                         }
                         ParameterValue::String(s) => {
                             let hlstring = {
-                                let val = builder.create_string(s.as_str());
+                                let val = builder.create_string(s);
                                 hlstring::create(&mut builder, &hlstringArgs { value: Some(val) })
                             };
                             let parameter = Parameter::create(
@@ -306,11 +299,11 @@ mod tests {
         let test_data: Vec<u8> = FunctionCall::new(
             "PrintTwelveArgs".to_string(),
             Some(vec![
-                ParameterValue::String("1".to_string()),
+                ParameterValue::String("1"),
                 ParameterValue::Int(2),
                 ParameterValue::Long(3),
-                ParameterValue::String("4".to_string()),
-                ParameterValue::String("5".to_string()),
+                ParameterValue::String("4"),
+                ParameterValue::String("5"),
                 ParameterValue::Bool(true),
                 ParameterValue::Bool(false),
                 ParameterValue::UInt(8),
@@ -331,11 +324,11 @@ mod tests {
         let parameters = function_call.parameters.unwrap();
         assert_eq!(parameters.len(), 12);
         let expected_parameters = vec![
-            ParameterValue::String("1".to_string()),
+            ParameterValue::String("1"),
             ParameterValue::Int(2),
             ParameterValue::Long(3),
-            ParameterValue::String("4".to_string()),
-            ParameterValue::String("5".to_string()),
+            ParameterValue::String("4"),
+            ParameterValue::String("5"),
             ParameterValue::Bool(true),
             ParameterValue::Bool(false),
             ParameterValue::UInt(8),

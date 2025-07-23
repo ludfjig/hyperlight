@@ -313,7 +313,7 @@ impl UninitializedSandbox {
     }
 
     /// Registers a host function that the guest can call.
-    pub fn register<Args: ParameterTuple, Output: SupportedReturnType>(
+    pub fn register<Args: for<'a> ParameterTuple<'a>, Output: SupportedReturnType>(
         &mut self,
         name: impl AsRef<str>,
         host_func: impl Into<HostFunction<Output, Args>>,
@@ -327,7 +327,7 @@ impl UninitializedSandbox {
     /// that will be permitted when the function handler runs.
     #[cfg(all(feature = "seccomp", target_os = "linux"))]
     pub fn register_with_extra_allowed_syscalls<
-        Args: ParameterTuple,
+        Args: for<'a> ParameterTuple<'a>,
         Output: SupportedReturnType,
     >(
         &mut self,
@@ -344,9 +344,9 @@ impl UninitializedSandbox {
     /// This overrides the default behavior of writing to stdout.
     /// The function expects the signature `FnMut(String) -> i32`
     /// and will be called when the guest wants to print output.
-    pub fn register_print(
+    pub fn register_print<Args: for<'a> ParameterTuple<'a>, Output: SupportedReturnType>(
         &mut self,
-        print_func: impl Into<HostFunction<i32, (String,)>>,
+        print_func: impl Into<HostFunction<Output, Args>>,
     ) -> Result<()> {
         #[cfg(not(all(target_os = "linux", feature = "seccomp")))]
         self.register("HostPrint", print_func)?;
@@ -366,9 +366,12 @@ impl UninitializedSandbox {
     /// Like [`register_print`](Self::register_print), but allows specifying extra syscalls
     /// that will be permitted during function execution.
     #[cfg(all(feature = "seccomp", target_os = "linux"))]
-    pub fn register_print_with_extra_allowed_syscalls(
+    pub fn register_print_with_extra_allowed_syscalls<
+        Args: for<'a> ParameterTuple<'a>,
+        Output: SupportedReturnType,
+    >(
         &mut self,
-        print_func: impl Into<HostFunction<i32, (String,)>>,
+        print_func: impl Into<HostFunction<Output, Args>>,
         extra_allowed_syscalls: impl IntoIterator<Item = crate::sandbox::ExtraAllowedSyscall>,
     ) -> Result<()> {
         #[cfg(all(target_os = "linux", feature = "seccomp"))]
@@ -434,7 +437,7 @@ mod tests {
         let mut sandbox: MultiUseSandbox = uninitialized_sandbox.evolve().unwrap();
 
         let res = sandbox
-            .call::<Vec<u8>>("ReadFromUserMemory", (4u64, buffer.to_vec()))
+            .call::<Vec<u8>>("ReadFromUserMemory", (4u64, &buffer[..]))
             .expect("Failed to call ReadFromUserMemory");
 
         assert_eq!(res, buffer.to_vec());
@@ -573,9 +576,8 @@ mod tests {
         // incorrect arguments register + call
         {
             let mut usbox = uninitialized_sandbox();
-
             usbox
-                .register("test2", |msg: String| {
+                .register("test2", |msg: &str| {
                     println!("test2 called: {}", msg);
                     Ok(())
                 })
@@ -645,7 +647,7 @@ mod tests {
 
         assert!(host_funcs.is_ok());
 
-        host_funcs.unwrap().host_print("test".to_string()).unwrap();
+        host_funcs.unwrap().host_print("test").unwrap();
 
         drop(sandbox);
 
@@ -712,7 +714,7 @@ mod tests {
 
         // writer as a function
 
-        fn fn_writer(msg: String) -> Result<i32> {
+        fn fn_writer(msg: &str) -> Result<i32> {
             assert_eq!(msg, "test2");
             Ok(0)
         }
@@ -734,7 +736,7 @@ mod tests {
 
         assert!(host_funcs.is_ok());
 
-        host_funcs.unwrap().host_print("test2".to_string()).unwrap();
+        host_funcs.unwrap().host_print("test2").unwrap();
 
         // writer as a method
 
@@ -761,7 +763,7 @@ mod tests {
 
         assert!(host_funcs.is_ok());
 
-        host_funcs.unwrap().host_print("test3".to_string()).unwrap();
+        host_funcs.unwrap().host_print("test3").unwrap();
     }
 
     struct TestHostPrint {}
@@ -771,7 +773,7 @@ mod tests {
             TestHostPrint {}
         }
 
-        fn write(&mut self, msg: String) -> Result<i32> {
+        fn write(&mut self, msg: &str) -> Result<i32> {
             assert_eq!(msg, "test3");
             Ok(0)
         }
@@ -819,7 +821,10 @@ mod tests {
 
                     host_funcs
                         .unwrap()
-                        .host_print(format!("Print from UninitializedSandbox on Thread {}\n", i))
+                        .host_print(&format!(
+                            "Print from UninitializedSandbox on Thread {}\n",
+                            i
+                        ))
                         .unwrap();
 
                     let sandbox = uninitialized_sandbox.evolve().unwrap_or_else(|_| {
@@ -854,7 +859,7 @@ mod tests {
 
                     host_funcs
                         .unwrap()
-                        .host_print(format!("Print from Sandbox on Thread {}\n", i))
+                        .host_print(&format!("Print from Sandbox on Thread {}\n", i))
                         .unwrap();
                 })
             })

@@ -189,8 +189,8 @@ pub enum HyperlightError {
     NoMemorySnapshot,
 
     /// Failed to get value from parameter value
-    #[error("Failed To Convert Parameter Value {0:?} to {1:?}")]
-    ParameterValueConversionFailure(ParameterValue, &'static str),
+    #[error("Failed To Convert Parameter Value to {0:?}")]
+    ParameterValueConversionFailure(&'static str),
 
     /// a failure occurred processing a PE file
     #[error("Failure processing PE File {0:?}")]
@@ -248,8 +248,8 @@ pub enum HyperlightError {
     UnexpectedNoOfArguments(usize, usize),
 
     /// The parameter value type is unexpected
-    #[error("The parameter value type is unexpected got {0:?} expected {1:?}")]
-    UnexpectedParameterValueType(ParameterValue, String),
+    #[error("The parameter value type is unexpected, expected {0:?}")]
+    UnexpectedParameterValueType(String),
 
     /// The return value type is unexpected
     #[error("The return value type is unexpected got {0:?} expected {1:?}")]

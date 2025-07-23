@@ -28,7 +28,7 @@ use crate::{Result, new_error};
 ///
 pub trait Registerable {
     /// Register a primitive host function
-    fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
+    fn register_host_function<Args: for<'a> ParameterTuple<'a>, Output: SupportedReturnType>(
         &mut self,
         name: &str,
         hf: impl Into<HostFunction<Output, Args>>,
@@ -36,7 +36,10 @@ pub trait Registerable {
     /// Register a primitive host function whose worker thread has
     /// extra permissive seccomp filters installed
     #[cfg(all(feature = "seccomp", target_os = "linux"))]
-    fn register_host_function_with_syscalls<Args: ParameterTuple, Output: SupportedReturnType>(
+    fn register_host_function_with_syscalls<
+        Args: for<'a> ParameterTuple<'a>,
+        Output: SupportedReturnType,
+    >(
         &mut self,
         name: &str,
         hf: impl Into<HostFunction<Output, Args>>,
@@ -44,7 +47,7 @@ pub trait Registerable {
     ) -> Result<()>;
 }
 impl Registerable for UninitializedSandbox {
-    fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
+    fn register_host_function<Args: for<'a> ParameterTuple<'a>, Output: SupportedReturnType>(
         &mut self,
         name: &str,
         hf: impl Into<HostFunction<Output, Args>>,
@@ -64,7 +67,10 @@ impl Registerable for UninitializedSandbox {
         (*hfs).register_host_function(name.to_string(), entry, self.mgr.unwrap_mgr_mut())
     }
     #[cfg(all(feature = "seccomp", target_os = "linux"))]
-    fn register_host_function_with_syscalls<Args: ParameterTuple, Output: SupportedReturnType>(
+    fn register_host_function_with_syscalls<
+        Args: for<'a> ParameterTuple<'a>,
+        Output: SupportedReturnType,
+    >(
         &mut self,
         name: &str,
         hf: impl Into<HostFunction<Output, Args>>,
@@ -91,7 +97,7 @@ impl Registerable for UninitializedSandbox {
 #[derive(Clone)]
 pub struct HostFunction<Output, Args>
 where
-    Args: ParameterTuple,
+    Args: for<'a> ParameterTuple<'a>,
     Output: SupportedReturnType,
 {
     // This is a thin wrapper around a `Fn(Args) -> Result<Output>`.
@@ -127,7 +133,7 @@ pub(crate) struct TypeErasedHostFunction {
 
 impl<Args, Output> HostFunction<Output, Args>
 where
-    Args: ParameterTuple,
+    Args: for<'a> ParameterTuple<'a>,
     Output: SupportedReturnType,
 {
     /// Call the host function with the given arguments.
@@ -144,12 +150,12 @@ impl TypeErasedHostFunction {
 
 impl<Args, Output> From<HostFunction<Output, Args>> for TypeErasedHostFunction
 where
-    Args: ParameterTuple,
+    Args: for<'a> ParameterTuple<'a>,
     Output: SupportedReturnType,
 {
     fn from(func: HostFunction<Output, Args>) -> TypeErasedHostFunction {
         TypeErasedHostFunction {
-            func: Box::new(move |args: Vec<ParameterValue>| {
+            func: Box::new(move |args: Vec<ParameterValue<'_>>| {
                 let args = Args::from_value(args)?;
                 Ok(func.call(args)?.into_value())
             }),
@@ -169,7 +175,7 @@ macro_rules! impl_host_function {
         impl<F, R, $($P),*> From<F> for HostFunction<R::ReturnType, ($($P,)*)>
         where
             F: FnMut($($P),*) -> R + Send + 'static,
-            ($($P,)*): ParameterTuple,
+            ($($P,)*): for<'a> ParameterTuple<'a>,
             R: ResultType,
         {
             fn from(mut func: F) -> HostFunction<R::ReturnType, ($($P,)*)> {
@@ -191,7 +197,10 @@ macro_rules! impl_host_function {
 
 for_each_tuple!(impl_host_function);
 
-pub(crate) fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
+pub(crate) fn register_host_function<
+    Args: for<'a> ParameterTuple<'a>,
+    Output: SupportedReturnType,
+>(
     func: impl Into<HostFunction<Output, Args>>,
     sandbox: &mut UninitializedSandbox,
     name: &str,

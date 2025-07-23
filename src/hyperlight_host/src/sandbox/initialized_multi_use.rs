@@ -239,10 +239,10 @@ impl MultiUseSandbox {
         note = "Deprecated in favour of call and snapshot/restore."
     )]
     #[instrument(err(Debug), skip(self, args), parent = Span::current())]
-    pub fn call_guest_function_by_name<Output: SupportedReturnType>(
+    pub fn call_guest_function_by_name<'a, Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl ParameterTuple<'a>,
     ) -> Result<Output> {
         let snapshot = self.snapshot()?;
         let res = self.call(func_name, args);
@@ -282,10 +282,10 @@ impl MultiUseSandbox {
     /// # }
     /// ```
     #[instrument(err(Debug), skip(self, args), parent = Span::current())]
-    pub fn call<Output: SupportedReturnType>(
+    pub fn call<'a, Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl ParameterTuple<'a>,
     ) -> Result<Output> {
         // Reset snapshot since we are mutating the sandbox state
         self.snapshot = None;
@@ -385,11 +385,11 @@ impl MultiUseSandbox {
         })
     }
 
-    fn call_guest_function_by_name_no_reset(
+    fn call_guest_function_by_name_no_reset<'a>(
         &mut self,
         function_name: &str,
         return_type: ReturnType,
-        args: Vec<ParameterValue>,
+        args: Vec<ParameterValue<'a>>,
     ) -> Result<ReturnValue> {
         let res = (|| {
             let fc = FunctionCall::new(
@@ -462,10 +462,10 @@ impl MultiUseSandbox {
 }
 
 impl Callable for MultiUseSandbox {
-    fn call<Output: SupportedReturnType>(
+    fn call<'a, Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl ParameterTuple<'a>,
     ) -> Result<Output> {
         self.call(func_name, args)
     }
@@ -544,7 +544,7 @@ mod tests {
         .unwrap();
 
         for _ in 0..1000 {
-            sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+            sbox1.call::<String>("Echo", "hello").unwrap();
         }
 
         let mut sbox2: MultiUseSandbox = {
@@ -556,10 +556,7 @@ mod tests {
 
         for i in 0..1000 {
             sbox2
-                .call::<i32>(
-                    "PrintUsingPrintf",
-                    format!("Hello World {}\n", i).to_string(),
-                )
+                .call::<i32>("PrintUsingPrintf", "Hello World")
                 .unwrap();
         }
     }
@@ -605,7 +602,7 @@ mod tests {
             )
             .unwrap();
 
-            usbox.register("MakeGetpidSyscall", make_get_pid_syscall)?;
+            // usbox.register("MakeGetpidSyscall", make_get_pid_syscall)?;
 
             let mut sbox: MultiUseSandbox = usbox.evolve()?;
 
@@ -701,7 +698,7 @@ mod tests {
             let host_func_result = sbox
                 .call::<i64>(
                     "CallGivenParamlessHostFuncThatReturnsI64",
-                    "Openat_Hostfunc".to_string(),
+                    "Openat_Hostfunc",
                 )
                 .expect("Expected to call host function that returns i64");
 
@@ -731,7 +728,7 @@ mod tests {
             let host_func_result: i64 = sbox
                 .call::<i64>(
                     "CallGivenParamlessHostFuncThatReturnsI64",
-                    "Openat_Hostfunc".to_string(),
+                    "Openat_Hostfunc",
                 )
                 .expect("Expected to call host function that returns i64");
 

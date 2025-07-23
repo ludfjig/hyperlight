@@ -34,7 +34,7 @@ use crate::flatbuffers::hyperlight::generated::{
 /// Supported parameter types with values for function calling.
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[derive(Debug, Clone, PartialEq)]
-pub enum ParameterValue {
+pub enum ParameterValue<'a> {
     /// i32
     Int(i32),
     /// u32
@@ -47,12 +47,12 @@ pub enum ParameterValue {
     Float(f32),
     /// f64
     Double(f64),
-    /// String
-    String(String),
     /// bool
     Bool(bool),
-    /// `Vec<u8>`
-    VecBytes(Vec<u8>),
+    /// String
+    String(&'a str),
+    /// Vec<u8>
+    VecBytes(&'a [u8]),
 }
 
 /// Supported parameter types for function calling.
@@ -132,9 +132,9 @@ pub enum ReturnType {
     VecBytes,
 }
 
-impl From<&ParameterValue> for ParameterType {
+impl<'a> From<&ParameterValue<'a>> for ParameterType {
     #[cfg_attr(feature = "tracing", instrument(skip_all, parent = Span::current(), level= "Trace"))]
-    fn from(value: &ParameterValue) -> Self {
+    fn from(value: &ParameterValue<'a>) -> Self {
         match *value {
             ParameterValue::Int(_) => ParameterType::Int,
             ParameterValue::UInt(_) => ParameterType::UInt,
@@ -149,11 +149,10 @@ impl From<&ParameterValue> for ParameterType {
     }
 }
 
-impl TryFrom<Parameter<'_>> for ParameterValue {
+impl<'a> TryFrom<Parameter<'a>> for ParameterValue<'a> {
     type Error = Error;
 
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(param: Parameter<'_>) -> Result<Self> {
+    fn try_from(param: Parameter<'a>) -> Result<Self> {
         let value = param.value_type();
         let result = match value {
             FbParameterValue::hlint => param
@@ -177,12 +176,14 @@ impl TryFrom<Parameter<'_>> for ParameterValue {
             FbParameterValue::hlbool => param
                 .value_as_hlbool()
                 .map(|hlbool| ParameterValue::Bool(hlbool.value())),
-            FbParameterValue::hlstring => param.value_as_hlstring().map(|hlstring| {
-                ParameterValue::String(hlstring.value().unwrap_or_default().to_string())
-            }),
-            FbParameterValue::hlvecbytes => param.value_as_hlvecbytes().map(|hlvecbytes| {
-                ParameterValue::VecBytes(hlvecbytes.value().unwrap_or_default().iter().collect())
-            }),
+            FbParameterValue::hlstring => param
+                .value_as_hlstring()
+                .and_then(|hlstring| hlstring.value())
+                .map(|s| ParameterValue::String(s)),
+            FbParameterValue::hlvecbytes => param
+                .value_as_hlvecbytes()
+                .and_then(|hlvecbytes| hlvecbytes.value())
+                .map(|bytes| ParameterValue::VecBytes(bytes.bytes())),
             other => {
                 bail!("Unexpected flatbuffer parameter value type: {:?}", other);
             }
@@ -269,7 +270,7 @@ impl TryFrom<FbReturnType> for ReturnType {
     }
 }
 
-impl TryFrom<ParameterValue> for i32 {
+impl TryFrom<ParameterValue<'_>> for i32 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -282,7 +283,7 @@ impl TryFrom<ParameterValue> for i32 {
     }
 }
 
-impl TryFrom<ParameterValue> for u32 {
+impl TryFrom<ParameterValue<'_>> for u32 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -295,7 +296,7 @@ impl TryFrom<ParameterValue> for u32 {
     }
 }
 
-impl TryFrom<ParameterValue> for i64 {
+impl TryFrom<ParameterValue<'_>> for i64 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -308,7 +309,7 @@ impl TryFrom<ParameterValue> for i64 {
     }
 }
 
-impl TryFrom<ParameterValue> for u64 {
+impl TryFrom<ParameterValue<'_>> for u64 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -321,7 +322,7 @@ impl TryFrom<ParameterValue> for u64 {
     }
 }
 
-impl TryFrom<ParameterValue> for f32 {
+impl TryFrom<ParameterValue<'_>> for f32 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -334,7 +335,7 @@ impl TryFrom<ParameterValue> for f32 {
     }
 }
 
-impl TryFrom<ParameterValue> for f64 {
+impl TryFrom<ParameterValue<'_>> for f64 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -347,20 +348,7 @@ impl TryFrom<ParameterValue> for f64 {
     }
 }
 
-impl TryFrom<ParameterValue> for String {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: ParameterValue) -> Result<Self> {
-        match value {
-            ParameterValue::String(v) => Ok(v),
-            _ => {
-                bail!("Unexpected parameter value type: {:?}", value)
-            }
-        }
-    }
-}
-
-impl TryFrom<ParameterValue> for bool {
+impl TryFrom<ParameterValue<'_>> for bool {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ParameterValue) -> Result<Self> {
@@ -373,10 +361,23 @@ impl TryFrom<ParameterValue> for bool {
     }
 }
 
-impl TryFrom<ParameterValue> for Vec<u8> {
+impl<'a> TryFrom<ParameterValue<'a>> for &'a str {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: ParameterValue) -> Result<Self> {
+    fn try_from(value: ParameterValue<'a>) -> Result<Self> {
+        match value {
+            ParameterValue::String(v) => Ok(v),
+            _ => {
+                bail!("Unexpected parameter value type: {:?}", value)
+            }
+        }
+    }
+}
+
+impl<'a> TryFrom<ParameterValue<'a>> for &'a [u8] {
+    type Error = Error;
+    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
+    fn try_from(value: ParameterValue<'a>) -> Result<Self> {
         match value {
             ParameterValue::VecBytes(v) => Ok(v),
             _ => {
