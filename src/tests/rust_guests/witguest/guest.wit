@@ -1,84 +1,19 @@
-package test:wit;
+/// Hyperlight WIT Demo - showcases bidirectional host-guest communication
+package hyperlight:greeting-demo;
 
-world test {
-  import roundtrip;
-  import host-resource;
-  export roundtrip;
-  export test-host-resource;
+world greeting-demo {
+  import time-service;
+  export greeting;
 }
 
-interface roundtrip {
-  roundtrip-bool: func(x: bool) -> bool;
-  roundtrip-s8: func(x: s8) -> s8;
-  roundtrip-s16: func(x: s16) -> s16;
-  roundtrip-s32: func(x: s32) -> s32;
-  roundtrip-s64: func(x: s64) -> s64;
-  roundtrip-u8: func(x: u8) -> u8;
-  roundtrip-u16: func(x: u16) -> u16;
-  roundtrip-u32: func(x: u32) -> u32;
-  roundtrip-u64: func(x: u64) -> u64;
-  roundtrip-f32: func(x: f32) -> f32;
-  roundtrip-f64: func(x: f64) -> f64;
-  roundtrip-char: func(x: char) -> char;
-  roundtrip-string: func(x: string) -> string;
-  roundtrip-list: func(x: list<u8>) -> list<u8>;
-  roundtrip-tuple: func(x: tuple<string, u8>) -> tuple<string, u8>;
-  roundtrip-option: func(x: option<string>) -> option<string>;
-  roundtrip-result: func(x: result<char, string>) -> result<char, string>;
-  roundtrip-no-result: func(x: u32);
-  roundtrip-fix-list: func(x: list<u8, 4>) -> list<u8, 4>;
-  roundtrip-fix-list-u32: func(x: list<u32, 4>) -> list<u32, 4>;
-  roundtrip-fix-list-u64: func(x: list<u64, 4>) -> list<u64, 4>;
-  roundtrip-fix-list-i8: func(x: list<s8, 4>) -> list<s8, 4>;
-  roundtrip-fix-list-i16: func(x: list<s16, 4>) -> list<s16, 4>;
-  roundtrip-fix-list-i32: func(x: list<s32, 4>) -> list<s32, 4>;
-  roundtrip-fix-list-i64: func(x: list<s64, 4>) -> list<s64, 4>;
-  roundtrip-fix-list-f32: func(x: list<f32, 4>) -> list<f32, 4>;
-  roundtrip-fix-list-f64: func(x: list<f64, 4>) -> list<f64, 4>;
-  roundtrip-fix-list-u8-size8: func(x: list<u8, 8>) -> list<u8, 8>;
-  roundtrip-fix-list-u64-size2: func(x: list<u64, 2>) -> list<u64, 2>;
-  roundtrip-fix-list-string: func(x: list<string, 4>) -> list<string, 4>;
-  roundtrip-fix-array-of-lists: func(x: list<list<u8>, 3>) -> list<list<u8>, 3>;
-  roundtrip-fix-array-of-string-lists: func(x: list<list<string>, 2>) -> list<list<string>, 2>;
-
-  record testrecord {
-    contents: string,
-    length: u64,
-  }
-  roundtrip-record: func(x: testrecord) -> testrecord;
-  flags smallflags {
-    flag-a,
-    flag-b,
-    flag-c,
-  }
-  roundtrip-flags-small: func(x: smallflags) -> smallflags;
-  flags largeflags {
-    flag00, flag01, flag02, flag03, flag04, flag05, flag06, flag07,
-    flag08, flag09, flag0a, flag0b, flag0c, flag0d, flag0e, flag0f,
-
-    flag10, flag11, flag12, flag13, flag14, flag15, flag16, flag17,
-    flag18, flag19, flag1a, flag1b, flag1c, flag1d, flag1e, flag1f,
-  }
-  roundtrip-flags-large: func(x: largeflags) -> largeflags;
-  variant testvariant {
-    variant-a, variant-b(string), variant-c(char),
-  }
-  roundtrip-variant: func(x: testvariant) -> testvariant;
-  enum testenum {
-    enum-a, enum-b, enum-c
-  }
-  roundtrip-enum: func(x: testenum) -> testenum;
+/// Host-provided time services
+interface time-service {
+  /// Get the current time as a formatted string
+  get-current-time: func() -> string;
 }
 
-interface host-resource {
-  resource testresource {
-    constructor(init1: string, init2: char);
-    append-char: func(x: char);
-  }
-  roundtrip-own: func(x: own<testresource>) -> own<testresource>;
-  return-own: func(x: own<testresource>);
-}
-
-interface test-host-resource {
-  test: func() -> bool;
+/// Guest-provided greeting functionality
+interface greeting {
+  /// Create a personalized greeting with current time from host
+  greet-user: func(username: string) -> string;
 }

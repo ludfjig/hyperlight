@@ -43,7 +43,7 @@ hyperlight-guest-tracing = { workspace = true, default-features = true, optional
 vmm-sys-util = "0.15.0"
 crossbeam-channel = "0.5.15"
 thiserror = "2.0.14"
-chrono = { version = "0.4", optional = true }
+chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 metrics = "0.24.2"
 serde_json = "1.0"
@@ -124,14 +124,14 @@ cfg_aliases = "0.2.1"
 built = { version = "0.8.0", optional = true, features = ["chrono", "git2"] }
 
 [features]
-default = ["kvm", "mshv3", "seccomp", "build-metadata", "init-paging"]
+default = ["kvm", "mshv3", "build-metadata", "init-paging"]
 seccomp = ["dep:seccompiler"]
 function_call_metrics = []
 executable_heap = []
 # This feature enables printing of debug information to stdout in debug builds
 print_debug = []
 # Dumps the VM state to a file on unexpected errors or crashes. The path of the file will be printed on stdout and logged.
-crashdump = ["dep:chrono"]
+crashdump = []
 trace_guest = ["hyperlight-common/trace_guest", "hyperlight-guest-tracing/trace"]
 # This feature enables unwinding the guest stack from the host, in
 # order to produce stack traces for debugging or profiling.

@@ -19,173 +19,28 @@ limitations under the License.
 
 extern crate alloc;
 extern crate hyperlight_guest;
-
-mod bindings;
+use crate::bindings::hyperlight::greeting_demo::TimeService;
+use alloc::format;
 use alloc::string::String;
 
-use bindings::*;
+mod bindings {
+    hyperlight_component_macro::guest_bindgen!("interface.wasm");
+}
 
 struct Guest {}
 
-impl test::wit::Roundtrip for Guest {
-    fn roundtrip_bool(&mut self, x: bool) -> bool {
-        (Host {}).roundtrip_bool(x)
-    }
-    fn roundtrip_s8(&mut self, x: i8) -> i8 {
-        (Host {}).roundtrip_s8(x)
-    }
-    fn roundtrip_s16(&mut self, x: i16) -> i16 {
-        (Host {}).roundtrip_s16(x)
-    }
-    fn roundtrip_s32(&mut self, x: i32) -> i32 {
-        (Host {}).roundtrip_s32(x)
-    }
-    fn roundtrip_s64(&mut self, x: i64) -> i64 {
-        (Host {}).roundtrip_s64(x)
-    }
-    fn roundtrip_u8(&mut self, x: u8) -> u8 {
-        (Host {}).roundtrip_u8(x)
-    }
-    fn roundtrip_u16(&mut self, x: u16) -> u16 {
-        (Host {}).roundtrip_u16(x)
-    }
-    fn roundtrip_u32(&mut self, x: u32) -> u32 {
-        (Host {}).roundtrip_u32(x)
-    }
-    fn roundtrip_u64(&mut self, x: u64) -> u64 {
-        (Host {}).roundtrip_u64(x)
-    }
-    fn roundtrip_f32(&mut self, x: f32) -> f32 {
-        (Host {}).roundtrip_f32(x)
-    }
-    fn roundtrip_f64(&mut self, x: f64) -> f64 {
-        (Host {}).roundtrip_f64(x)
-    }
-    fn roundtrip_char(&mut self, x: char) -> char {
-        (Host {}).roundtrip_char(x)
-    }
-    fn roundtrip_string(&mut self, x: alloc::string::String) -> alloc::string::String {
-        (Host {}).roundtrip_string(x)
-    }
-    fn roundtrip_list(&mut self, x: alloc::vec::Vec<u8>) -> alloc::vec::Vec<u8> {
-        (Host {}).roundtrip_list(x)
-    }
-    fn roundtrip_tuple(&mut self, x: (alloc::string::String, u8)) -> (alloc::string::String, u8) {
-        (Host {}).roundtrip_tuple(x)
-    }
-    fn roundtrip_option(
-        &mut self,
-        x: ::core::option::Option<alloc::string::String>,
-    ) -> ::core::option::Option<alloc::string::String> {
-        (Host {}).roundtrip_option(x)
-    }
-    fn roundtrip_result(
-        &mut self,
-        x: ::core::result::Result<char, alloc::string::String>,
-    ) -> ::core::result::Result<char, alloc::string::String> {
-        (Host {}).roundtrip_result(x)
-    }
-    fn roundtrip_record(
-        &mut self,
-        x: test::wit::roundtrip::Testrecord,
-    ) -> test::wit::roundtrip::Testrecord {
-        (Host {}).roundtrip_record(x)
-    }
-    fn roundtrip_flags_small(
-        &mut self,
-        x: test::wit::roundtrip::Smallflags,
-    ) -> test::wit::roundtrip::Smallflags {
-        (Host {}).roundtrip_flags_small(x)
-    }
-    fn roundtrip_flags_large(
-        &mut self,
-        x: test::wit::roundtrip::Largeflags,
-    ) -> test::wit::roundtrip::Largeflags {
-        (Host {}).roundtrip_flags_large(x)
-    }
-    fn roundtrip_variant(
-        &mut self,
-        x: test::wit::roundtrip::Testvariant,
-    ) -> test::wit::roundtrip::Testvariant {
-        (Host {}).roundtrip_variant(x)
-    }
-    fn roundtrip_enum(
-        &mut self,
-        x: test::wit::roundtrip::Testenum,
-    ) -> test::wit::roundtrip::Testenum {
-        (Host {}).roundtrip_enum(x)
-    }
-    fn roundtrip_fix_list(&mut self, x: [u8; 4]) -> [u8; 4] {
-        (Host {}).roundtrip_fix_list(x)
-    }
-    fn roundtrip_fix_list_u32(&mut self, x: [u32; 4]) -> [u32; 4] {
-        (Host {}).roundtrip_fix_list_u32(x)
-    }
-    fn roundtrip_fix_list_u64(&mut self, x: [u64; 4]) -> [u64; 4] {
-        (Host {}).roundtrip_fix_list_u64(x)
-    }
-    fn roundtrip_fix_list_i8(&mut self, x: [i8; 4]) -> [i8; 4] {
-        (Host {}).roundtrip_fix_list_i8(x)
-    }
-    fn roundtrip_fix_list_i16(&mut self, x: [i16; 4]) -> [i16; 4] {
-        (Host {}).roundtrip_fix_list_i16(x)
-    }
-    fn roundtrip_fix_list_i32(&mut self, x: [i32; 4]) -> [i32; 4] {
-        (Host {}).roundtrip_fix_list_i32(x)
-    }
-    fn roundtrip_fix_list_i64(&mut self, x: [i64; 4]) -> [i64; 4] {
-        (Host {}).roundtrip_fix_list_i64(x)
-    }
-    fn roundtrip_fix_list_f32(&mut self, x: [f32; 4]) -> [f32; 4] {
-        (Host {}).roundtrip_fix_list_f32(x)
-    }
-    fn roundtrip_fix_list_f64(&mut self, x: [f64; 4]) -> [f64; 4] {
-        (Host {}).roundtrip_fix_list_f64(x)
-    }
-    fn roundtrip_fix_list_u8_size8(&mut self, x: [u8; 8]) -> [u8; 8] {
-        (Host {}).roundtrip_fix_list_u8_size8(x)
-    }
-    fn roundtrip_fix_list_u64_size2(&mut self, x: [u64; 2]) -> [u64; 2] {
-        (Host {}).roundtrip_fix_list_u64_size2(x)
-    }
-    fn roundtrip_fix_list_string(&mut self, x: [String; 4]) -> [String; 4] {
-        (Host {}).roundtrip_fix_list_string(x)
-    }
-    fn roundtrip_fix_array_of_lists(&mut self, x: [Vec<u8>; 3]) -> [Vec<u8>; 3] {
-        x
-    }
-    fn roundtrip_fix_array_of_string_lists(&mut self, x: [Vec<String>; 2]) -> [Vec<String>; 2] {
-        x
-    }
-    fn roundtrip_no_result(&mut self, x: u32) {
-        (Host {}).roundtrip_no_result(x)
+impl bindings::hyperlight::greeting_demo::Greeting for Guest {
+    fn greet_user(&mut self, username: String) -> String {
+        // Call the host to get the current time
+        let current_time = (bindings::Host {}).get_current_time();
+
+        format!("Hello {}! The current time is {}", username, current_time)
     }
 }
 
-impl test::wit::TestHostResource for Guest {
-    fn test(&mut self) -> bool {
-        use test::wit::host_resource::Testresource;
-        let mut host = Host {};
-        use alloc::string::ToString;
-        let r = <Host as Testresource>::new(&mut host, "str".to_string(), 'z');
-        <Host as Testresource>::append_char(&mut host, &r, 'a');
-        <Host as Testresource>::append_char(&mut host, &r, 'b');
-        let r = <Host as test::wit::HostResource>::roundtrip_own(&mut host, r);
-        let r = <Host as test::wit::HostResource>::roundtrip_own(&mut host, r);
-        <Host as Testresource>::append_char(&mut host, &r, 'c');
-        <Host as test::wit::HostResource>::return_own(&mut host, r);
-        true
-    }
-}
-
-#[allow(refining_impl_trait)]
-impl test::wit::TestExports<Host> for Guest {
-    type Roundtrip = Self;
-    fn roundtrip(&mut self) -> &mut Self {
-        self
-    }
-    type TestHostResource = Self;
-    fn test_host_resource(&mut self) -> &mut Self {
+impl bindings::hyperlight::greeting_demo::GreetingDemoExports<bindings::Host> for Guest {
+    type Greeting = Self;
+    fn greeting(&mut self) -> &mut Self {
         self
     }
 }
@@ -202,10 +57,10 @@ pub extern "C" fn hyperlight_main() {
     bindings::hyperlight_guest_init::<Guest>();
 }
 
-use ::alloc::vec::Vec;
-use ::hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-use ::hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use ::hyperlight_guest::error::{HyperlightGuestError, Result};
+use alloc::vec::Vec;
+use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
+use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+use hyperlight_guest::error::{HyperlightGuestError, Result};
 #[no_mangle]
 pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
     Err(HyperlightGuestError::new(
