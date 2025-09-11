@@ -82,7 +82,7 @@ where
 {
     /// Create a new `SandboxMemoryManager` with the given parameters
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    fn new(
+    pub(crate) fn new(
         layout: SandboxMemoryLayout,
         shared_mem: S,
         load_addr: RawPtr,

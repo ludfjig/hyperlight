@@ -79,7 +79,7 @@ impl SharedMemorySnapshot {
 
     /// Return the size of the snapshot in bytes.
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    pub(super) fn mem_size(&self) -> usize {
+    pub(crate) fn mem_size(&self) -> usize {
         self.snapshot.len()
     }
 }

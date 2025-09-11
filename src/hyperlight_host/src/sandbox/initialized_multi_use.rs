@@ -33,6 +33,7 @@ use tracing::{Span, instrument};
 
 use super::host_funcs::FunctionRegistry;
 use super::snapshot::Snapshot;
+use super::uninitialized_evolve::set_up_hypervisor_partition;
 use super::{Callable, WrapperGetter};
 use crate::HyperlightError::SnapshotSandboxMismatch;
 use crate::func::guest_err::check_for_guest_error;
@@ -41,8 +42,9 @@ use crate::hypervisor::{Hypervisor, InterruptHandle};
 #[cfg(unix)]
 use crate::mem::memory_region::MemoryRegionType;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
+use crate::mem::mgr::SandboxMemoryManager;
 use crate::mem::ptr::RawPtr;
-use crate::mem::shared_mem::HostSharedMemory;
+use crate::mem::shared_mem::{ExclusiveSharedMemory, HostSharedMemory};
 use crate::metrics::maybe_time_and_emit_guest_call;
 use crate::sandbox::mem_mgr::MemMgrWrapper;
 use crate::{Result, log_then_return};
@@ -93,6 +95,27 @@ impl MultiUseSandbox {
             dbg_mem_access_fn,
             snapshot: None,
         }
+    }
+
+    /// Create a new `MultiUseSandbox` from a previously taken `Snapshot`.
+    #[allow(unreachable_code, unused_variables)]
+    pub fn from_snapshot(snapshot: &Snapshot) -> Result<MultiUseSandbox> {
+        let size = snapshot.inner.mem_size();
+        let mem = ExclusiveSharedMemory::new(size)?;
+        let mgr =
+            SandboxMemoryManager::new(todo!(), mem, todo!("load addr"), todo!("entrypoint offset"));
+        let wrapper = MemMgrWrapper::new(mgr, todo!("stack cookie"));
+        let (hshm, gshm) = wrapper.build();
+        let vm = set_up_hypervisor_partition(&mut gshm, todo!("config"), todo!("load info"))?;
+
+        Ok(Self {
+            id: SANDBOX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            _host_funcs: Arc::new(Mutex::new(FunctionRegistry::default())),
+            mem_mgr: todo!(),
+            vm: vm,
+            dispatch_ptr: todo!(),
+            snapshot: Some(snapshot.clone()),
+        })
     }
 
     /// Creates a snapshot of the sandbox's current memory state.
@@ -511,6 +534,22 @@ mod tests {
     use crate::mem::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, SharedMemory as _};
     use crate::sandbox::SandboxConfiguration;
     use crate::{GuestBinary, HyperlightError, MultiUseSandbox, Result, UninitializedSandbox};
+
+    #[test]
+    fn sandbox_from_snapshot() {
+        let path = simple_guest_as_string().unwrap();
+        let sandbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
+        let mut sandbox = sandbox.evolve().unwrap();
+        sandbox.call::<i32>("AddToStatic", 1).unwrap();
+        let num = sandbox.call::<i32>("GetStatic", ()).unwrap();
+        assert_eq!(num, 1);
+        let snapshot = sandbox.snapshot().unwrap();
+
+        let mut sandbox = MultiUseSandbox::from_snapshot(&snapshot).unwrap();
+        sandbox.call::<i32>("AddToStatic", 1).unwrap();
+        let num = sandbox.call::<i32>("GetStatic", ()).unwrap();
+        assert_eq!(num, 1);
+    }
 
     /// Make sure input/output buffers are properly reset after guest call (with host call)
     #[test]
