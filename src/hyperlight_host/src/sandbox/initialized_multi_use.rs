@@ -33,12 +33,15 @@ use tracing::{Span, instrument};
 
 use super::host_funcs::FunctionRegistry;
 use super::snapshot::Snapshot;
+#[cfg(any(crashdump, gdb))]
+use super::uninitialized::SandboxRuntimeConfig;
 use super::uninitialized_evolve::set_up_hypervisor_partition;
-use super::{Callable, WrapperGetter};
+use super::{Callable, SandboxConfiguration, WrapperGetter};
 use crate::HyperlightError::SnapshotSandboxMismatch;
 use crate::func::guest_err::check_for_guest_error;
 use crate::func::{ParameterTuple, SupportedReturnType};
 use crate::hypervisor::{Hypervisor, InterruptHandle};
+use crate::mem::exe::LoadInfo;
 #[cfg(unix)]
 use crate::mem::memory_region::MemoryRegionType;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
@@ -69,6 +72,13 @@ pub struct MultiUseSandbox {
     /// If the current state of the sandbox has been captured in a snapshot,
     /// that snapshot is stored here.
     snapshot: Option<Snapshot>,
+    /// Configuration used to create this sandbox (needed for snapshot creation)
+    config: SandboxConfiguration,
+    /// Runtime configuration for debugging and crash dumps (needed for snapshot creation)
+    #[cfg(any(crashdump, gdb))]
+    rt_cfg: SandboxRuntimeConfig,
+    /// Information about the loaded guest binary (needed for snapshot creation)
+    load_info: LoadInfo,
 }
 
 impl MultiUseSandbox {
@@ -94,6 +104,10 @@ impl MultiUseSandbox {
             #[cfg(gdb)]
             dbg_mem_access_fn,
             snapshot: None,
+            config: SandboxConfiguration::default(),
+            #[cfg(any(crashdump, gdb))]
+            rt_cfg: SandboxRuntimeConfig::default(),
+            load_info: LoadInfo::default(),
         }
     }
 
@@ -102,19 +116,39 @@ impl MultiUseSandbox {
     pub fn from_snapshot(snapshot: &Snapshot) -> Result<MultiUseSandbox> {
         let size = snapshot.inner.mem_size();
         let mem = ExclusiveSharedMemory::new(size)?;
-        let mgr =
-            SandboxMemoryManager::new(todo!(), mem, todo!("load addr"), todo!("entrypoint offset"));
-        let wrapper = MemMgrWrapper::new(mgr, todo!("stack cookie"));
-        let (hshm, gshm) = wrapper.build();
-        let vm = set_up_hypervisor_partition(&mut gshm, todo!("config"), todo!("load info"))?;
+        let mgr = SandboxMemoryManager::new(
+            *snapshot.inner.layout(),
+            mem,
+            snapshot.inner.load_addr(),
+            snapshot.inner.entrypoint_offset(),
+        );
+        let wrapper = MemMgrWrapper::new(mgr, *snapshot.inner.stack_cookie());
+        let (mut hshm, mut gshm) = wrapper.build();
+
+        // Restore the actual memory content from the snapshot
+        hshm.unwrap_mgr_mut().restore_snapshot(&snapshot.inner)?;
+
+        let vm = set_up_hypervisor_partition(
+            &mut gshm,
+            snapshot.inner.config(),
+            #[cfg(any(crashdump, gdb))]
+            snapshot.inner.rt_cfg(),
+            *snapshot.inner.load_info(),
+        )?;
 
         Ok(Self {
             id: SANDBOX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             _host_funcs: Arc::new(Mutex::new(FunctionRegistry::default())),
-            mem_mgr: todo!(),
+            mem_mgr: hshm.clone(),
             vm: vm,
-            dispatch_ptr: todo!(),
+            dispatch_ptr: snapshot.inner.dispatch_ptr(),
+            #[cfg(gdb)]
+            dbg_mem_access_fn: Arc::new(Mutex::new(hshm)),
             snapshot: Some(snapshot.clone()),
+            config: snapshot.inner.config().clone(),
+            #[cfg(any(crashdump, gdb))]
+            rt_cfg: snapshot.inner.rt_cfg().clone(),
+            load_info: *snapshot.inner.load_info(),
         })
     }
 
@@ -148,10 +182,26 @@ impl MultiUseSandbox {
         }
         let mapped_regions_iter = self.vm.get_mapped_regions();
         let mapped_regions_vec: Vec<MemoryRegion> = mapped_regions_iter.cloned().collect();
-        let memory_snapshot = self
-            .mem_mgr
-            .unwrap_mgr_mut()
-            .snapshot(self.id, mapped_regions_vec)?;
+
+        // Get values before calling snapshot to avoid borrowing issues
+        let layout = self.mem_mgr.unwrap_mgr().get_memory_layout().clone();
+        let load_addr = self.mem_mgr.unwrap_mgr().get_load_addr();
+        let entrypoint_offset = self.mem_mgr.unwrap_mgr().get_entrypoint_offset();
+        let stack_cookie = *self.mem_mgr.get_stack_cookie();
+
+        let memory_snapshot = self.mem_mgr.unwrap_mgr_mut().snapshot(
+            self.id,
+            mapped_regions_vec,
+            layout,
+            load_addr,
+            entrypoint_offset,
+            stack_cookie,
+            self.config.clone(),
+            #[cfg(any(crashdump, gdb))]
+            self.rt_cfg.clone(),
+            self.load_info,
+            self.dispatch_ptr.clone(),
+        )?;
         let inner = Arc::new(memory_snapshot);
         let snapshot = Snapshot { inner };
         self.snapshot = Some(snapshot.clone());
@@ -548,7 +598,7 @@ mod tests {
         let mut sandbox = MultiUseSandbox::from_snapshot(&snapshot).unwrap();
         sandbox.call::<i32>("AddToStatic", 1).unwrap();
         let num = sandbox.call::<i32>("GetStatic", ()).unwrap();
-        assert_eq!(num, 1);
+        assert_eq!(num, 2); // Should be 2: 1 (from snapshot) + 1 (from call)
     }
 
     /// Make sure input/output buffers are properly reset after guest call (with host call)

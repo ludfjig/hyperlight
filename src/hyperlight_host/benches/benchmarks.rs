@@ -30,8 +30,40 @@ fn create_uninit_sandbox() -> UninitializedSandbox {
     UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap()
 }
 
+fn create_uninit_sandbox_with_heap_size(heap_size: u64) -> UninitializedSandbox {
+    let mut config = SandboxConfiguration::default();
+    config.set_heap_size(heap_size);
+    let path = simple_guest_as_string().unwrap();
+    UninitializedSandbox::new(GuestBinary::FilePath(path), Some(config)).unwrap()
+}
+
 fn create_multiuse_sandbox() -> MultiUseSandbox {
     create_uninit_sandbox().evolve().unwrap()
+}
+
+fn create_multiuse_sandbox_with_heap_size(heap_size: u64) -> MultiUseSandbox {
+    create_uninit_sandbox_with_heap_size(heap_size)
+        .evolve()
+        .unwrap()
+}
+
+fn benchmark_new_sandbox_with_echo(heap_size: Option<u64>) -> String {
+    let mut sandbox = match heap_size {
+        Some(size) => create_multiuse_sandbox_with_heap_size(size),
+        None => create_multiuse_sandbox(),
+    };
+    let result: String = sandbox.call("Echo", "hello\n".to_string()).unwrap();
+    assert_eq!(result, "hello\n");
+    result
+}
+
+fn benchmark_snapshot_sandbox_with_echo(
+    snapshot: &hyperlight_host::sandbox::snapshot::Snapshot,
+) -> String {
+    let mut sandbox = MultiUseSandbox::from_snapshot(snapshot).unwrap();
+    let result: String = sandbox.call("Echo", "hello\n".to_string()).unwrap();
+    assert_eq!(result, "hello\n");
+    result
 }
 
 fn guest_call_benchmark(c: &mut Criterion) {
@@ -176,6 +208,39 @@ fn sandbox_benchmark(c: &mut Criterion) {
     group.bench_function("create_sandbox_and_drop", |b| {
         b.iter(create_multiuse_sandbox);
     });
+
+    // Define heap sizes to benchmark: (size_in_bytes, name_suffix)
+    let heap_sizes = [
+        (16 * 1024, "16KB"),          // 16 KB
+        (1024 * 1024, "1MB"),         // 1 MB
+        (500 * 1024 * 1024, "500MB"), // 500 MB
+    ];
+
+    // Benchmark new sandbox creation with different heap sizes
+    for (heap_size, size_name) in heap_sizes.iter() {
+        group.bench_function(
+            &format!("create_new_sandbox_with_echo_call_{}_heap", size_name),
+            |b| {
+                b.iter(|| benchmark_new_sandbox_with_echo(Some(*heap_size)));
+            },
+        );
+    }
+
+    // Benchmark snapshot restoration with different heap sizes
+    for (heap_size, size_name) in heap_sizes.iter() {
+        group.bench_function(
+            &format!(
+                "create_new_sandbox_with_echo_call_from_snapshot_{}_heap",
+                size_name
+            ),
+            |b| {
+                let mut reference_sandbox = create_multiuse_sandbox_with_heap_size(*heap_size);
+                let snapshot = reference_sandbox.snapshot().unwrap();
+
+                b.iter(|| benchmark_snapshot_sandbox_with_echo(&snapshot));
+            },
+        );
+    }
 
     group.finish();
 }

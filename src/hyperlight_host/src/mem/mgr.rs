@@ -26,6 +26,7 @@ use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionD
 use tracing::{Span, instrument};
 
 use super::exe::ExeInfo;
+use super::exe::LoadInfo;
 use super::layout::SandboxMemoryLayout;
 use super::memory_region::MemoryRegion;
 #[cfg(feature = "init-paging")]
@@ -35,7 +36,10 @@ use super::ptr_offset::Offset;
 use super::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, SharedMemory};
 use super::shared_mem_snapshot::SharedMemorySnapshot;
 use crate::sandbox::SandboxConfiguration;
+use crate::sandbox::mem_mgr::StackCookie;
 use crate::sandbox::uninitialized::GuestBlob;
+#[cfg(any(crashdump, gdb))]
+use crate::sandbox::uninitialized::SandboxRuntimeConfig;
 use crate::{Result, log_then_return, new_error};
 
 cfg_if::cfg_if! {
@@ -100,6 +104,21 @@ where
     /// Get `SharedMemory` in `self` as a mutable reference
     pub(crate) fn get_shared_mem_mut(&mut self) -> &mut S {
         &mut self.shared_mem
+    }
+
+    /// Get the memory layout
+    pub(crate) fn get_memory_layout(&self) -> &SandboxMemoryLayout {
+        &self.layout
+    }
+
+    /// Get the load address
+    pub(crate) fn get_load_addr(&self) -> RawPtr {
+        self.load_addr.clone()
+    }
+
+    /// Get the entrypoint offset
+    pub(crate) fn get_entrypoint_offset(&self) -> Offset {
+        self.entrypoint_offset
     }
 
     /// Set up the hypervisor partition in the given `SharedMemory` parameter
@@ -265,8 +284,29 @@ where
         &mut self,
         sandbox_id: u64,
         mapped_regions: Vec<MemoryRegion>,
+        layout: SandboxMemoryLayout,
+        load_addr: RawPtr,
+        entrypoint_offset: Offset,
+        stack_cookie: StackCookie,
+        config: SandboxConfiguration,
+        #[cfg(any(crashdump, gdb))] rt_cfg: SandboxRuntimeConfig,
+        load_info: LoadInfo,
+        dispatch_ptr: RawPtr,
     ) -> Result<SharedMemorySnapshot> {
-        SharedMemorySnapshot::new(&mut self.shared_mem, sandbox_id, mapped_regions)
+        SharedMemorySnapshot::new(
+            &mut self.shared_mem,
+            sandbox_id,
+            mapped_regions,
+            layout,
+            load_addr,
+            entrypoint_offset,
+            stack_cookie,
+            config,
+            #[cfg(any(crashdump, gdb))]
+            rt_cfg,
+            load_info,
+            dispatch_ptr,
+        )
     }
 
     /// This function restores a memory snapshot from a given snapshot.
