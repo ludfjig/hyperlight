@@ -37,6 +37,9 @@ pub mod snapshot;
 /// Trait used by the macros to paper over the differences between hyperlight and hyperlight-wasm
 mod callable;
 
+/// Functionality for observing and potentially interrupting guest execution
+pub mod observer;
+
 #[cfg(feature = "unwind_guest")]
 use std::io::Write;
 #[cfg(feature = "trace_guest")]
