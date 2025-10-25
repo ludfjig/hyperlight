@@ -19,7 +19,7 @@ use std::str::FromStr;
 #[cfg(any(kvm, mshv))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(kvm, mshv))]
 use std::time::Duration;
 
@@ -94,6 +94,7 @@ pub trait InterruptHandle: Send + Sync + Debug {
     /// - If this is called while the vcpu is not running, (for example during a host call), the
     ///   vcpu will not immediately be interrupted, but will prevent the vcpu from running **the next time**
     ///   it's scheduled, and returns `false`.
+    /// - Note that calling kill() before invoking a guest function call will have no effect on future guest calls.
     ///
     /// # Note
     /// This function will block for the duration of the time it takes for the vcpu thread to be interrupted.
@@ -118,79 +119,87 @@ pub trait InterruptHandle: Send + Sync + Debug {
 #[cfg(any(kvm, mshv))]
 #[derive(Debug)]
 pub(super) struct LinuxInterruptHandle {
-    /// Invariant: vcpu is running => most significant bit (63) of `running` is set. (Neither converse nor inverse is true)
+    /// Atomic value packing vcpu execution state.
     ///
-    /// Additionally, bit 0-62 tracks how many times the VCPU has been run. Incremented each time `run()` is called.
+    /// Bit layout:
+    /// - Bit 63: RUNNING_BIT - set when vcpu is actively running
+    /// - Bit 62: CANCEL_BIT - set when cancellation has been requested
+    /// - Bits 61-0: generation counter - tracks vcpu run iterations to prevent ABA problem
     ///
-    /// This prevents an ABA problem where:
-    /// 1. The VCPU is running (generation N),
-    /// 2. It gets cancelled,
-    /// 3. Then quickly restarted (generation N+1),
-    ///    before the original thread has observed that it was cancelled.
-    ///
-    /// Without this generation counter, the interrupt logic might assume the VCPU is still
-    /// in the *original* run (generation N), see that it's `running`, and re-send the signal.
-    /// But the new VCPU run (generation N+1) would treat this as a stale signal and ignore it,
-    /// potentially causing an infinite loop where no effective interrupt is delivered.
-    ///
-    /// Invariant: If the VCPU is running, `run_generation[bit 0-62]` matches the current run's generation.
+    /// CANCEL_BIT persists across vcpu exits/re-entries within a single `HyperlightVm::run()` call
+    /// (e.g., during host function calls), but is cleared at the start of each new `HyperlightVm::run()` call.
     running: AtomicU64,
-    /// Invariant: vcpu is running => `tid` is the thread on which it is running.
-    /// Note: multiple vms may have the same `tid`, but at most one vm will have `running` set to true.
+
+    /// Thread ID where the vcpu is running.
+    ///
+    /// Note: Multiple VMs may have the same `tid` (same thread runs multiple sandboxes sequentially),
+    /// but at most one VM will have RUNNING_BIT set at any given time.
     tid: AtomicU64,
-    /// True when an "interruptor" has requested the VM to be cancelled. Set immediately when
-    /// `kill()` is called, and cleared when the vcpu is no longer running.
-    /// This is used to
-    /// 1. make sure stale signals do not interrupt the
-    ///    the wrong vcpu (a vcpu may only be interrupted iff `cancel_requested` is true),
-    /// 2. ensure that if a vm is killed while a host call is running,
-    ///    the vm will not re-enter the guest after the host call returns.
-    cancel_requested: AtomicBool,
-    /// True when the debugger has requested the VM to be interrupted. Set immediately when
-    /// `kill_from_debugger()` is called, and cleared when the vcpu is no longer running.
-    /// This is used to make sure stale signals do not interrupt the the wrong vcpu
-    /// (a vcpu may only be interrupted by a debugger if `debug_interrupt` is true),
+
+    /// Debugger interrupt flag (gdb feature only).
+    /// Set when `kill_from_debugger()` is called, cleared when vcpu stops running.
     #[cfg(gdb)]
     debug_interrupt: AtomicBool,
-    /// Whether the corresponding vm is dropped
+
+    /// Whether the corresponding VM has been dropped.
     dropped: AtomicBool,
-    /// Retry delay between signals sent to the vcpu thread
+
+    /// Delay between retry attempts when sending signals to interrupt the vcpu.
     retry_delay: Duration,
-    /// The offset of the SIGRTMIN signal used to interrupt the vcpu thread
+
+    /// Offset from SIGRTMIN for the signal used to interrupt the vcpu thread.
     sig_rt_min_offset: u8,
 }
 
 #[cfg(any(kvm, mshv))]
 impl LinuxInterruptHandle {
     const RUNNING_BIT: u64 = 1 << 63;
-    const MAX_GENERATION: u64 = Self::RUNNING_BIT - 1;
+    const CANCEL_BIT: u64 = 1 << 62;
+    const MAX_GENERATION: u64 = (1 << 62) - 1;
 
-    // set running to true and increment the generation. Generation will wrap around at `MAX_GENERATION`.
+    /// Sets the RUNNING_BIT and increments the generation counter.
+    ///
+    /// # Preserves
+    /// - CANCEL_BIT: The current value of CANCEL_BIT is preserved
+    ///
+    /// # Invariants Maintained
+    /// - Generation increments by 1 (wraps to 0 at MAX_GENERATION)
+    /// - RUNNING_BIT is set
+    /// - CANCEL_BIT remains unchanged
+    ///
+    /// # Memory Ordering
+    /// Uses `Release` ordering to ensure that the `tid` store (which uses `Relaxed`)
+    /// is visible to any thread that observes RUNNING_BIT=true via `Acquire` ordering.
+    /// This prevents the interrupt thread from reading a stale `tid` value.
     #[expect(clippy::expect_used)]
     fn set_running_and_increment_generation(&self) -> u64 {
         self.running
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |raw| {
-                let generation = raw & !Self::RUNNING_BIT;
-                if generation == Self::MAX_GENERATION {
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |raw| {
+                let cancel_bit = raw & Self::CANCEL_BIT; // Preserve CANCEL_BIT
+                let generation = raw & Self::MAX_GENERATION;
+                let new_generation = if generation == Self::MAX_GENERATION {
                     // restart generation from 0
-                    return Some(Self::RUNNING_BIT);
-                }
-                Some((generation + 1) | Self::RUNNING_BIT)
+                    0
+                } else {
+                    generation + 1
+                };
+                // Set RUNNING_BIT, preserve CANCEL_BIT, increment generation
+                Some(Self::RUNNING_BIT | cancel_bit | new_generation)
             })
             .expect("Should never fail since we always return Some")
     }
 
-    // clear the running bit and return the generation
-    fn clear_running_bit(&self) -> u64 {
-        self.running
-            .fetch_and(!Self::RUNNING_BIT, Ordering::Relaxed)
-    }
-
-    fn get_running_and_generation(&self) -> (bool, u64) {
-        let raw = self.running.load(Ordering::Relaxed);
+    /// Get the running and cancel bits, return the previous value.
+    ///
+    /// # Memory Ordering
+    /// Uses `Acquire` ordering to synchronize with the `Release` in `set_running_and_increment_generation()`.
+    /// This ensures that when we observe RUNNING_BIT=true, we also see the correct `tid` value.
+    fn get_running_cancel_and_generation(&self) -> (bool, bool, u64) {
+        let raw = self.running.load(Ordering::Acquire);
         let running = raw & Self::RUNNING_BIT != 0;
-        let generation = raw & !Self::RUNNING_BIT;
-        (running, generation)
+        let cancel = raw & Self::CANCEL_BIT != 0;
+        let generation = raw & Self::MAX_GENERATION;
+        (running, cancel, generation)
     }
 
     fn send_signal(&self) -> bool {
@@ -199,9 +208,17 @@ impl LinuxInterruptHandle {
         let mut target_generation: Option<u64> = None;
 
         loop {
-            let (running, generation) = self.get_running_and_generation();
+            let (running, cancel, generation) = self.get_running_cancel_and_generation();
 
-            if !running {
+            // Check if we should continue sending signals
+            // Exit if not running OR if neither cancel nor debug_interrupt is set
+            #[cfg(gdb)]
+            let should_continue =
+                running && (cancel || self.debug_interrupt.load(Ordering::Relaxed));
+            #[cfg(not(gdb))]
+            let should_continue = running && cancel;
+
+            if !should_continue {
                 break;
             }
 
@@ -214,8 +231,10 @@ impl LinuxInterruptHandle {
 
             log::info!("Sending signal to kill vcpu thread...");
             sent_signal = true;
+            // Acquire ordering to synchronize with the Release store in set_tid()
+            // This ensures we see the correct tid value for the currently running vcpu
             unsafe {
-                libc::pthread_kill(self.tid.load(Ordering::Relaxed) as _, signal_number);
+                libc::pthread_kill(self.tid.load(Ordering::Acquire) as _, signal_number);
             }
             std::thread::sleep(self.retry_delay);
         }
@@ -227,8 +246,11 @@ impl LinuxInterruptHandle {
 #[cfg(any(kvm, mshv))]
 impl InterruptHandleImpl for LinuxInterruptHandle {
     fn set_tid(&self) {
+        // Release ordering to synchronize with the Acquire load of `running` in send_signal()
+        // This ensures that when send_signal() observes RUNNING_BIT=true (via Acquire),
+        // it also sees the correct tid value stored here
         self.tid
-            .store(unsafe { libc::pthread_self() as u64 }, Ordering::Relaxed);
+            .store(unsafe { libc::pthread_self() as u64 }, Ordering::Release);
     }
 
     fn set_running(&self) {
@@ -236,15 +258,21 @@ impl InterruptHandleImpl for LinuxInterruptHandle {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancel_requested.load(Ordering::Relaxed)
+        // Acquire ordering to synchronize with the Release in kill()
+        // This ensures we see the CANCEL_BIT set by the interrupt thread
+        self.running.load(Ordering::Acquire) & Self::CANCEL_BIT != 0
     }
 
     fn clear_cancel(&self) {
-        self.cancel_requested.store(false, Ordering::Relaxed);
+        // Relaxed is sufficient here - we're the only thread that clears this bit
+        // at the start of run(), and there's no data race on the clear operation itself
+        self.running.fetch_and(!Self::CANCEL_BIT, Ordering::Relaxed);
     }
 
     fn clear_running(&self) {
-        self.clear_running_bit();
+        // Release ordering to ensure all vcpu operations are visible before clearing RUNNING_BIT
+        self.running
+            .fetch_and(!Self::RUNNING_BIT, Ordering::Release);
     }
 
     fn is_debug_interrupted(&self) -> bool {
@@ -271,8 +299,11 @@ impl InterruptHandleImpl for LinuxInterruptHandle {
 #[cfg(any(kvm, mshv))]
 impl InterruptHandle for LinuxInterruptHandle {
     fn kill(&self) -> bool {
-        self.cancel_requested.store(true, Ordering::Relaxed);
+        // Release ordering ensures that any writes before kill() are visible to the vcpu thread
+        // when it checks is_cancelled() with Acquire ordering
+        self.running.fetch_or(Self::CANCEL_BIT, Ordering::Release);
 
+        // Send signals to interrupt the vcpu if it's currently running
         self.send_signal()
     }
     #[cfg(gdb)]
@@ -288,14 +319,30 @@ impl InterruptHandle for LinuxInterruptHandle {
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 pub(super) struct WindowsInterruptHandle {
-    // `WHvCancelRunVirtualProcessor()` will return Ok even if the vcpu is not running, which is the reason we need this flag.
-    running: AtomicBool,
-    cancel_requested: AtomicBool,
+    /// Atomic value packing vcpu execution state.
+    ///
+    /// Bit layout:
+    /// - Bit 1: RUNNING_BIT - set when vcpu is actively running
+    /// - Bit 0: CANCEL_BIT - set when cancellation has been requested
+    ///
+    /// `WHvCancelRunVirtualProcessor()` will return Ok even if the vcpu is not running,
+    /// which is why we need the RUNNING_BIT.
+    ///
+    /// CANCEL_BIT persists across vcpu exits/re-entries within a single `HyperlightVm::run()` call
+    /// (e.g., during host function calls), but is cleared at the start of each new `HyperlightVm::run()` call.
+    state: AtomicU64,
+
     // This is used to signal the GDB thread to stop the vCPU
     #[cfg(gdb)]
     debug_interrupt: AtomicBool,
     partition_handle: windows::Win32::System::Hypervisor::WHV_PARTITION_HANDLE,
     dropped: AtomicBool,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsInterruptHandle {
+    const RUNNING_BIT: u64 = 1 << 1;
+    const CANCEL_BIT: u64 = 1 << 0;
 }
 
 #[cfg(target_os = "windows")]
@@ -305,20 +352,25 @@ impl InterruptHandleImpl for WindowsInterruptHandle {
     }
 
     fn set_running(&self) {
-        self.running.store(true, Ordering::Relaxed);
+        // Release ordering to ensure prior memory operations are visible when another thread observes running=true
+        self.state.fetch_or(Self::RUNNING_BIT, Ordering::Release);
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancel_requested.load(Ordering::Relaxed)
+        // Acquire ordering to synchronize with the Release in kill()
+        // This ensures we see the CANCEL_BIT set by the interrupt thread
+        self.state.load(Ordering::Acquire) & Self::CANCEL_BIT != 0
     }
 
     fn clear_cancel(&self) {
-        self.cancel_requested.store(false, Ordering::Relaxed);
+        // Relaxed is sufficient here - we're the only thread that clears this bit
+        // at the start of run(), and there's no data race on the clear operation itself
+        self.state.fetch_and(!Self::CANCEL_BIT, Ordering::Relaxed);
     }
 
     fn clear_running(&self) {
-        // On Windows, clear running, cancel_requested, and debug_interrupt together
-        self.running.store(false, Ordering::Relaxed);
+        // Release ordering to ensure all vcpu operations are visible before clearing running
+        self.state.fetch_and(!Self::RUNNING_BIT, Ordering::Release);
         #[cfg(gdb)]
         self.debug_interrupt.store(false, Ordering::Relaxed);
     }
@@ -350,8 +402,14 @@ impl InterruptHandle for WindowsInterruptHandle {
     fn kill(&self) -> bool {
         use windows::Win32::System::Hypervisor::WHvCancelRunVirtualProcessor;
 
-        self.cancel_requested.store(true, Ordering::Relaxed);
-        self.running.load(Ordering::Relaxed)
+        // Release ordering ensures that any writes before kill() are visible to the vcpu thread
+        // when it checks is_cancelled() with Acquire ordering
+        self.state.fetch_or(Self::CANCEL_BIT, Ordering::Release);
+
+        // Acquire ordering to synchronize with the Release in set_running()
+        // This ensures we see the running state set by the vcpu thread
+        let state = self.state.load(Ordering::Acquire);
+        (state & Self::RUNNING_BIT != 0)
             && unsafe { WHvCancelRunVirtualProcessor(self.partition_handle, 0, 0).is_ok() }
     }
     #[cfg(gdb)]
@@ -359,7 +417,9 @@ impl InterruptHandle for WindowsInterruptHandle {
         use windows::Win32::System::Hypervisor::WHvCancelRunVirtualProcessor;
 
         self.debug_interrupt.store(true, Ordering::Relaxed);
-        self.running.load(Ordering::Relaxed)
+        // Acquire ordering to synchronize with the Release in set_running()
+        let state = self.state.load(Ordering::Acquire);
+        (state & Self::RUNNING_BIT != 0)
             && unsafe { WHvCancelRunVirtualProcessor(self.partition_handle, 0, 0).is_ok() }
     }
 

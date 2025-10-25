@@ -19,7 +19,7 @@ use std::convert::TryFrom;
 #[cfg(crashdump)]
 use std::path::Path;
 #[cfg(target_os = "windows")]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(any(kvm, mshv))]
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
@@ -146,7 +146,6 @@ impl HyperlightVm {
         #[cfg(any(kvm, mshv))]
         let interrupt_handle: Arc<dyn InterruptHandleImpl> = Arc::new(LinuxInterruptHandle {
             running: AtomicU64::new(0),
-            cancel_requested: AtomicBool::new(false),
             #[cfg(gdb)]
             debug_interrupt: AtomicBool::new(false),
             #[cfg(all(
@@ -170,8 +169,7 @@ impl HyperlightVm {
 
         #[cfg(target_os = "windows")]
         let interrupt_handle: Arc<dyn InterruptHandleImpl> = Arc::new(WindowsInterruptHandle {
-            running: AtomicBool::new(false),
-            cancel_requested: AtomicBool::new(false),
+            state: AtomicU64::new(0),
             #[cfg(gdb)]
             debug_interrupt: AtomicBool::new(false),
             partition_handle: vm.partition_handle(),
@@ -374,20 +372,26 @@ impl HyperlightVm {
         &mut self,
         #[cfg(gdb)] dbg_mem_access_fn: Arc<Mutex<SandboxMemoryManager<HostSharedMemory>>>,
     ) -> Result<()> {
+        // ===== KILL() TIMING POINT 1: Between guest function calls =====
+        // Clear any stale cancellation from a previous guest function call or if kill() was called too early.
+        // This ensures that kill() called BETWEEN different guest function calls doesn't affect the next call.
+        //
+        // If kill() was called and ran to completion BEFORE this line executes:
+        //    - kill() has NO effect on this guest function call because CANCEL_BIT is cleared here.
+        //    - NOTE: stale signals can still be delivered, but they will be ignored.
+        self.interrupt_handle.clear_cancel();
+
         // Keeps the trace context and open spans
         #[cfg(feature = "trace_guest")]
         let mut tc = crate::sandbox::trace::TraceContext::new();
 
         let result = loop {
+            // ===== KILL() TIMING POINT 2: Before set_tid() =====
+            // If kill() is called and ran to completion BEFORE this line executes:
+            //    - CANCEL_BIT will be set and we will return an early VmExit::Cancelled()
             self.interrupt_handle.set_tid();
-            // Note: if a `InterruptHandle::kill()` called while this thread is **here**
-            // Then this is fine since `cancel_requested` is set to true, so we will skip the `VcpuFd::run()` call
             self.interrupt_handle.set_running();
 
-            // Don't run the vcpu if `cancel_requested` is true
-            //
-            // Note: if a `InterruptHandle::kill()` called while this thread is **here**
-            // Then this is fine since `cancel_requested` is set to true, so we will skip the `VcpuFd::run()` call
             let exit_reason = if self.interrupt_handle.is_cancelled()
                 || self.interrupt_handle.is_debug_interrupted()
             {
@@ -395,7 +399,15 @@ impl HyperlightVm {
             } else {
                 #[cfg(feature = "trace_guest")]
                 tc.setup_guest_trace(Span::current().context());
+
+                // ===== KILL() TIMING POINT 3: Before calling run_vcpu() =====
+                // If kill() is called and ran to completion BEFORE this line executes:
+                //    - CANCEL_BIT will be set, but it's too late to prevent entering the guest this iteration
+                //    - Signals will interrupt the guest (RUNNING_BIT=true), causing VmExit::Cancelled()
+                //    - If the guest completes before any signals arrive, kill() may have no effect
+                //      - If there are more iterations to do (IO/host func, etc.), the next iteration will be cancelled
                 let exit_reason = self.vm.run_vcpu();
+
                 // End current host trace by closing the current span that captures traces
                 // happening when a guest exits and re-enters.
                 #[cfg(feature = "trace_guest")]
@@ -411,24 +423,28 @@ impl HyperlightVm {
                 exit_reason
             };
 
-            // Note: if a `InterruptHandle::kill()` called while this thread is **here**
-            // Then signals will be sent to this thread until `running` is set to false.
-            // This is fine since the signal handler is a no-op.
+            // ===== KILL() TIMING POINT 4: Before capturing cancel_requested =====
+            // If kill() is called and ran to completion BEFORE this line executes:
+            //    - CANCEL_BIT will be set
+            //    - Signals may still be sent (RUNNING_BIT=true) but are harmless no-ops
+            //    - kill() will have no effect on this iteration, but CANCEL_BIT will persist
+            //    - If the loop continues (e.g., for a host call), the next iteration will be cancelled
+            //    - Stale signals from before clear_running() may arrive and kick future iterations,
+            //      but will be filtered out by the cancel_requested check below (and retried).
             let cancel_requested = self.interrupt_handle.is_cancelled();
-            #[cfg(any(kvm, mshv))]
             let debug_interrupted = self.interrupt_handle.is_debug_interrupted();
 
-            // Note: if a `InterruptHandle::kill()` called while this thread is **here**
-            // Then `cancel_requested` will be set to true again, which will cancel the **next vcpu run**.
-            // Additionally signals will be sent to this thread until `running` is set to false.
-            // This is fine since the signal handler is a no-op.
+            // ===== KILL() TIMING POINT 5: Before calling clear_running() =====
+            // Same as point 4.
             self.interrupt_handle.clear_running();
-            self.interrupt_handle.clear_cancel();
 
-            // At this point, `running` is `false` so no more signals will be sent to this thread,
-            // but we may still receive async signals that were sent before this point.
-            // To prevent those signals from interrupting subsequent calls to `run()` (on other vms!),
-            // we make sure to check `cancel_requested` before cancelling (see `libc::EINTR` match-arm below).
+            // ===== KILL() TIMING POINT 6: After calling clear_running() =====
+            // If kill() is called and ran to completion BEFORE this line executes:
+            //    - CANCEL_BIT will be set but won't affect this iteration, it is never read below this comment
+            //      and cleared at next run() start
+            //    - RUNNING_BIT=false, so no new signals will be sent
+            //    - Stale signals from before clear_running() may arrive and kick future iterations,
+            //      but will be filtered out by the cancel_requested check below (and retried).
             match exit_reason {
                 #[cfg(gdb)]
                 Ok(VmExit::Debug { dr6, exception }) => {
@@ -517,13 +533,10 @@ impl HyperlightVm {
                     }
                 }
                 Ok(VmExit::Cancelled()) => {
-                    // On Linux (kvm/mshv), if cancellation was not requested for this specific vm,
-                    // the vcpu was interrupted because of debug interrupt or a stale signal that
-                    // meant to be delivered to a previous/other vcpu on this same thread, so let's ignore it
-                    // On Windows, WHvCancelRunVirtualProcessor is explicit, so we always break
-                    #[cfg(any(kvm, mshv))]
+                    // If cancellation was not requested for this specific guest function call,
+                    // the vcpu was interrupted by a stale cancellation from a previous call
                     if !cancel_requested && !debug_interrupted {
-                        // treat this the same as a VmExit::Retry, the cancel was not meant for this vcpu
+                        // treat this the same as a VmExit::Retry, the cancel was not meant for this call
                         continue;
                     }
 
@@ -536,10 +549,6 @@ impl HyperlightVm {
                         {
                             break Err(e);
                         }
-                    }
-
-                    if cancel_requested {
-                        self.interrupt_handle.clear_cancel();
                     }
 
                     metrics::counter!(METRIC_GUEST_CANCELLATION).increment(1);
