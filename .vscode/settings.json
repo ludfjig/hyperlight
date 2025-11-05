@@ -1,6 +1,6 @@
 {
     "rust-analyzer.linkedProjects": [
-        "Cargo.toml", 
+        "Cargo.toml",
         // guest crates for testing, not part of the workspace
         "src/tests/rust_guests/simpleguest/Cargo.toml",
     ],
@@ -8,5 +8,9 @@
     "rust-analyzer.cargo.features": [
         // "gdb",
         // "kvm"
+    ],
+    "rust-analyzer.rustfmt.extraArgs": [
+        // Makes sure VSCode (when saving, formatting, etc) uses same rust-fmt format as we specify in rustfmt.toml file and use in the justfile 
+        "+nightly" 
     ],
 }
