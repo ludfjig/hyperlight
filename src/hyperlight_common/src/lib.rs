@@ -22,9 +22,11 @@ limitations under the License.
 
 extern crate alloc;
 
+#[cfg(feature = "trace_guest")]
 pub mod flatbuffer_wrappers;
 /// cbindgen:ignore
 /// FlatBuffers-related utilities and (mostly) generated code
+#[cfg(feature = "trace_guest")]
 #[allow(clippy::all, warnings)]
 mod flatbuffers;
 // cbindgen:ignore
@@ -38,6 +40,9 @@ pub mod mem;
 
 /// cbindgen:ignore
 pub mod outb;
+
+/// Postcard-based wire format for host/guest function calls.
+pub mod wire;
 
 /// cbindgen:ignore
 pub mod resource;

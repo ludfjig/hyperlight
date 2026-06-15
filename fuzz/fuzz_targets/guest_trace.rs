@@ -21,7 +21,9 @@ compile_error!("feature `trace` must be enabled to correctly fuzz guest trace fu
 
 use std::sync::{Mutex, OnceLock};
 
-use hyperlight_host::func::{ParameterValue, ReturnType, ReturnValue};
+use hyperlight_common::func::OwnedReturn;
+use hyperlight_common::wire::Param;
+use hyperlight_host::func::ReturnType;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox::uninitialized::GuestBinary;
 use hyperlight_host::{MultiUseSandbox, UninitializedSandbox};
@@ -89,12 +91,12 @@ fuzz_target!(
 
         let mut sandbox = SANDBOX.get().unwrap().lock().unwrap();
 
-        let func_params = vec![ParameterValue::UInt(max_depth), ParameterValue::String(msg)];
+        let func_params = vec![Param::UInt(max_depth), Param::String(msg.as_str())];
         let result = sandbox.call_type_erased_guest_function_by_name("FuzzGuestTrace", ReturnType::UInt, func_params);
 
         match result {
             Ok(ret_val) => {
-                if let ReturnValue::UInt(depth_reached) = ret_val {
+                if let OwnedReturn::UInt(depth_reached) = ret_val {
                     assert!(depth_reached == max_depth);
                     Corpus::Keep
                 } else {

@@ -37,7 +37,7 @@ fn main() -> hyperlight_host::Result<()> {
     let mut multi_use_sandbox: MultiUseSandbox = uninitialized_sandbox.evolve()?;
 
     // Call guest function
-    let message = "Hello, World! I am executing inside of a VM :)\n".to_string();
+    let message = "Hello, World! I am executing inside of a VM :)\n";
     multi_use_sandbox
         .call::<i32>(
             "PrintOutput", // function must be defined in the guest binary

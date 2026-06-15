@@ -56,7 +56,7 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                 .iter()
                 .map(|p| {
                     let me = emit_hl_marshal_param(s, kebab_to_var(p.name.name), &p.ty);
-                    quote! { args.push(::hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue::VecBytes(#me)); }
+                    quote! { __storage.push(#me); }
                 })
                 .collect::<Vec<_>>();
             let unmarshal = emit_hl_unmarshal_result(s, ret.clone(), &ft.result);
@@ -71,12 +71,17 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
             };
             let decl = quote! {
                 fn #n(&mut self, #(#param_decls),*) -> #result_decl {
-                    let mut args = ::alloc::vec::Vec::new();
+                    let mut __storage: ::alloc::vec::Vec<::alloc::vec::Vec<u8>> = ::alloc::vec::Vec::new();
                     #(#marshal)*
+                    let args: ::alloc::vec::Vec<::hyperlight_common::wire::Param<'_>> =
+                        __storage
+                            .iter()
+                            .map(|v| ::hyperlight_common::wire::Param::VecBytes(v.as_slice()))
+                            .collect();
                     let #ret = ::hyperlight_guest_bin::host_comm::call_host_function::<::alloc::vec::Vec<u8>>(
                         #hln,
                         Some(args),
-                        ::hyperlight_common::flatbuffer_wrappers::function_types::ReturnType::VecBytes,
+                        ::hyperlight_common::wire::ReturnType::VecBytes,
                     );
                     let ::core::result::Result::Ok(#ret) = #ret else { panic!("bad return from guest {:?}", #ret) };
                     #[allow(clippy::unused_unit)]
@@ -183,11 +188,15 @@ fn emit_export_extern_decl<'a, 'b, 'c>(
                     panic!("resources exported from wasm not yet supported")
                 }
             };
-            let pts = ft.params.iter().map(|_| quote! { ::hyperlight_common::flatbuffer_wrappers::function_types::ParameterType::VecBytes }).collect::<Vec<_>>();
+            let pts = ft
+                .params
+                .iter()
+                .map(|_| quote! { ::hyperlight_common::wire::ParameterType::VecBytes })
+                .collect::<Vec<_>>();
             let (pds, pus) = ft.params.iter().enumerate()
                 .map(|(i, p)| {
                     let id = kebab_to_var(p.name.name);
-                    let pd = quote! { let ::hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue::VecBytes(#id) = &fc.parameters.as_ref().unwrap()[#i] else { panic!("invariant violation: host passed non-VecBytes core hyperlight argument"); }; };
+                    let pd = quote! { let ::hyperlight_common::wire::Param::VecBytes(#id) = &__params[#i] else { panic!("invariant violation: host passed non-VecBytes core hyperlight argument"); }; };
                     let pu = emit_hl_unmarshal_param(s, id, &p.ty);
                     (pd, pu)
                 })
@@ -210,19 +219,29 @@ fn emit_export_extern_decl<'a, 'b, 'c>(
             let marshal_result = emit_hl_marshal_result(s, ret.clone(), &ft.result);
             let trait_path = s.cur_trait_path();
             quote! {
-                fn #n<T: Guest>(fc: ::hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall) -> ::hyperlight_guest::error::Result<::alloc::vec::Vec<u8>> {
+                fn #n<T: Guest>(
+                    __params: ::alloc::vec::Vec<::hyperlight_common::wire::Param<'_>>,
+                    __out: &mut [u8],
+                ) -> ::hyperlight_guest::error::Result<usize> {
                     <T as Guest>::with_guest_state(|state| {
                         #(#pds)*
                         #(#get_instance)*
                         let #ret = #trait_path::#n(state, #(#pus,)*);
-                        ::core::result::Result::Ok(::hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result::<&[u8]>(&#marshal_result))
+                        let __bytes: &[u8] = &#marshal_result;
+                        let __fcr: ::hyperlight_common::wire::FunctionCallResult<'_> =
+                            ::hyperlight_common::wire::FunctionCallResult::Ok(
+                                ::hyperlight_common::wire::ReturnValue::VecBytes(__bytes),
+                            );
+                        let __written = ::hyperlight_common::wire::encode_into(&__fcr, __out)
+                            .expect("failed to encode guest return value");
+                        ::core::result::Result::Ok(__written.len())
                     })
                 }
                 ::hyperlight_guest_bin::guest_function::register::register_function(
                     ::hyperlight_guest_bin::guest_function::definition::GuestFunctionDefinition::new(
                         ::alloc::string::ToString::to_string(#fname),
                         ::alloc::vec![#(#pts),*],
-                        ::hyperlight_common::flatbuffer_wrappers::function_types::ReturnType::VecBytes,
+                        ::hyperlight_common::wire::ReturnType::VecBytes,
                         #n::<T>
                     )
                 );

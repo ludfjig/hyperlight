@@ -14,60 +14,94 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use super::error::Error;
 use super::utils::for_each_tuple;
-use crate::flatbuffer_wrappers::function_types::{ParameterType, ParameterValue};
+use crate::wire::{Param, ParameterType};
 
-/// This is a marker trait that is used to indicate that a type is a
-/// valid Hyperlight parameter type.
+/// A type usable as a guest or host function parameter.
 ///
-/// For each parameter type Hyperlight supports in host functions, we
-/// provide an implementation for `SupportedParameterType`
-pub trait SupportedParameterType: Sized + Clone + Send + Sync + 'static {
-    /// The underlying Hyperlight parameter type representing this `SupportedParameterType`
+/// The trait is implemented on a sized "carrier" type that determines
+/// the user-facing form via the [`Borrowed`] associated type. For
+/// primitives the carrier is the value type itself ([`i32`], [`bool`],
+/// etc.). For zero-copy string and byte slice parameters the carriers
+/// are the marker types [`Str`] and [`Bytes`] whose `Borrowed<'a>`
+/// resolves to `&'a str` and `&'a [u8]` respectively.
+///
+/// [`Borrowed`]: SupportedParameterType::Borrowed
+pub trait SupportedParameterType: Sized + 'static {
+    /// The form of this parameter received by user code.
+    type Borrowed<'a>;
+    /// Static tag for signature matching and dispatch.
     const TYPE: ParameterType;
-
-    /// Get the underling Hyperlight parameter value representing this
-    /// `SupportedParameterType`
-    fn into_value(self) -> ParameterValue;
-    /// Get the actual inner value of this `SupportedParameterType`
-    fn from_value(value: ParameterValue) -> Result<Self, Error>;
+    /// Build the on-wire [`Param`] from a borrowed value.
+    fn into_param<'a>(b: Self::Borrowed<'a>) -> Param<'a>;
+    /// Extract the user-facing borrowed value from a wire [`Param`].
+    fn from_param<'a>(p: Param<'a>) -> Result<Self::Borrowed<'a>, Error>;
 }
 
-// We can then implement these traits for each type that Hyperlight supports as a parameter or return type
-macro_rules! for_each_param_type {
-    ($macro:ident) => {
-        $macro!(String, String);
-        $macro!(i32, Int);
-        $macro!(u32, UInt);
-        $macro!(i64, Long);
-        $macro!(u64, ULong);
-        $macro!(f32, Float);
-        $macro!(f64, Double);
-        $macro!(bool, Bool);
-        $macro!(Vec<u8>, VecBytes);
-    };
+/// Marker carrier whose user-facing form is `&'a str`. Use this in
+/// the parameter list of `register_host_function` and friends in
+/// place of `String` to receive a borrowed slice into the wire buffer.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Str(PhantomData<()>);
+
+/// Marker carrier whose user-facing form is `&'a [u8]`. Use this in
+/// place of `Vec<u8>` to receive a borrowed slice into the wire buffer.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Bytes(PhantomData<()>);
+
+impl SupportedParameterType for Str {
+    type Borrowed<'a> = &'a str;
+    const TYPE: ParameterType = ParameterType::String;
+    fn into_param<'a>(b: Self::Borrowed<'a>) -> Param<'a> {
+        Param::String(b)
+    }
+    fn from_param<'a>(p: Param<'a>) -> Result<Self::Borrowed<'a>, Error> {
+        match p {
+            Param::String(s) => Ok(s),
+            other => Err(Error::ParameterValueConversionFailure(
+                other.type_tag(),
+                "&str",
+            )),
+        }
+    }
 }
 
-macro_rules! impl_supported_param_type {
-    ($type:ty, $enum:ident) => {
-        impl SupportedParameterType for $type {
-            const TYPE: ParameterType = ParameterType::$enum;
+impl SupportedParameterType for Bytes {
+    type Borrowed<'a> = &'a [u8];
+    const TYPE: ParameterType = ParameterType::VecBytes;
+    fn into_param<'a>(b: Self::Borrowed<'a>) -> Param<'a> {
+        Param::VecBytes(b)
+    }
+    fn from_param<'a>(p: Param<'a>) -> Result<Self::Borrowed<'a>, Error> {
+        match p {
+            Param::VecBytes(b) => Ok(b),
+            other => Err(Error::ParameterValueConversionFailure(
+                other.type_tag(),
+                "&[u8]",
+            )),
+        }
+    }
+}
 
-            fn into_value(self) -> ParameterValue {
-                ParameterValue::$enum(self)
+macro_rules! impl_param_primitive {
+    ($t:ty, $variant:ident, $label:literal) => {
+        impl SupportedParameterType for $t {
+            type Borrowed<'a> = $t;
+            const TYPE: ParameterType = ParameterType::$variant;
+            fn into_param<'a>(b: Self::Borrowed<'a>) -> Param<'a> {
+                Param::$variant(b)
             }
-
-            fn from_value(value: ParameterValue) -> Result<Self, Error> {
-                match value {
-                    ParameterValue::$enum(i) => Ok(i),
+            fn from_param<'a>(p: Param<'a>) -> Result<Self::Borrowed<'a>, Error> {
+                match p {
+                    Param::$variant(v) => Ok(v),
                     other => Err(Error::ParameterValueConversionFailure(
-                        other.clone(),
-                        stringify!($type),
+                        other.type_tag(),
+                        $label,
                     )),
                 }
             }
@@ -75,59 +109,60 @@ macro_rules! impl_supported_param_type {
     };
 }
 
-for_each_param_type!(impl_supported_param_type);
+impl_param_primitive!(i32, Int, "i32");
+impl_param_primitive!(u32, UInt, "u32");
+impl_param_primitive!(i64, Long, "i64");
+impl_param_primitive!(u64, ULong, "u64");
+impl_param_primitive!(f32, Float, "f32");
+impl_param_primitive!(f64, Double, "f64");
+impl_param_primitive!(bool, Bool, "bool");
 
-/// A trait to describe the tuple of parameters that a host function can take.
-pub trait ParameterTuple: Sized + Clone + Send + Sync + 'static {
-    /// The number of parameters in the tuple
+/// A tuple of parameters a function can take. The shape is described
+/// by a tuple of carrier types; borrows propagate through to a tuple
+/// of borrowed user-facing types.
+pub trait ParameterTuple: Sized + 'static {
+    /// The form of the parameter tuple received by user code.
+    type Borrowed<'a>;
+    /// Number of parameters in the tuple.
     const SIZE: usize;
-
-    /// The underlying Hyperlight parameter types representing this tuple of `SupportedParameterType`
-    const TYPE: &[ParameterType];
-
-    /// Get the underling Hyperlight parameter value representing this
-    /// `SupportedParameterType`
-    fn into_value(self) -> Vec<ParameterValue>;
-
-    /// Get the actual inner value of this `SupportedParameterType`
-    fn from_value(value: Vec<ParameterValue>) -> Result<Self, Error>;
+    /// Static type tags for the parameter slots.
+    const TYPE: &'static [ParameterType];
+    /// Serialize a borrowed tuple into a `Vec<Param<'a>>`.
+    fn into_params<'a>(b: Self::Borrowed<'a>) -> Vec<Param<'a>>;
+    /// Deserialize from a `Vec<Param<'a>>` into the borrowed tuple.
+    fn from_params<'a>(p: Vec<Param<'a>>) -> Result<Self::Borrowed<'a>, Error>;
 }
 
 impl<T: SupportedParameterType> ParameterTuple for T {
+    type Borrowed<'a> = T::Borrowed<'a>;
     const SIZE: usize = 1;
-
-    const TYPE: &[ParameterType] = &[T::TYPE];
-
-    fn into_value(self) -> Vec<ParameterValue> {
-        vec![self.into_value()]
+    const TYPE: &'static [ParameterType] = &[T::TYPE];
+    fn into_params<'a>(b: Self::Borrowed<'a>) -> Vec<Param<'a>> {
+        vec![T::into_param(b)]
     }
-
-    fn from_value(value: Vec<ParameterValue>) -> Result<Self, Error> {
-        match <[ParameterValue; 1]>::try_from(value) {
-            Ok([val]) => Ok(T::from_value(val)?),
-            Err(value) => Err(Error::UnexpectedNoOfArguments(value.len(), 1)),
+    fn from_params<'a>(p: Vec<Param<'a>>) -> Result<Self::Borrowed<'a>, Error> {
+        match <[Param<'a>; 1]>::try_from(p) {
+            Ok([v]) => T::from_param(v),
+            Err(v) => Err(Error::UnexpectedNoOfArguments(v.len(), 1)),
         }
     }
 }
 
 macro_rules! impl_param_tuple {
-    ([$N:expr] ($($name:ident: $param:ident),*)) => {
-        impl<$($param: SupportedParameterType),*> ParameterTuple for ($($param,)*) {
+    ([$N:expr] ($($name:ident: $P:ident),*)) => {
+        impl<$($P: SupportedParameterType),*> ParameterTuple for ($($P,)*) {
+            type Borrowed<'a> = ($($P::Borrowed<'a>,)*);
             const SIZE: usize = $N;
-
-            const TYPE: &[ParameterType] = &[
-                $($param::TYPE),*
-            ];
-
-            fn into_value(self) -> Vec<ParameterValue> {
-                let ($($name,)*) = self;
-                vec![$($name.into_value()),*]
+            const TYPE: &'static [ParameterType] = &[$($P::TYPE),*];
+            #[allow(unused_variables)]
+            fn into_params<'a>(b: Self::Borrowed<'a>) -> Vec<Param<'a>> {
+                let ($($name,)*) = b;
+                vec![$($P::into_param($name)),*]
             }
-
-            fn from_value(value: Vec<ParameterValue>) -> Result<Self, Error> {
-                match <[ParameterValue; $N]>::try_from(value) {
-                    Ok([$($name,)*]) => Ok(($($param::from_value($name)?,)*)),
-                    Err(value) => Err(Error::UnexpectedNoOfArguments(value.len(), $N))
+            fn from_params<'a>(p: Vec<Param<'a>>) -> Result<Self::Borrowed<'a>, Error> {
+                match <[Param<'a>; $N]>::try_from(p) {
+                    Ok([$($name,)*]) => Ok(($($P::from_param($name)?,)*)),
+                    Err(v) => Err(Error::UnexpectedNoOfArguments(v.len(), $N)),
                 }
             }
         }

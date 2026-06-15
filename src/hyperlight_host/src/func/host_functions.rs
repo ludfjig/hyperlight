@@ -16,9 +16,9 @@ limitations under the License.
 
 use std::sync::{Arc, Mutex};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
 use hyperlight_common::for_each_tuple;
-use hyperlight_common::func::{Error as FuncError, Function, ResultType};
+use hyperlight_common::func::{Error as FuncError, Function, OwnedReturn, ResultType};
+use hyperlight_common::wire::Param;
 
 use super::{ParameterTuple, SupportedReturnType};
 use crate::sandbox::UninitializedSandbox;
@@ -57,25 +57,6 @@ impl Registerable for UninitializedSandbox {
     }
 }
 
-/// Allow registering host functions on an already-evolved
-/// [`crate::MultiUseSandbox`].
-///
-/// The primary entry point for host-function registration is the
-/// `UninitializedSandbox` impl above — that's the lifecycle phase
-/// where the guest hasn't yet been allowed to issue host calls.
-/// There are, however, cases where a `MultiUseSandbox` is obtained
-/// without traversing the `Uninitialized → evolve()` path:
-///
-/// - Sandboxes loaded from a persisted snapshot.
-/// - Any future API that yields a `MultiUseSandbox` directly.
-///
-/// In those cases the caller never had a chance to call
-/// `register_host_function` on an `UninitializedSandbox`, so we
-/// expose the same trait implementation here for late registration.
-/// The guest's host-function dispatcher resolves by name at call
-/// time, so inserting into the registry after `evolve()` is
-/// semantically safe as long as the first host-function invocation
-/// happens after registration completes.
 impl Registerable for crate::MultiUseSandbox {
     fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
         &mut self,
@@ -94,10 +75,6 @@ impl Registerable for crate::MultiUseSandbox {
         };
 
         (*hfs).register_host_function(name.to_string(), entry);
-
-        // Registration mutates the host-function set captured in
-        // snapshots. Invalidate the cached snapshot so the next
-        // `snapshot()` call reflects the updated registry.
         self.snapshot = None;
         Ok(())
     }
@@ -121,58 +98,31 @@ impl Registerable for crate::HostFunctions {
     }
 }
 
-/// A representation of a host function.
-/// This is a thin wrapper around a `Fn(Args) -> Result<Output>`.
+/// A typed host function. Dispatches a borrowed parameter vector to
+/// the user's closure via the [`Function`] trait, then converts the
+/// return value into an owned form ready for serialization.
 #[derive(Clone)]
 pub struct HostFunction<Output, Args>
 where
     Args: ParameterTuple,
     Output: SupportedReturnType,
 {
-    // This is a thin wrapper around a `Function<Output, Args, HyperlightError>`.
-    // But unlike `Function<..>` which is a trait, this is a concrete type.
-    // This allows us to:
-    //  1. Impose constraints on the function arguments and return type.
-    //  2. Impose a single function signature.
-    //
-    // This second point is important because the `Function<..>` trait is generic
-    // over the function arguments and return type.
-    // This means that a given type could implement `Function<..>` for multiple
-    // function signatures.
-    // This means we can't do something like:
-    // ```rust,ignore
-    // impl<Args, Output, F> SomeTrait for F
-    // where
-    //     F: Function<Output, Args, HyperlightError>,
-    // { ... }
-    // ```
-    // because the concrete type F might implement `Function<..>` for multiple
-    // arguments and return types, and that would means implementing `SomeTrait`
-    // multiple times for the same type F.
-
-    // Use Arc in here instead of Box because it's useful in tests and
-    // presumably in other places to be able to clone a HostFunction and
-    // use it across different sandboxes.
-    func: Arc<dyn Function<Output, Args, HyperlightError> + Send + Sync + 'static>,
+    func: Arc<dyn Function<Output, Args, HyperlightError>>,
 }
+
+/// Type-erased host function used by the registry. The closure takes
+/// a borrowed parameter vector and returns an owned return value.
+type ErasedHostFn = dyn for<'a> Fn(Vec<Param<'a>>) -> std::result::Result<OwnedReturn, HyperlightError>
+    + Send
+    + Sync
+    + 'static;
 
 pub(crate) struct TypeErasedHostFunction {
-    func: Box<dyn Fn(Vec<ParameterValue>) -> Result<ReturnValue> + Send + Sync + 'static>,
-}
-
-impl<Args, Output> HostFunction<Output, Args>
-where
-    Args: ParameterTuple,
-    Output: SupportedReturnType,
-{
-    /// Call the host function with the given arguments.
-    pub fn call(&self, args: Args) -> Result<Output> {
-        self.func.call(args)
-    }
+    func: Box<ErasedHostFn>,
 }
 
 impl TypeErasedHostFunction {
-    pub(crate) fn call(&self, args: Vec<ParameterValue>) -> Result<ReturnValue> {
+    pub(crate) fn call(&self, args: Vec<Param<'_>>) -> Result<OwnedReturn> {
         (self.func)(args)
     }
 }
@@ -189,12 +139,6 @@ impl From<FuncError> for HyperlightError {
             FuncError::UnexpectedNoOfArguments(got, expected) => {
                 HyperlightError::UnexpectedNoOfArguments(got, expected)
             }
-            FuncError::UnexpectedParameterValueType(got, expected) => {
-                HyperlightError::UnexpectedParameterValueType(got, expected)
-            }
-            FuncError::UnexpectedReturnValueType(got, expected) => {
-                HyperlightError::UnexpectedReturnValueType(got, expected)
-            }
         }
     }
 }
@@ -206,62 +150,79 @@ where
 {
     fn from(func: HostFunction<Output, Args>) -> TypeErasedHostFunction {
         TypeErasedHostFunction {
-            func: Box::new(move |args: Vec<ParameterValue>| {
-                let args = Args::from_value(args)?;
-                Ok(func.call(args)?.into_value())
+            func: Box::new(move |args: Vec<Param<'_>>| {
+                let r = func.func.call_with_params(args)?;
+                Ok(r.into_owned())
             }),
         }
     }
 }
 
+/// Adapter that holds a `FnMut` closure behind a `Mutex` and exposes
+/// it as a [`Function`] implementation. The `Marker` type parameter
+/// disambiguates the tuple shape so different arities produce
+/// distinct concrete types without overlapping impls.
+struct TupleAdapter<F, R, E, Marker> {
+    inner: Mutex<F>,
+    _m: core::marker::PhantomData<fn(E, Marker) -> R>,
+}
+
 macro_rules! impl_host_function {
     ([$N:expr] ($($p:ident: $P:ident),*)) => {
-        /*
-        // Normally for a `Fn + Send + Sync` we don't need to use a Mutex
-        // like we do in the case of a `FnMut`.
-        // However, we can't implement `IntoHostFunction` for `Fn` and `FnMut`
-        // because `FnMut` is a supertrait of `Fn`.
-         */
-
         impl<F, R, $($P),*> From<F> for HostFunction<R::ReturnType, ($($P,)*)>
         where
-            F: FnMut($($P),*) -> R + Send + 'static,
+            F: for<'a> FnMut($(<$P as super::SupportedParameterType>::Borrowed<'a>),*) -> R
+                + Send + 'static,
             ($($P,)*): ParameterTuple,
-            R: ResultType<HyperlightError>,
+            R: ResultType<HyperlightError> + 'static,
+            R::ReturnType: SupportedReturnType,
+            $($P: super::SupportedParameterType,)*
         {
+            #[allow(non_snake_case, unused_parens)]
             fn from(func: F) -> HostFunction<R::ReturnType, ($($P,)*)> {
-                let func = Mutex::new(func);
-                let func = move |$($p: $P,)*| {
-                    let mut func = func.lock().map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
-                    (func)($($p),*).into_result()
-                };
-                let func = Arc::new(func);
-                HostFunction { func }
+                HostFunction {
+                    func: Arc::new(TupleAdapter::<F, R::ReturnType, HyperlightError, ($($P,)*)> {
+                        inner: Mutex::new(func),
+                        _m: core::marker::PhantomData,
+                    }),
+                }
+            }
+        }
+
+        impl<F, R, E, $($P),*> Function<R::ReturnType, ($($P,)*), E>
+            for TupleAdapter<F, R::ReturnType, E, ($($P,)*)>
+        where
+            F: for<'a> FnMut($(<$P as super::SupportedParameterType>::Borrowed<'a>),*) -> R
+                + Send + 'static,
+            $($P: super::SupportedParameterType,)*
+            R: ResultType<E> + 'static,
+            R::ReturnType: SupportedReturnType,
+            E: From<FuncError> + core::fmt::Debug + 'static,
+        {
+            #[allow(non_snake_case, unused_parens, unused_variables, clippy::unused_unit)]
+            fn call_with_params<'a>(
+                &self,
+                params: Vec<Param<'a>>,
+            ) -> core::result::Result<R::ReturnType, E> {
+                match <[Param<'a>; $N]>::try_from(params) {
+                    Ok([$($p,)*]) => {
+                        $(let $p = <$P as super::SupportedParameterType>::from_param($p)?;)*
+                        let mut f = self.inner.lock().map_err(|_| {
+                            FuncError::ParameterValueConversionFailure(
+                                hyperlight_common::wire::ParameterType::Int,
+                                "lock poisoned",
+                            )
+                        })?;
+                        (f)($($p),*).into_result()
+                    }
+                    Err(v) => Err(FuncError::UnexpectedNoOfArguments(v.len(), $N).into()),
+                }
             }
         }
     };
 }
 
+// Wrap the macro that lets us bridge user closures with arbitrary
+// `FnMut(P1::Borrowed<'_>, .., Pn::Borrowed<'_>) -> R` shapes into a
+// uniform `Function<R, (P1, .., Pn), HyperlightError>` adapter.
 for_each_tuple!(impl_host_function);
-
-pub(crate) fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
-    func: impl Into<HostFunction<Output, Args>>,
-    sandbox: &mut UninitializedSandbox,
-    name: &str,
-) -> Result<()> {
-    let func = func.into().into();
-
-    let entry = FunctionEntry {
-        function: func,
-        parameter_types: Args::TYPE,
-        return_type: Output::TYPE,
-    };
-
-    sandbox
-        .host_funcs
-        .try_lock()
-        .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
-        .register_host_function(name.to_string(), entry);
-
-    Ok(())
-}

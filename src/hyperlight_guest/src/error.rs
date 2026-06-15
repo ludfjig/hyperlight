@@ -17,8 +17,8 @@ limitations under the License.
 use alloc::format;
 use alloc::string::{String, ToString as _};
 
-pub use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::func::Error as FuncError;
+pub use hyperlight_common::wire::ErrorCode;
 use {anyhow, serde_json};
 
 pub type Result<T> = core::result::Result<T, HyperlightGuestError>;
@@ -65,15 +65,7 @@ impl From<FuncError> for HyperlightGuestError {
                 e.to_string(),
             ),
             FuncError::UnexpectedNoOfArguments(..) => HyperlightGuestError::new(
-                ErrorCode::GuestFunctionIncorrecNoOfParameters,
-                e.to_string(),
-            ),
-            FuncError::UnexpectedParameterValueType(..) => HyperlightGuestError::new(
-                ErrorCode::GuestFunctionParameterTypeMismatch,
-                e.to_string(),
-            ),
-            FuncError::UnexpectedReturnValueType(..) => HyperlightGuestError::new(
-                ErrorCode::GuestFunctionParameterTypeMismatch,
+                ErrorCode::GuestFunctionIncorrectNoOfParameters,
                 e.to_string(),
             ),
         }

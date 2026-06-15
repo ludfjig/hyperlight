@@ -14,32 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use alloc::string::String;
-
 use thiserror::Error;
 
-use crate::func::{ParameterValue, ReturnValue};
+use crate::wire::ParameterType;
 
-/// The error type for Hyperlight operations
-#[derive(Error, Debug)]
+/// Errors returned by the function dispatch machinery.
+///
+/// Variants carry only static, copy-friendly metadata so the error
+/// type does not borrow from the wire buffer.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Failed to get value from parameter value
-    #[error("Failed To Convert Parameter Value {0:?} to {1:?}")]
-    ParameterValueConversionFailure(ParameterValue, &'static str),
+    /// A parameter's wire tag did not match the type the dispatched
+    /// function expected.
+    #[error("Failed to convert parameter of type {0:?} to {1}")]
+    ParameterValueConversionFailure(ParameterType, &'static str),
 
-    /// Failed to get value from return value
-    #[error("Failed To Convert Return Value {0:?} to {1:?}")]
-    ReturnValueConversionFailure(ReturnValue, &'static str),
+    /// A function returned a value whose wire tag did not match the
+    /// type the caller expected.
+    #[error("Failed to convert return value of type {0} to {1}")]
+    ReturnValueConversionFailure(&'static str, &'static str),
 
-    /// A function was called with an incorrect number of arguments
-    #[error("The number of arguments to the function is wrong: got {0:?} expected {1:?}")]
+    /// A function was invoked with the wrong arity.
+    #[error("The number of arguments to the function is wrong: got {0} expected {1}")]
     UnexpectedNoOfArguments(usize, usize),
-
-    /// The parameter value type is unexpected
-    #[error("The parameter value type is unexpected got {0:?} expected {1:?}")]
-    UnexpectedParameterValueType(ParameterValue, String),
-
-    /// The return value type is unexpected
-    #[error("The return value type is unexpected got {0:?} expected {1:?}")]
-    UnexpectedReturnValueType(ReturnValue, String),
 }

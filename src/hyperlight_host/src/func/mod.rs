@@ -29,18 +29,11 @@ pub(crate) mod host_functions;
 
 /// Re-export for `HostFunction` trait
 pub use host_functions::{HostFunction, Registerable};
-/// Re-export for `ParameterType` enum
-pub use hyperlight_common::flatbuffer_wrappers::function_types::ParameterType;
-/// Re-export for `ParameterValue` enum
-pub use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
-/// Re-export for `ReturnType` enum
-pub use hyperlight_common::flatbuffer_wrappers::function_types::ReturnType;
-/// Re-export for `ReturnValue` enum
-pub use hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue;
-/// Re-export for `HostFunctionDefinition`
-pub use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
-/// Re-export for `HostFunctionDetails`
-pub use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 pub use hyperlight_common::func::{
-    ParameterTuple, ResultType, SupportedParameterType, SupportedReturnType,
+    Bytes, IntoParam, IntoParameters, OwnedReturn, ParameterTuple, ResultType, Str,
+    SupportedParameterType, SupportedReturnType,
+};
+/// Re-exports of the wire types describing function call shapes.
+pub use hyperlight_common::wire::{
+    HostFunctionDefinition, HostFunctionDetails, Param, ParameterType, ReturnType, ReturnValue,
 };

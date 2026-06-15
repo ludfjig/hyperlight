@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
  */
 
-pub use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-pub use hyperlight_common::flatbuffer_wrappers::function_types::{
-    ParameterType, ParameterValue, ReturnType, ReturnValue,
+pub use hyperlight_common::wire::{
+    FunctionCall, FunctionCallType, Param, ParameterType, ReturnType, ReturnValue,
 };

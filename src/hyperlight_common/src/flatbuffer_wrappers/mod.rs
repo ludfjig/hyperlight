@@ -14,18 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod function_call;
-pub mod function_types;
-pub mod guest_error;
-/// cbindgen:ignore
-pub mod guest_log_data;
-/// cbindgen:ignore
-pub mod guest_log_level;
 /// cbindgen:ignore
 #[cfg(feature = "trace_guest")]
 pub mod guest_trace_data;
-/// cbindgen:ignore
-pub mod host_function_definition;
-/// cbindgen:ignore
-pub mod host_function_details;
-pub mod util;

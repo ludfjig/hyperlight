@@ -18,24 +18,70 @@ limitations under the License.
 
 use std::sync::{Mutex, OnceLock};
 
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use hyperlight_host::func::{ParameterValue, ReturnType};
+use hyperlight_common::wire::{ErrorCode, Param};
+use hyperlight_host::func::ReturnType;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox::uninitialized::GuestBinary;
 use hyperlight_host::{HyperlightError, MultiUseSandbox, UninitializedSandbox};
 use hyperlight_testing::simple_guest_for_fuzzing_as_string;
+use libfuzzer_sys::arbitrary::{Arbitrary, Result as ArbResult, Unstructured};
 use libfuzzer_sys::fuzz_target;
 
 static SANDBOX: OnceLock<Mutex<MultiUseSandbox>> = OnceLock::new();
 
-// This fuzz target tests all combinations of ReturnType and Parameters for `call_guest_function_by_name`.
-// For fuzzing efficiency, we create one Sandbox and reuse it for all fuzzing iterations.
+/// Owned variant of a wire `Param`. Backing storage for the borrows
+/// `Param<'_>` carries.
+#[derive(Debug)]
+enum OwnedParam {
+    Int(i32),
+    UInt(u32),
+    Long(i64),
+    ULong(u64),
+    Float(f32),
+    Double(f64),
+    Bool(bool),
+    String(String),
+    VecBytes(Vec<u8>),
+}
+
+impl<'a> Arbitrary<'a> for OwnedParam {
+    fn arbitrary(u: &mut Unstructured<'a>) -> ArbResult<Self> {
+        match u.int_in_range(0..=8)? {
+            0 => Ok(OwnedParam::Int(u.arbitrary()?)),
+            1 => Ok(OwnedParam::UInt(u.arbitrary()?)),
+            2 => Ok(OwnedParam::Long(u.arbitrary()?)),
+            3 => Ok(OwnedParam::ULong(u.arbitrary()?)),
+            4 => Ok(OwnedParam::Float(u.arbitrary()?)),
+            5 => Ok(OwnedParam::Double(u.arbitrary()?)),
+            6 => Ok(OwnedParam::Bool(u.arbitrary()?)),
+            7 => Ok(OwnedParam::String(u.arbitrary()?)),
+            _ => Ok(OwnedParam::VecBytes(u.arbitrary()?)),
+        }
+    }
+}
+
+impl OwnedParam {
+    fn as_param(&self) -> Param<'_> {
+        match self {
+            OwnedParam::Int(v) => Param::Int(*v),
+            OwnedParam::UInt(v) => Param::UInt(*v),
+            OwnedParam::Long(v) => Param::Long(*v),
+            OwnedParam::ULong(v) => Param::ULong(*v),
+            OwnedParam::Float(v) => Param::Float(*v),
+            OwnedParam::Double(v) => Param::Double(*v),
+            OwnedParam::Bool(v) => Param::Bool(*v),
+            OwnedParam::String(s) => Param::String(s.as_str()),
+            OwnedParam::VecBytes(b) => Param::VecBytes(b.as_slice()),
+        }
+    }
+}
+
 fuzz_target!(
     init: {
         let mut cfg = SandboxConfiguration::default();
-        cfg.set_output_data_size(64 * 1024); // 64 KB output buffer
-        cfg.set_input_data_size(64 * 1024); // 64 KB input buffer
-        cfg.set_scratch_size(512 * 1024); // large scratch region to contain those buffers, any data copies, etc.
+        cfg.set_output_data_size(64 * 1024);
+        cfg.set_input_data_size(64 * 1024);
+        cfg.set_scratch_size(512 * 1024);
         let u_sbox = UninitializedSandbox::new(
             GuestBinary::FilePath(simple_guest_for_fuzzing_as_string().expect("Guest Binary Missing")),
             Some(cfg)
@@ -46,23 +92,22 @@ fuzz_target!(
         SANDBOX.set(Mutex::new(mu_sbox)).unwrap();
     },
 
-    |data: (String, ReturnType, Vec<ParameterValue>)| {
-        let (host_func_name, host_func_return, mut host_func_params) = data;
+    |data: (String, ReturnType, Vec<OwnedParam>)| {
+        let (host_func_name, host_func_return, owned_params) = data;
         let mut sandbox = SANDBOX.get().unwrap().lock().unwrap();
-        host_func_params.insert(0, ParameterValue::String(host_func_name.clone()));
-        if let Err(e) = sandbox.call_type_erased_guest_function_by_name("FuzzHostFunc", host_func_return, host_func_params) {
+        let mut params: Vec<Param<'_>> = Vec::with_capacity(owned_params.len() + 1);
+        params.push(Param::String(host_func_name.as_str()));
+        for p in &owned_params {
+            params.push(p.as_param());
+        }
+        if let Err(e) = sandbox.call_type_erased_guest_function_by_name("FuzzHostFunc", host_func_return, params) {
             match e {
-                // the following are expected errors and occur frequently since
-                // we are randomly generating the function name and parameters
-                // to call with.
                 HyperlightError::HostFunctionNotFound(_) => {}
                 HyperlightError::GuestError(ErrorCode::HostFunctionError, msg) if msg == format!("HostFunction {} was not found", host_func_name) => {}
                 HyperlightError::UnexpectedNoOfArguments(_, _) => {},
                 HyperlightError::GuestError(ErrorCode::HostFunctionError, msg) if msg.contains("The number of arguments to the function is wrong") => {}
                 HyperlightError::ParameterValueConversionFailure(_, _) => {},
                 HyperlightError::GuestError(ErrorCode::HostFunctionError, msg) if msg.contains("Failed To Convert Parameter Value") => {}
-
-                // any other error should be reported
                 _ => panic!("Guest Aborted with Unexpected Error: {:?}", e),
             }
         }

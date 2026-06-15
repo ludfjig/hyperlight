@@ -29,7 +29,7 @@ fuzz_target!(
         let mut sandbox = SANDBOX.get().unwrap().lock().unwrap();
         let len: i32 = sandbox.call::<i32>(
             "PrintOutput",
-            data,
+            data.as_str(),
         )
         .expect("Unexpected return value");
         assert!(len >= 0);

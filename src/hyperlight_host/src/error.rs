@@ -26,8 +26,7 @@ use std::time::SystemTimeError;
 #[cfg(target_os = "windows")]
 use crossbeam_channel::{RecvError, SendError};
 use flatbuffers::InvalidFlatbuffer;
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+use hyperlight_common::wire::{ErrorCode, ParameterType};
 use thiserror::Error;
 
 use crate::hypervisor::hyperlight_vm::HyperlightVmError;
@@ -75,10 +74,6 @@ pub enum HyperlightError {
     /// Guest execution was cancelled by the host
     #[error("Execution was cancelled by the host.")]
     ExecutionCanceledByHost(),
-
-    /// Accessing the value of a flatbuffer parameter failed
-    #[error("Failed to get a value from flat buffer parameter")]
-    FailedToGetValueFromParameter(),
 
     ///Field Name not found in decoded GuestLogData
     #[error("Field Name {0} not found in decoded GuestLogData")]
@@ -196,8 +191,8 @@ pub enum HyperlightError {
     NoMemorySnapshot,
 
     /// Failed to get value from parameter value
-    #[error("Failed To Convert Parameter Value {0:?} to {1:?}")]
-    ParameterValueConversionFailure(ParameterValue, &'static str),
+    #[error("Failed To Convert Parameter Value of type {0:?} to {1}")]
+    ParameterValueConversionFailure(ParameterType, &'static str),
 
     /// a failure occurred processing a PE file
     #[error("Failure processing PE File {0:?}")]
@@ -237,8 +232,8 @@ pub enum HyperlightError {
     RefCellMutBorrowFailed(#[from] BorrowMutError),
 
     /// Failed to get value from return value
-    #[error("Failed To Convert Return Value {0:?} to {1:?}")]
-    ReturnValueConversionFailure(ReturnValue, &'static str),
+    #[error("Failed To Convert Return Value of type {0} to {1}")]
+    ReturnValueConversionFailure(&'static str, &'static str),
 
     /// Tried to restore a snapshot into a sandbox whose memory
     /// layout is not compatible with the snapshot's.
@@ -274,11 +269,11 @@ pub enum HyperlightError {
 
     /// The parameter value type is unexpected
     #[error("The parameter value type is unexpected got {0:?} expected {1:?}")]
-    UnexpectedParameterValueType(ParameterValue, String),
+    UnexpectedParameterValueType(ParameterType, String),
 
     /// The return value type is unexpected
-    #[error("The return value type is unexpected got {0:?} expected {1:?}")]
-    UnexpectedReturnValueType(ReturnValue, String),
+    #[error("The return value type is unexpected got {0} expected {1:?}")]
+    UnexpectedReturnValueType(&'static str, String),
 
     /// Slice conversion to UTF8 failed
     #[error("String Conversion of UTF8 data to str failed")]
@@ -369,7 +364,6 @@ impl HyperlightError {
             | HyperlightError::CheckedAddOverflow(_, _)
             | HyperlightError::CStringConversionError(_)
             | HyperlightError::Error(_)
-            | HyperlightError::FailedToGetValueFromParameter()
             | HyperlightError::FieldIsMissingInGuestLogData(_)
             | HyperlightError::GuestBinVersionMismatch { .. }
             | HyperlightError::GuestError(_, _)

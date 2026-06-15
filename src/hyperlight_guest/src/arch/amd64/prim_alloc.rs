@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
  */
 
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+use hyperlight_common::wire::ErrorCode;
 
 // There are no notable architecture-specific safety considerations
 // here, and the general conditions are documented in the

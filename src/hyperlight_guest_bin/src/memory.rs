@@ -19,7 +19,7 @@ use core::ffi::c_void;
 use core::mem::{align_of, size_of};
 use core::ptr;
 
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+use hyperlight_common::wire::ErrorCode;
 use hyperlight_guest::exit::abort_with_code;
 
 /*

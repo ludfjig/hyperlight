@@ -15,14 +15,48 @@ limitations under the License.
 */
 
 use alloc::ffi::CString;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::ffi::{CStr, c_char};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ParameterValue};
+use hyperlight_common::wire::{Param, ParameterType};
 use hyperlight_guest::error::Result;
 
 use crate::types::FfiVec;
 
-/// A union of the value stored in a ParameterValue, used for FFI.
+/// Owned form of a parameter value used inside the C API to keep the
+/// backing storage alive while a borrowed [`Param`] is constructed
+/// for downstream calls.
+pub enum OwnedParam {
+    Int(i32),
+    UInt(u32),
+    Long(i64),
+    ULong(u64),
+    Float(f32),
+    Double(f64),
+    Bool(bool),
+    String(String),
+    VecBytes(Vec<u8>),
+}
+
+impl OwnedParam {
+    /// Borrow this owned parameter as a wire [`Param`].
+    pub fn as_param(&self) -> Param<'_> {
+        match self {
+            OwnedParam::Int(v) => Param::Int(*v),
+            OwnedParam::UInt(v) => Param::UInt(*v),
+            OwnedParam::Long(v) => Param::Long(*v),
+            OwnedParam::ULong(v) => Param::ULong(*v),
+            OwnedParam::Float(v) => Param::Float(*v),
+            OwnedParam::Double(v) => Param::Double(*v),
+            OwnedParam::Bool(v) => Param::Bool(*v),
+            OwnedParam::String(s) => Param::String(s.as_str()),
+            OwnedParam::VecBytes(v) => Param::VecBytes(v.as_slice()),
+        }
+    }
+}
+
+/// A union of the value stored in a Param, used for FFI.
 /// On it's own, this union has no way to know which value type is stored
 /// which is why it's used in conjunction with `ParameterType` in `FfiParameter`.
 #[repr(C)]
@@ -40,7 +74,7 @@ pub union FfiParameterValue {
     pub VecBytes: FfiVec,
 }
 
-/// An owned FFI version Of `ParameterValue`
+/// An owned FFI version of a wire [`Param`].
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct FfiParameter {
@@ -49,23 +83,24 @@ pub struct FfiParameter {
 }
 
 impl FfiParameter {
-    /// Returns a new `FfiParameter` by consuming a `ParameterValue`
-    pub fn from_parameter_value(value: ParameterValue) -> Result<Self> {
+    /// Returns a new `FfiParameter` by copying a wire [`Param`] into owned
+    /// FFI storage.
+    pub fn from_param(value: Param<'_>) -> Result<Self> {
         let (tag, union) = match value {
-            ParameterValue::Int(v) => (ParameterType::Int, FfiParameterValue { Int: v }),
-            ParameterValue::UInt(v) => (ParameterType::UInt, FfiParameterValue { UInt: v }),
-            ParameterValue::Long(v) => (ParameterType::Long, FfiParameterValue { Long: v }),
-            ParameterValue::ULong(v) => (ParameterType::ULong, FfiParameterValue { ULong: v }),
-            ParameterValue::Float(v) => (ParameterType::Float, FfiParameterValue { Float: v }),
-            ParameterValue::Double(v) => (ParameterType::Double, FfiParameterValue { Double: v }),
-            ParameterValue::Bool(v) => (ParameterType::Bool, FfiParameterValue { Bool: v }),
-            ParameterValue::String(v) => {
-                let c_str = CString::new(v.as_str()).expect("Unable to make CString from String");
+            Param::Int(v) => (ParameterType::Int, FfiParameterValue { Int: v }),
+            Param::UInt(v) => (ParameterType::UInt, FfiParameterValue { UInt: v }),
+            Param::Long(v) => (ParameterType::Long, FfiParameterValue { Long: v }),
+            Param::ULong(v) => (ParameterType::ULong, FfiParameterValue { ULong: v }),
+            Param::Float(v) => (ParameterType::Float, FfiParameterValue { Float: v }),
+            Param::Double(v) => (ParameterType::Double, FfiParameterValue { Double: v }),
+            Param::Bool(v) => (ParameterType::Bool, FfiParameterValue { Bool: v }),
+            Param::String(s) => {
+                let c_str = CString::new(s).expect("Unable to make CString from &str");
                 let leaked = c_str.into_raw();
                 (ParameterType::String, FfiParameterValue { String: leaked })
             }
-            ParameterValue::VecBytes(v) => {
-                let leaked = unsafe { FfiVec::from_vec(v) };
+            Param::VecBytes(b) => {
+                let leaked = unsafe { FfiVec::from_vec(b.to_vec()) };
                 (
                     ParameterType::VecBytes,
                     FfiParameterValue { VecBytes: leaked },
@@ -75,25 +110,25 @@ impl FfiParameter {
         Ok(FfiParameter { tag, value: union })
     }
 
-    /// Copies self into a new `ParameterValue`.
+    /// Copies self into a new [`OwnedParam`].
     /// # Safety
-    /// `self` must be an unmodified version of what `from_parameter_value` returned.
-    pub unsafe fn copy_to_parameter_value(&self) -> ParameterValue {
+    /// `self` must be an unmodified version of what `from_param` returned.
+    pub unsafe fn copy_to_owned_param(&self) -> OwnedParam {
         match self.tag {
-            ParameterType::Int => ParameterValue::Int(unsafe { self.value.Int }),
-            ParameterType::UInt => ParameterValue::UInt(unsafe { self.value.UInt }),
-            ParameterType::Long => ParameterValue::Long(unsafe { self.value.Long }),
-            ParameterType::ULong => ParameterValue::ULong(unsafe { self.value.ULong }),
-            ParameterType::Float => ParameterValue::Float(unsafe { self.value.Float }),
-            ParameterType::Double => ParameterValue::Double(unsafe { self.value.Double }),
-            ParameterType::Bool => ParameterValue::Bool(unsafe { self.value.Bool }),
-            ParameterType::String => ParameterValue::String(
+            ParameterType::Int => OwnedParam::Int(unsafe { self.value.Int }),
+            ParameterType::UInt => OwnedParam::UInt(unsafe { self.value.UInt }),
+            ParameterType::Long => OwnedParam::Long(unsafe { self.value.Long }),
+            ParameterType::ULong => OwnedParam::ULong(unsafe { self.value.ULong }),
+            ParameterType::Float => OwnedParam::Float(unsafe { self.value.Float }),
+            ParameterType::Double => OwnedParam::Double(unsafe { self.value.Double }),
+            ParameterType::Bool => OwnedParam::Bool(unsafe { self.value.Bool }),
+            ParameterType::String => OwnedParam::String(
                 unsafe { CStr::from_ptr(self.value.String) }
                     .to_string_lossy()
                     .into_owned(),
             ),
             ParameterType::VecBytes => {
-                ParameterValue::VecBytes(unsafe { self.value.VecBytes.copy_to_vec() })
+                OwnedParam::VecBytes(unsafe { self.value.VecBytes.copy_to_vec() })
             }
         }
     }

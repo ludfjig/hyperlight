@@ -35,12 +35,12 @@ fn pass_byte_array() {
         const LEN: usize = 10;
         let bytes = vec![1u8; LEN];
         let res: Vec<u8> = sandbox
-            .call("SetByteArrayToZero", bytes.clone())
+            .call("SetByteArrayToZero", bytes.as_slice())
             .expect("Expected VecBytes");
         assert_eq!(res, [0; LEN]);
 
         sandbox
-            .call::<i32>("SetByteArrayToZeroNoLength", bytes.clone())
+            .call::<i32>("SetByteArrayToZeroNoLength", bytes.as_slice())
             .unwrap_err(); // missing length param
     });
 }
@@ -115,7 +115,7 @@ fn invalid_guest_function_name() {
         let fn_name = "FunctionDoesntExist";
         let res = sandbox.call::<i32>(fn_name, ());
         assert!(
-            matches!(res.unwrap_err(), HyperlightError::GuestError(hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode::GuestFunctionNotFound, error_name) if error_name == fn_name)
+            matches!(res.unwrap_err(), HyperlightError::GuestError(hyperlight_common::wire::ErrorCode::GuestFunctionNotFound, error_name) if error_name == fn_name)
         );
     });
 }
@@ -136,17 +136,17 @@ fn set_static() {
 #[test]
 fn multiple_parameters() {
     let (tx, rx) = channel();
-    let writer = move |msg: String| {
-        tx.send(msg).unwrap();
+    let writer = move |msg: &str| {
+        tx.send(msg.to_string()).unwrap();
         0
     };
 
     let args = (
-        ("1".to_string(), "arg1:1"),
+        ("1", "arg1:1"),
         (2_i32, "arg2:2"),
         (3_i64, "arg3:3"),
-        ("4".to_string(), "arg4:4"),
-        ("5".to_string(), "arg5:5"),
+        ("4", "arg4:4"),
+        ("5", "arg5:5"),
         (true, "arg6:true"),
         (false, "arg7:false"),
         (8_u32, "arg8:8"),
@@ -188,7 +188,7 @@ fn incorrect_parameter_type() {
         assert!(matches!(
             res.unwrap_err(),
             HyperlightError::GuestError(
-                hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode::GuestFunctionParameterTypeMismatch,
+                hyperlight_common::wire::ErrorCode::GuestFunctionParameterTypeMismatch,
                 msg
             ) if msg == "Expected parameter type String for parameter index 0 of function Echo but got Int."
         ));
@@ -198,11 +198,11 @@ fn incorrect_parameter_type() {
 #[test]
 fn incorrect_parameter_num() {
     with_all_sandboxes(|mut sandbox| {
-        let res = sandbox.call::<i32>("Echo", ("1".to_string(), 2_i32));
+        let res = sandbox.call::<i32>("Echo", ("1", 2_i32));
         assert!(matches!(
             res.unwrap_err(),
             HyperlightError::GuestError(
-                hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode::GuestFunctionIncorrecNoOfParameters,
+                hyperlight_common::wire::ErrorCode::GuestFunctionIncorrectNoOfParameters,
                 msg
             ) if msg == "Called function Echo with 2 parameters but it takes 1."
         ));
@@ -239,13 +239,13 @@ fn iostack_is_working() {
 fn simple_test_helper() {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let messages_clone = messages.clone();
-    let writer = move |msg: String| {
+    let writer = move |msg: &str| {
         let len = msg.len();
         let mut lock = messages_clone
             .try_lock()
             .map_err(|_| new_error!("Error locking"))
             .unwrap();
-        lock.push(msg);
+        lock.push(msg.to_string());
         len as i32
     };
 
@@ -253,15 +253,15 @@ fn simple_test_helper() {
     let message2 = "world";
 
     with_all_sandboxes_with_writer(writer.into(), |mut sandbox| {
-        let res: i32 = sandbox.call("PrintOutput", message.to_string()).unwrap();
+        let res: i32 = sandbox.call("PrintOutput", message).unwrap();
         assert_eq!(res, 5);
 
-        let res: String = sandbox.call("Echo", message2.to_string()).unwrap();
+        let res: String = sandbox.call("Echo", message2).unwrap();
         assert_eq!(res, "world");
 
         let buffer = [1u8, 2, 3, 4, 5, 6];
         let res: Vec<u8> = sandbox
-            .call("GetSizePrefixedBuffer", buffer.to_vec())
+            .call("GetSizePrefixedBuffer", buffer.as_slice())
             .unwrap();
         assert_eq!(res, buffer);
     });
@@ -285,6 +285,35 @@ fn simple_test() {
 }
 
 #[test]
+fn borrowed_return_test() {
+    let mut sandbox = crate::common::new_rust_sandbox();
+
+    // Sub-slice of a borrowed &str input: returns the first line.
+    let s: String = sandbox
+        .call("FirstLineBorrowed", "first line\nsecond line\nthird")
+        .unwrap();
+    assert_eq!(s, "first line");
+
+    // Empty input degrades to an empty borrowed slice.
+    let s: String = sandbox.call("FirstLineBorrowed", "").unwrap();
+    assert_eq!(s, "");
+
+    // Sub-slice of a borrowed &[u8] input.
+    let buffer: [u8; 9] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02, 0x03];
+    let v: Vec<u8> = sandbox
+        .call("FirstFourBytesBorrowed", buffer.as_slice())
+        .unwrap();
+    assert_eq!(v, &buffer[..4]);
+
+    // Input shorter than the prefix length: returns the full input.
+    let short = [0x11u8, 0x22];
+    let v: Vec<u8> = sandbox
+        .call("FirstFourBytesBorrowed", short.as_slice())
+        .unwrap();
+    assert_eq!(v, short);
+}
+
+#[test]
 fn simple_test_parallel() {
     let handles: Vec<_> = (0..50)
         .map(|_| {
@@ -304,9 +333,9 @@ fn callback_test_helper() {
         // create host function
         let (tx, rx) = channel();
         sandbox
-            .register("HostMethod1", move |msg: String| {
+            .register::<(hyperlight_host::func::Str,), i32>("HostMethod1", move |msg: &str| {
                 let len = msg.len();
-                tx.send(msg).unwrap();
+                tx.send(msg.to_string()).unwrap();
                 Ok(len as i32)
             })
             .unwrap();
@@ -314,9 +343,7 @@ fn callback_test_helper() {
         // call guest function that calls host function
         let mut init_sandbox: MultiUseSandbox = sandbox.evolve().unwrap();
         let msg = "Hello world";
-        init_sandbox
-            .call::<i32>("GuestMethod1", msg.to_string())
-            .unwrap();
+        init_sandbox.call::<i32>("GuestMethod1", msg).unwrap();
 
         let messages = rx.try_iter().collect::<Vec<_>>();
         assert_eq!(messages, [format!("Hello from GuestFunction1, {msg}")]);
@@ -348,9 +375,10 @@ fn host_function_error() {
     with_all_uninit_sandboxes(|mut sandbox| {
         // create host function
         sandbox
-            .register("HostMethod1", |_: String| -> Result<String> {
-                Err(new_error!("Host function error!"))
-            })
+            .register::<(hyperlight_host::func::Str,), String>(
+                "HostMethod1",
+                |_: &str| -> Result<String> { Err(new_error!("Host function error!")) },
+            )
             .unwrap();
 
         // call guest function that calls host function
@@ -359,9 +387,7 @@ fn host_function_error() {
         let snapshot = init_sandbox.snapshot().unwrap();
 
         for _ in 0..1000 {
-            let res = init_sandbox
-                .call::<i32>("GuestMethod1", msg.to_string())
-                .unwrap_err();
+            let res = init_sandbox.call::<i32>("GuestMethod1", msg).unwrap_err();
             assert!(
                 matches!(&res, HyperlightError::GuestError(_, msg) if msg == "Host function error!") // rust guest
                 || matches!(&res, HyperlightError::GuestAborted(_, msg) if msg.contains("Host function error!")), // c guest

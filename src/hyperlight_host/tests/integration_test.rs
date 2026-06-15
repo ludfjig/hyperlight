@@ -18,8 +18,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::log_level::GuestLogFilter;
+use hyperlight_common::wire::ErrorCode;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::{HyperlightError, MultiUseSandbox};
 use hyperlight_testing::simplelogger::{LOGGER, SimpleLogger};
@@ -107,7 +107,7 @@ fn interrupt_in_progress_guest_call() {
 
         barrier.wait();
         // Make sure we can still call guest functions after the VM was interrupted
-        sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+        sbox1.call::<String>("Echo", "hello").unwrap();
 
         // drop vm to make sure other thread can detect it
         drop(sbox1);
@@ -134,7 +134,7 @@ fn interrupt_guest_call_in_advance() {
         });
 
         barrier.wait(); // wait until `kill()` is called before starting the guest call
-        match sbox1.call::<String>("Echo", "hello".to_string()) {
+        match sbox1.call::<String>("Echo", "hello") {
             Ok(_) => {}
             Err(HyperlightError::ExecutionCanceledByHost()) => {
                 panic!("Unexpected Cancellation Error");
@@ -144,7 +144,7 @@ fn interrupt_guest_call_in_advance() {
 
         // Make sure we can still call guest functions after the VM was interrupted early
         // i.e. make sure we dont kill the next iteration.
-        sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+        sbox1.call::<String>("Echo", "hello").unwrap();
 
         // drop vm to make sure other thread can detect it
         drop(sbox1);
@@ -188,9 +188,9 @@ fn interrupt_same_thread() {
     for _ in 0..NUM_ITERS {
         barrier.wait();
         sbox1
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
-        match sbox2.call::<String>("Echo", "hello".to_string()) {
+        match sbox2.call::<String>("Echo", "hello") {
             // Only allow successful calls or interrupted.
             // The call can be successful in case the call is finished before kill() is called.
             Ok(_) | Err(HyperlightError::ExecutionCanceledByHost()) => {}
@@ -200,7 +200,7 @@ fn interrupt_same_thread() {
             sbox2.restore(snapshot2.clone()).unwrap();
         }
         sbox3
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
     }
     thread.join().expect("Thread should finish");
@@ -235,9 +235,9 @@ fn interrupt_same_thread_no_barrier() {
     barrier.wait();
     for _ in 0..NUM_ITERS {
         sbox1
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
-        match sbox2.call::<String>("Echo", "hello".to_string()) {
+        match sbox2.call::<String>("Echo", "hello") {
             // Only allow successful calls or interrupted.
             // The call can be successful in case the call is finished before kill() is called.
             Ok(_) | Err(HyperlightError::ExecutionCanceledByHost()) => {}
@@ -247,7 +247,7 @@ fn interrupt_same_thread_no_barrier() {
             sbox2.restore(snapshot2.clone()).unwrap();
         }
         sbox3
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
     }
     workload_done.store(true, Ordering::Relaxed);
@@ -366,9 +366,7 @@ fn interrupt_spamming_host_call() {
 
         barrier.wait();
         // This guest call calls "HostFunc1" in a loop
-        let res = sbox1
-            .call::<i32>("HostCallLoop", "HostFunc1".to_string())
-            .unwrap_err();
+        let res = sbox1.call::<i32>("HostCallLoop", "HostFunc1").unwrap_err();
 
         assert!(
             matches!(&res, HyperlightError::ExecutionCanceledByHost()),
@@ -382,10 +380,7 @@ fn interrupt_spamming_host_call() {
 #[test]
 fn print_four_args_c_guest() {
     with_c_sandbox(|mut sbox1| {
-        let res = sbox1.call::<i32>(
-            "PrintFourArgs",
-            ("Test4".to_string(), 3_i32, 4_i64, "Tested".to_string()),
-        );
+        let res = sbox1.call::<i32>("PrintFourArgs", ("Test4", 3_i32, 4_i64, "Tested"));
         assert!(matches!(&res, Ok(46)), "unexpected result: {res:?}");
     });
 }
@@ -409,7 +404,7 @@ fn guest_abort() {
 fn guest_abort_with_context1() {
     with_all_sandboxes(|mut sbox1| {
         let res = sbox1
-            .call::<()>("GuestAbortWithMessage", (25_i32, "Oh no".to_string()))
+            .call::<()>("GuestAbortWithMessage", (25_i32, "Oh no"))
             .unwrap_err();
         assert!(
             matches!(&res, HyperlightError::GuestAborted(code, context) if (*code == 25 && context == "Oh no")),
@@ -454,7 +449,7 @@ fn guest_abort_with_context2() {
                                 Proin sagittis nisl rhoncus mattis rhoncus urna. Magna eget est lorem ipsum.";
 
         let res = sbox1
-            .call::<()>("GuestAbortWithMessage", (60_i32, abort_message.to_string()))
+            .call::<()>("GuestAbortWithMessage", (60_i32, abort_message))
             .unwrap_err();
         assert!(
             matches!(&res, HyperlightError::GuestAborted(_, context) if context.contains("Guest abort buffer overflowed")),
@@ -472,7 +467,7 @@ fn guest_abort_c_guest() {
         let res = sbox1
             .call::<()>(
                 "GuestAbortWithMessage",
-                (75_i32, "This is a test error message".to_string()),
+                (75_i32, "This is a test error message"),
             )
             .unwrap_err();
         assert!(
@@ -487,7 +482,7 @@ fn guest_panic() {
     // this test is rust-specific
     with_rust_sandbox(|mut sbox1| {
         let res = sbox1
-            .call::<()>("guest_panic", "Error... error...".to_string())
+            .call::<()>("guest_panic", "Error... error...")
             .unwrap_err();
         assert!(
             matches!(&res, HyperlightError::GuestAborted(code, context) if *code == ErrorCode::UnknownError as u8 && context.contains("\nError... error...")),
@@ -584,13 +579,8 @@ fn corrupt_output_size_prefix_rejected() {
         let res = sbox.call::<i32>("CorruptOutputSizePrefix", ());
         assert!(
             res.is_err(),
-            "Expected error when guest corrupts size prefix, got: {:?}",
+            "Expected error when guest corrupts output frame, got: {:?}",
             res,
-        );
-        let err_msg = format!("{:?}", res.unwrap_err());
-        assert!(
-            err_msg.contains("Corrupt buffer size prefix: flatbuffer claims 4294967295 bytes but the element slot is only 8 bytes"),
-            "Unexpected error message: {err_msg}"
         );
     });
 }
@@ -607,7 +597,7 @@ fn corrupt_output_back_pointer_rejected() {
         let err_msg = format!("{:?}", res.unwrap_err());
         assert!(
             err_msg.contains(
-                "Corrupt buffer back-pointer: element offset 57005 is outside valid range [8, 8]"
+                "Corrupt buffer back-pointer: element offset 57005 is outside valid range [8, 16]"
             ),
             "Unexpected error message: {err_msg}"
         );
@@ -743,16 +733,16 @@ fn log_message() {
     // follows:
     //  - logs from trace level tracing spans created as logs because of the tracing `log` feature
     //    - 4 from evolve call (generic_init + hyperlight_main)
-    //    - 8 from guest call
+    //    - 4 from guest call
     // and are multiplied because we make 6 calls to `log_test_messages`
     // NOTE: These numbers need to be updated if log messages or spans are added/removed
-    let num_fixed_trace_log = 12 * 6;
-
-    // Calculate fixed info logs
-    // - 4 logs per iteration from infrastructure at Info level (internal_dispatch_function)
-    //   (dispatch x 1 + call_guest x 1) * 2 logs (Enter/Exit) = 4 logs
-    // - 6 iterations
-    let num_fixed_info_log = 4 * 6;
+    // TODO: `call_guest_function` in the guest is temporarily not instrumented
+    // (see comment in `src/hyperlight_guest_bin/src/guest_function/call.rs`),
+    // which is why the per-iteration trace count is 8 instead of 12 and there
+    // are no fixed Info-level records anymore. Restore both once the
+    // instrumentation is restored.
+    let num_fixed_trace_log = 8 * 6;
+    let num_fixed_info_log = 0;
 
     let tests = vec![
         (LevelFilter::TRACE, 5 + num_fixed_trace_log),
@@ -822,7 +812,7 @@ fn log_test_messages(levelfilter: Option<tracing_core::LevelFilter>) {
             let level: u64 = GuestLogFilter::from(*level).into();
             let message = format!("Hello from log_message level {}", level as i32);
             sbox1
-                .call::<()>("LogMessage", (message.to_string(), level as i32))
+                .call::<()>("LogMessage", (message.as_str(), level as i32))
                 .unwrap();
         });
     }
@@ -834,7 +824,7 @@ fn log_test_messages(levelfilter: Option<tracing_core::LevelFilter>) {
 fn test_if_guest_is_able_to_get_bool_return_values_from_host() {
     with_c_uninit_sandbox(|mut sbox1| {
         sbox1
-            .register("HostBool", |a: i32, b: i32| a + b > 10)
+            .register::<(i32, i32), bool>("HostBool", |a, b| a + b > 10)
             .unwrap();
         let mut sbox3 = sbox1.evolve().unwrap();
 
@@ -860,7 +850,7 @@ fn test_if_guest_is_able_to_get_bool_return_values_from_host() {
 fn test_if_guest_is_able_to_get_float_return_values_from_host() {
     with_c_uninit_sandbox(|mut sbox1| {
         sbox1
-            .register("HostAddFloat", |a: f32, b: f32| a + b)
+            .register::<(f32, f32), f32>("HostAddFloat", |a, b| a + b)
             .unwrap();
         let mut sbox3 = sbox1.evolve().unwrap();
         let res = sbox3
@@ -876,7 +866,7 @@ fn test_if_guest_is_able_to_get_float_return_values_from_host() {
 fn test_if_guest_is_able_to_get_double_return_values_from_host() {
     with_c_uninit_sandbox(|mut sbox1| {
         sbox1
-            .register("HostAddDouble", |a: f64, b: f64| a + b)
+            .register::<(f64, f64), f64>("HostAddDouble", |a, b| a + b)
             .unwrap();
         let mut sbox3 = sbox1.evolve().unwrap();
         let res = sbox3
@@ -892,18 +882,15 @@ fn test_if_guest_is_able_to_get_double_return_values_from_host() {
 fn test_if_guest_is_able_to_get_string_return_values_from_host() {
     with_c_uninit_sandbox(|mut sbox1| {
         sbox1
-            .register("HostAddStrings", |a: String| {
-                a + ", string added by Host Function"
+            .register::<(hyperlight_host::func::Str,), String>("HostAddStrings", |a: &str| {
+                Ok(format!("{a}, string added by Host Function"))
             })
             .unwrap();
         let mut sbox3 = sbox1.evolve().unwrap();
         let res = sbox3
             .call::<String>("GuestRetrievesStringValue", ())
             .unwrap();
-        assert_eq!(
-            res,
-            "Guest Function, string added by Host Function".to_string()
-        );
+        assert_eq!(res, "Guest Function, string added by Host Function");
     });
 }
 
@@ -1422,7 +1409,7 @@ fn interrupt_infinite_loop_stress_test() {
                 // Call the guest function "CallHostThenSpin" which calls "WaitForKill" once then spins
                 // NOTE: If this test hangs, it means the guest was not successfully killed and is spinning forever.
                 // This indicates a bug in the cancellation mechanism.
-                let res = sandbox.call::<()>("CallHostThenSpin", "WaitForKill".to_string());
+                let res = sandbox.call::<()>("CallHostThenSpin", "WaitForKill");
 
                 // Wait for killer thread to finish
                 killer_thread.join().unwrap();
@@ -1509,11 +1496,11 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     let res = sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string());
+                        .call::<String>("Echo", "Real");
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     res
                 }
@@ -1522,22 +1509,22 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string())
+                        .call::<String>("Echo", "Real")
                 }
                 // sandbox on spawned thread, bait on main thread
                 2 => {
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     sandbox_handle.join().unwrap()
                 }
@@ -1545,13 +1532,13 @@ fn interrupt_infinite_moving_loop_stress_test() {
                 3 => {
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     let res = sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string());
+                        .call::<String>("Echo", "Real");
                     bait_handle.join().unwrap();
                     res
                 }
@@ -1560,10 +1547,10 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     let res = sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string());
+                        .call::<String>("Echo", "Real");
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     bait_handle.join().unwrap();
@@ -1574,21 +1561,21 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     sandbox_handle.join().unwrap()
                 }
                 // sandbox on spawned thread, bait on spawned thread
                 6 => {
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     bait_handle.join().unwrap();
@@ -1598,12 +1585,12 @@ fn interrupt_infinite_moving_loop_stress_test() {
                 7 => {
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     bait_handle.join().unwrap();
                     sandbox_handle.join().unwrap()
                 }
@@ -1747,7 +1734,7 @@ fn interrupt_cancel_delete_race() {
                     .collect();
 
                 // Makes sure RUNNING_BIT is set when kill() is called
-                let _ = sandbox.call::<String>("Echo", "test".to_string());
+                let _ = sandbox.call::<String>("Echo", "test");
 
                 // Drop the sandbox while kill threads are spamming
                 drop(sandbox);

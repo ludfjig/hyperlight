@@ -20,85 +20,80 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{CStr, c_char};
 
-use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
+use hyperlight_common::wire::{self, FunctionCallResult, ReturnValue};
 use hyperlight_guest_bin::host_comm::get_host_return_value;
 
 use crate::types::FfiVec;
+
+fn encode_return(rv: ReturnValue<'_>) -> Vec<u8> {
+    let result: FunctionCallResult<'_> = FunctionCallResult::Ok(rv);
+    wire::encode(&result).expect("Failed to encode guest return value")
+}
 
 // The reason for the capitalized type in the function names below
 // is to match the names of the variants in hl_ReturnType,
 // which is used in the C macros in macro.h
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Int(value: i32) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_Int(value: i32) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::Int(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_UInt(value: u32) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_UInt(value: u32) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::UInt(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Long(value: i64) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_Long(value: i64) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::Long(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_ULong(value: u64) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_ULong(value: u64) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::ULong(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Float(value: f32) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_Float(value: f32) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::Float(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Double(value: f64) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_Double(value: f64) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::Double(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Void() -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(());
-
+pub extern "C" fn hl_result_from_Void() -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::Void);
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_String(value: *const c_char) -> Box<FfiVec> {
+pub extern "C" fn hl_result_from_String(value: *const c_char) -> Box<FfiVec> {
     let str = unsafe { CStr::from_ptr(value) };
-    let vec = get_flatbuffer_result(str.to_string_lossy().as_ref());
-
+    let owned = str.to_string_lossy().into_owned();
+    let vec = encode_return(ReturnValue::String(owned.as_str()));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Bytes(data: *const u8, len: usize) -> Box<FfiVec> {
+pub extern "C" fn hl_result_from_Bytes(data: *const u8, len: usize) -> Box<FfiVec> {
     let slice = unsafe { core::slice::from_raw_parts(data, len) };
-
-    let vec = get_flatbuffer_result(slice);
-
+    let vec = encode_return(ReturnValue::VecBytes(slice));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hl_flatbuffer_result_from_Bool(value: bool) -> Box<FfiVec> {
-    let vec = get_flatbuffer_result(value);
-
+pub extern "C" fn hl_result_from_Bool(value: bool) -> Box<FfiVec> {
+    let vec = encode_return(ReturnValue::Bool(value));
     Box::new(unsafe { FfiVec::from_vec(vec) })
 }
 

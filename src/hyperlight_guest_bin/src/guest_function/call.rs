@@ -17,13 +17,11 @@ limitations under the License.
 use alloc::format;
 use alloc::vec::Vec;
 
-use flatbuffers::FlatBufferBuilder;
-use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-use hyperlight_common::flatbuffer_wrappers::function_types::{FunctionCallResult, ParameterType};
-use hyperlight_common::flatbuffer_wrappers::guest_error::{ErrorCode, GuestError};
+use hyperlight_common::wire::{
+    self, ErrorCode, FunctionCall, FunctionCallResult, FunctionCallType, GuestError, ParameterType,
+};
 use hyperlight_guest::bail;
 use hyperlight_guest::error::{HyperlightGuestError, Result};
-use tracing::instrument;
 
 use crate::{GUEST_HANDLE, REGISTERED_GUEST_FUNCTIONS};
 
@@ -34,20 +32,28 @@ core::arch::global_asm!(
 );
 
 #[tracing::instrument(skip_all, parent = tracing::Span::current(), level= "Trace")]
-fn guest_dispatch_function_default(function_call: FunctionCall) -> Result<Vec<u8>> {
-    let name = &function_call.function_name;
+fn guest_dispatch_function_default(function_call: FunctionCall<'_>) -> Result<Vec<u8>> {
+    let name = function_call.name;
     bail!(ErrorCode::GuestFunctionNotFound => "No handler found for function call: {name:#?}");
 }
 
-#[instrument(skip_all, level = "Info")]
-pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<Vec<u8>> {
+// `#[tracing::instrument]` is intentionally not applied here. The macro's
+// exit event would push a trace frame to the same output stack that
+// `push_shared_output_with` is mid-reservation on, clobbering the encoded
+// `FunctionCallResult`. See
+// `src/hyperlight_guest/src/guest_handle/io.rs::push_shared_output_with`
+// for the contract on nested pushes.
+pub(crate) fn call_guest_function(
+    function_call: FunctionCall<'_>,
+    out: &mut [u8],
+) -> Result<usize> {
     // Validate this is a Guest Function Call
-    if function_call.function_call_type() != FunctionCallType::Guest {
+    if function_call.call_type != FunctionCallType::Guest {
         return Err(HyperlightGuestError::new(
             ErrorCode::GuestError,
             format!(
                 "Invalid function call type: {:#?}, should be Guest.",
-                function_call.function_call_type()
+                function_call.call_type
             ),
         ));
     }
@@ -57,31 +63,43 @@ pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<Vec<u8>
     // this is to avoid the clippy warning "shared reference to mutable static"
     #[allow(clippy::deref_addrof)]
     if let Some(registered_function_definition) =
-        unsafe { (*(&raw const REGISTERED_GUEST_FUNCTIONS)).get(&function_call.function_name) }
+        unsafe { (*(&raw const REGISTERED_GUEST_FUNCTIONS)).get(function_call.name) }
     {
-        let function_call_parameter_types: Vec<ParameterType> = function_call
-            .parameters
-            .iter()
-            .flatten()
-            .map(|p| p.into())
-            .collect();
+        let function_call_parameter_types: Vec<ParameterType> =
+            function_call.params.iter().map(|p| p.type_tag()).collect();
 
         // Verify that the function call has the correct parameter types and length.
         registered_function_definition.verify_parameters(&function_call_parameter_types)?;
 
-        (registered_function_definition.function_pointer)(function_call)
+        (registered_function_definition.function_pointer)(function_call.params, out)
     } else {
         // The given function is not registered. The guest should implement a function called
         // guest_dispatch_function to handle this.
+        //
+        // The fallback path keeps the legacy `Result<Vec<u8>>` ABI so existing
+        // user dispatchers (including the C API shim) continue to compile.
+        // We pay one extra copy here to splat the returned bytes into `out`.
 
         // TODO: ideally we would define a default implementation of this with weak linkage so the guest is not required
         // to implement the function but its seems that weak linkage is an unstable feature so for now its probably better
         // to not do that.
         unsafe extern "Rust" {
-            fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>>;
+            fn guest_dispatch_function(function_call: FunctionCall<'_>) -> Result<Vec<u8>>;
         }
 
-        unsafe { guest_dispatch_function(function_call) }
+        let bytes = unsafe { guest_dispatch_function(function_call) }?;
+        if bytes.len() > out.len() {
+            return Err(HyperlightGuestError::new(
+                ErrorCode::GuestError,
+                format!(
+                    "guest_dispatch_function returned {} bytes but only {} available in output buffer",
+                    bytes.len(),
+                    out.len()
+                ),
+            ));
+        }
+        out[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
     }
 }
 
@@ -100,27 +118,49 @@ pub(crate) fn internal_dispatch_function() {
 
     let handle = unsafe { GUEST_HANDLE };
 
-    let function_call = handle
-        .try_pop_shared_input_data_into::<FunctionCall>()
-        .expect("Function call deserialization failed");
+    // Borrow the input frame and write the reply into the output frame
+    // in a single pass. The decoded `FunctionCall<'_>` borrows directly
+    // from the shared input buffer, and the guest function serializes its
+    // `FunctionCallResult` postcard frame straight into the shared output
+    // buffer, avoiding any intermediate `Vec<u8>` for the steady-state
+    // success path.
+    let push = handle.with_shared_input_top(|bytes| {
+        let call: FunctionCall<'_> = wire::decode_exact(bytes).map_err(|e| {
+            HyperlightGuestError::new(
+                ErrorCode::GuestError,
+                format!("Failed to decode guest FunctionCall: {e:?}"),
+            )
+        })?;
+        handle.push_shared_output_with(|out| match call_guest_function(call, out) {
+            Ok(n) => Ok(n),
+            Err(err) => {
+                let fcr: FunctionCallResult<'_> = FunctionCallResult::Err(GuestError {
+                    code: err.kind,
+                    message: err.message,
+                });
+                let written = wire::encode_into(&fcr, out).map_err(|e| {
+                    HyperlightGuestError::new(
+                        ErrorCode::GuestError,
+                        format!("Failed to encode FunctionCallResult::Err: {e:?}"),
+                    )
+                })?;
+                Ok(written.len())
+            }
+        })
+    });
 
-    let res = call_guest_function(function_call);
-
-    match res {
-        Ok(bytes) => {
-            handle
-                .push_shared_output_data(bytes.as_slice())
-                .expect("Failed to serialize function call result");
-        }
-        Err(err) => {
-            let guest_error = Err(GuestError::new(err.kind, err.message));
-            let fcr = FunctionCallResult::new(guest_error);
-            let mut builder = FlatBufferBuilder::new();
-            let data = fcr.encode(&mut builder);
-            handle
-                .push_shared_output_data(data)
-                .expect("Failed to serialize function call result");
-        }
+    if let Err(err) = push {
+        // If even the in-place encode failed (e.g. decode failure or
+        // output buffer too small), fall back to a heap-allocated error
+        // reply so the host still sees a structured failure.
+        let fcr: FunctionCallResult<'_> = FunctionCallResult::Err(GuestError {
+            code: err.kind,
+            message: err.message,
+        });
+        let data = wire::encode(&fcr).expect("encode FunctionCallResult::Err");
+        handle
+            .push_shared_output_data(&data)
+            .expect("Failed to serialize function call result");
     }
 
     // All this tracing logic shall be done right before the call to `hlt` which is done after this

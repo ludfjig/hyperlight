@@ -55,7 +55,8 @@ fn run_once(test_file: &Path, label: &str) -> hyperlight_host::Result<()> {
     let mut mu: MultiUseSandbox = usbox.evolve()?;
     eprintln!("[{label}] evolve OK");
 
-    let result: String = mu.call("Echo", format!("{label}: map_file_cow works!"))?;
+    let s = format!("{label}: map_file_cow works!");
+    let result: String = mu.call("Echo", s.as_str())?;
     eprintln!("[{label}] guest returned: {result}");
     Ok(())
 }

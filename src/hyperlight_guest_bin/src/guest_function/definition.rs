@@ -18,18 +18,23 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ReturnType};
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
-use hyperlight_common::for_each_tuple;
 use hyperlight_common::func::{
-    Function, ParameterTuple, ResultType, ReturnValue, SupportedReturnType,
+    BorrowingFunction, Borrows, EncodeReturn, Function, ParameterTuple, ReturnCarrier,
+    SupportedReturnType,
+};
+use hyperlight_common::wire::{
+    self, ErrorCode, FunctionCallResult, Param, ParameterType, ReturnType,
 };
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 
 /// The function pointer type for Rust guest functions.
-pub type GuestFunc = fn(FunctionCall) -> Result<Vec<u8>>;
+///
+/// A registered guest function receives the decoded wire parameters (which
+/// borrow from the shared input buffer) plus a mutable slice of the shared
+/// output buffer. It serializes its postcard [`FunctionCallResult::Ok`]
+/// frame directly into `out` and returns the number of bytes written, so
+/// no intermediate `Vec<u8>` for the reply is ever allocated.
+pub type GuestFunc = fn(Vec<Param<'_>>, &mut [u8]) -> Result<usize>;
 
 /// The definition of a function exposed from the guest to the host.
 ///
@@ -47,7 +52,7 @@ pub struct GuestFunctionDefinition<F: Copy> {
     pub function_pointer: F,
 }
 
-/// Trait for functions that can be converted to a `fn(FunctionCall) -> Result<Vec<u8>>`
+/// Trait for functions that can be converted to a `GuestFunc` pointer.
 #[doc(hidden)]
 pub trait IntoGuestFunction<Output, Args>
 where
@@ -59,8 +64,8 @@ where
     #[doc(hidden)]
     const ASSERT_ZERO_SIZED: ();
 
-    /// Convert the function into a `fn(FunctionCall) -> Result<Vec<u8>>`
-    fn into_guest_function(self) -> fn(FunctionCall) -> Result<Vec<u8>>;
+    /// Convert the function into a `GuestFunc` pointer.
+    fn into_guest_function(self) -> GuestFunc;
 }
 
 /// Trait for functions that can be converted to a `GuestFunctionDefinition<GuestFunc>`
@@ -78,102 +83,19 @@ where
     ) -> GuestFunctionDefinition<GuestFunc>;
 }
 
-fn into_flatbuffer_result(value: ReturnValue) -> Vec<u8> {
-    match value {
-        ReturnValue::Void(()) => get_flatbuffer_result(()),
-        ReturnValue::Int(i) => get_flatbuffer_result(i),
-        ReturnValue::UInt(u) => get_flatbuffer_result(u),
-        ReturnValue::Long(l) => get_flatbuffer_result(l),
-        ReturnValue::ULong(ul) => get_flatbuffer_result(ul),
-        ReturnValue::Float(f) => get_flatbuffer_result(f),
-        ReturnValue::Double(d) => get_flatbuffer_result(d),
-        ReturnValue::Bool(b) => get_flatbuffer_result(b),
-        ReturnValue::String(s) => get_flatbuffer_result(s.as_str()),
-        ReturnValue::VecBytes(v) => get_flatbuffer_result(v.as_slice()),
-    }
+/// Encode a guest function's owned return value into the host-bound
+/// output slice. Returns the number of bytes written.
+fn encode_return_into<R: SupportedReturnType>(value: R, out: &mut [u8]) -> Result<usize> {
+    let owned = value.into_owned();
+    let result = FunctionCallResult::Ok(owned.as_return_value());
+    let written = wire::encode_into(&result, out).map_err(|e| {
+        HyperlightGuestError::new(
+            ErrorCode::GuestError,
+            format!("Failed to encode guest function result: {e:?}"),
+        )
+    })?;
+    Ok(written.len())
 }
-
-macro_rules! impl_host_function {
-    ([$N:expr] ($($p:ident: $P:ident),*)) => {
-        impl<F, R, $($P),*> IntoGuestFunction<R::ReturnType, ($($P,)*)> for F
-        where
-            F: Fn($($P),*) -> R,
-            F: Function<R::ReturnType, ($($P,)*), HyperlightGuestError>,
-            F: Copy + 'static, // Copy implies that F has no Drop impl
-            ($($P,)*): ParameterTuple,
-            R: ResultType<HyperlightGuestError>,
-        {
-            // Only functions that can be coerced into a function pointer (i.e., "fn" types)
-            // can be registered as guest functions.
-            //
-            // Note that the "Fn" trait is different from "fn" types in Rust.
-            // "fn" is a type, while "Fn" is a trait.
-            // For example, closures that capture environment implement "Fn" but cannot be
-            // coerced to function pointers.
-            // This means that the closure returned by `into_guest_function` can not capture
-            // any environment, not event `self`, and we must only rely on the type system
-            // to call the correct function.
-            //
-            // Ideally we would implement IntoGuestFunction for any F that can be converted
-            // into a function pointer, but currently there's no way to express that in Rust's
-            // type system.
-            // Therefore, to ensure that F is a "fn" type, we enforce that F is zero-sized
-            // has no Drop impl (the latter is enforced by the Copy bound), and it doesn't
-            // capture any lifetimes (not even through a marker type like PhantomData).
-            //
-            // Note that implementing IntoGuestFunction for "fn($(P),*) -> R" is not an option
-            // either, "fn($(P),*) -> R" is a type that's shared for all function pointers with
-            // that signature, e.g., "fn add(a: i32, b: i32) -> i32 { a + b }" and
-            // "fn sub(a: i32, b: i32) -> i32 { a - b }" both can be coerced to the same
-            // "fn(i32, i32) -> i32" type, so we would need to capture self (a function pointer)
-            // to know exactly which function to call.
-
-            #[doc(hidden)]
-            const ASSERT_ZERO_SIZED: () = const {
-                assert!(core::mem::size_of::<Self>() == 0)
-            };
-
-            fn into_guest_function(self) -> fn(FunctionCall) -> Result<Vec<u8>> {
-                |fc: FunctionCall| {
-                    // SAFETY: This is safe because:
-                    //  1. F is zero-sized (enforced by the ASSERT_ZERO_SIZED const).
-                    //  2. F has no Drop impl (enforced by the Copy bound).
-                    // Therefore, creating an instance of F is safe.
-                    let this = unsafe { core::mem::zeroed::<F>() };
-                    let params = fc.parameters.unwrap_or_default();
-                    let params = <($($P,)*) as ParameterTuple>::from_value(params)?;
-                    let result = Function::<R::ReturnType, ($($P,)*), HyperlightGuestError>::call(&this, params)?;
-                    Ok(into_flatbuffer_result(result.into_value()))
-                }
-            }
-        }
-    };
-}
-
-impl<F, Args, Output> AsGuestFunctionDefinition<Output, Args> for F
-where
-    F: IntoGuestFunction<Output, Args>,
-    Args: ParameterTuple,
-    Output: SupportedReturnType,
-{
-    fn as_guest_function_definition(
-        &self,
-        name: impl Into<String>,
-    ) -> GuestFunctionDefinition<GuestFunc> {
-        let parameter_types = Args::TYPE.to_vec();
-        let return_type = Output::TYPE;
-        let function_pointer = self.into_guest_function();
-
-        GuestFunctionDefinition {
-            function_name: name.into(),
-            parameter_types,
-            return_type,
-            function_pointer,
-        }
-    }
-}
-
-for_each_tuple!(impl_host_function);
 
 impl<F: Copy> GuestFunctionDefinition<F> {
     /// Create a new `GuestFunctionDefinition`.
@@ -222,7 +144,7 @@ impl<F: Copy> GuestFunctionDefinition<F> {
 
         if self.parameter_types.len() != parameter_types.len() {
             return Err(HyperlightGuestError::new(
-                ErrorCode::GuestFunctionIncorrecNoOfParameters,
+                ErrorCode::GuestFunctionIncorrectNoOfParameters,
                 format!(
                     "Called function {} with {} parameters but it takes {}.",
                     self.function_name,
@@ -245,5 +167,147 @@ impl<F: Copy> GuestFunctionDefinition<F> {
         }
 
         Ok(())
+    }
+}
+
+// Generic blanket: any `F: Function<R, Args, HyperlightGuestError>` that
+// is zero-sized can be converted to a `GuestFunc` by dispatching the
+// decoded parameter vector through `Function::call_with_params` and
+// encoding the result via `OwnedReturn`.
+impl<F, R, Args> IntoGuestFunction<R, Args> for F
+where
+    F: Function<R, Args, HyperlightGuestError>,
+    F: Copy + 'static,
+    R: SupportedReturnType,
+    Args: ParameterTuple,
+{
+    // Only functions that can be coerced into a function pointer (i.e., "fn" types)
+    // can be registered as guest functions. We enforce that `F` is zero-sized at
+    // const-eval time, and `Copy` ensures there is no `Drop` impl. The dispatcher
+    // creates a fresh `F` via `mem::zeroed`.
+    #[doc(hidden)]
+    const ASSERT_ZERO_SIZED: () = const { assert!(core::mem::size_of::<Self>() == 0) };
+
+    fn into_guest_function(self) -> GuestFunc {
+        |params: Vec<Param<'_>>, out: &mut [u8]| {
+            // SAFETY: `F` is zero-sized (enforced by ASSERT_ZERO_SIZED) and
+            // has no Drop impl (enforced by the Copy bound), so creating an
+            // instance from zero bytes is safe.
+            let this = unsafe { core::mem::zeroed::<F>() };
+            let value = Function::<R, Args, HyperlightGuestError>::call_with_params(&this, params)?;
+            encode_return_into(value, out)
+        }
+    }
+}
+
+impl<F, Args, Output> AsGuestFunctionDefinition<Output, Args> for F
+where
+    F: IntoGuestFunction<Output, Args>,
+    Args: ParameterTuple,
+    Output: SupportedReturnType,
+{
+    fn as_guest_function_definition(
+        &self,
+        name: impl Into<String>,
+    ) -> GuestFunctionDefinition<GuestFunc> {
+        // Force the zero-sized assertion to fire at compile time for this F.
+        let () = <Self as IntoGuestFunction<Output, Args>>::ASSERT_ZERO_SIZED;
+        let parameter_types = Args::TYPE.to_vec();
+        let return_type = Output::TYPE;
+        let function_pointer = self.into_guest_function();
+
+        GuestFunctionDefinition {
+            function_name: name.into(),
+            parameter_types,
+            return_type,
+            function_pointer,
+        }
+    }
+}
+
+/// Parallel of [`IntoGuestFunction`] for guest functions whose return
+/// value borrows from the input wire buffer. `Output` is a
+/// [`ReturnCarrier`] marker like [`hyperlight_common::func::BytesRef`]
+/// rather than the user's return type.
+#[doc(hidden)]
+pub trait IntoGuestFunctionBorrowed<Output, Args>
+where
+    Self: BorrowingFunction<Output, Args, HyperlightGuestError>,
+    Self: Copy + 'static,
+    Output: ReturnCarrier + for<'a> Borrows<'a>,
+    Args: ParameterTuple,
+{
+    #[doc(hidden)]
+    const ASSERT_ZERO_SIZED: ();
+    /// Convert the function into a `GuestFunc` pointer.
+    fn into_guest_function_borrowed(self) -> GuestFunc;
+}
+
+/// Parallel of [`AsGuestFunctionDefinition`] for the borrowing path.
+pub trait AsGuestFunctionDefinitionBorrowed<Output, Args>
+where
+    Self: BorrowingFunction<Output, Args, HyperlightGuestError>,
+    Self: IntoGuestFunctionBorrowed<Output, Args>,
+    Output: ReturnCarrier + for<'a> Borrows<'a>,
+    Args: ParameterTuple,
+{
+    /// Get the `GuestFunctionDefinition` for this function.
+    fn as_guest_function_definition_borrowed(
+        &self,
+        name: impl Into<String>,
+    ) -> GuestFunctionDefinition<GuestFunc>;
+}
+
+impl<F, R, Args> IntoGuestFunctionBorrowed<R, Args> for F
+where
+    F: BorrowingFunction<R, Args, HyperlightGuestError>,
+    F: Copy + 'static,
+    R: ReturnCarrier + for<'a> Borrows<'a>,
+    Args: ParameterTuple,
+{
+    #[doc(hidden)]
+    const ASSERT_ZERO_SIZED: () = const { assert!(core::mem::size_of::<Self>() == 0) };
+
+    fn into_guest_function_borrowed(self) -> GuestFunc {
+        |params: Vec<Param<'_>>, out: &mut [u8]| {
+            // SAFETY: `F` is zero-sized (enforced by ASSERT_ZERO_SIZED) and
+            // has no Drop impl (enforced by the Copy bound), so creating an
+            // instance from zero bytes is safe.
+            let this = unsafe { core::mem::zeroed::<F>() };
+            let value =
+                <F as BorrowingFunction<R, Args, HyperlightGuestError>>::call_with_params_borrowed(
+                    &this, params,
+                )?;
+            value.encode_into(out).map_err(|e| {
+                HyperlightGuestError::new(
+                    ErrorCode::GuestError,
+                    format!("Failed to encode guest function result: {e:?}"),
+                )
+            })
+        }
+    }
+}
+
+impl<F, Args, Output> AsGuestFunctionDefinitionBorrowed<Output, Args> for F
+where
+    F: IntoGuestFunctionBorrowed<Output, Args>,
+    Args: ParameterTuple,
+    Output: ReturnCarrier + for<'a> Borrows<'a>,
+{
+    fn as_guest_function_definition_borrowed(
+        &self,
+        name: impl Into<String>,
+    ) -> GuestFunctionDefinition<GuestFunc> {
+        let () = <Self as IntoGuestFunctionBorrowed<Output, Args>>::ASSERT_ZERO_SIZED;
+        let parameter_types = Args::TYPE.to_vec();
+        let return_type = <Output as ReturnCarrier>::TYPE;
+        let function_pointer = self.into_guest_function_borrowed();
+
+        GuestFunctionDefinition {
+            function_name: name.into(),
+            parameter_types,
+            return_type,
+            function_pointer,
+        }
     }
 }

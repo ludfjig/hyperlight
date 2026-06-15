@@ -80,7 +80,7 @@ fn main() -> hyperlight_host::Result<()> {
     multi_use_sandbox_dbg
         .call::<i32>(
             "PrintOutput", // function must be defined in the guest binary
-            message.clone(),
+            message.as_str(),
         )
         .unwrap();
 
@@ -89,7 +89,7 @@ fn main() -> hyperlight_host::Result<()> {
     multi_use_sandbox
         .call::<i32>(
             "PrintOutput", // function must be defined in the guest binary
-            message.clone(),
+            message.as_str(),
         )
         .unwrap();
 
@@ -403,10 +403,7 @@ mod tests {
 
             let mut sbox =
                 MultiUseSandbox::from_snapshot(snap_thread, HostFunctions::default(), Some(cfg))?;
-            sbox.call::<i32>(
-                "PrintOutput",
-                "Hello from a from_snapshot sandbox\n".to_string(),
-            )?;
+            sbox.call::<i32>("PrintOutput", "Hello from a from_snapshot sandbox\n")?;
             Ok(())
         });
 

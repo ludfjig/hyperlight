@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 const ENDPOINT_ADDR: &str = "http://localhost:4318/v1/traces";
 
-fn fn_writer(_msg: String) -> HyperlightResult<i32> {
+fn fn_writer(_msg: &str) -> HyperlightResult<i32> {
     Ok(0)
 }
 
@@ -133,9 +133,7 @@ fn run_example(wait_input: bool) -> HyperlightResult<()> {
 
                 // Call a guest function 5 times to generate some log entries.
                 for _ in 0..5 {
-                    multiuse_sandbox
-                        .call::<String>("Echo", "a".to_string())
-                        .unwrap();
+                    multiuse_sandbox.call::<String>("Echo", "a").unwrap();
                 }
 
                 // Define a message to send to the guest.
@@ -145,7 +143,7 @@ fn run_example(wait_input: bool) -> HyperlightResult<()> {
                 // Call a guest function that calls the HostPrint host function 5 times to generate some log entries.
                 for _ in 0..5 {
                     multiuse_sandbox
-                        .call::<i32>("PrintOutput", msg.clone())
+                        .call::<i32>("PrintOutput", msg.as_str())
                         .unwrap();
                 }
 

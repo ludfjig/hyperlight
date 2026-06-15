@@ -29,7 +29,7 @@ fn main() {
 
     // Do several calls against a sandbox running the `simpleguest.exe` binary,
     // and print their results
-    let res: String = sbox.call("Echo", "hello".to_string()).unwrap();
+    let res: String = sbox.call("Echo", "hello").unwrap();
     println!("got Echo res: {res}");
 
     let res: i32 = sbox.call("CallMalloc", 200_i32).unwrap();

@@ -62,7 +62,7 @@ impl Parse for NameArg {
 /// ```ignore
 /// use hyperlight_guest_bin::guest_function;
 /// #[guest_function]
-/// fn my_guest_function(arg1: i32, arg2: String) -> i32 {
+/// fn my_guest_function(arg1: i32, arg2: &str) -> i32 {
 ///     arg1 + arg2.len() as i32
 /// }
 /// ```
@@ -71,7 +71,7 @@ impl Parse for NameArg {
 /// ```ignore
 /// use hyperlight_guest_bin::guest_function;
 /// #[guest_function("custom_name")]
-/// fn my_guest_function(arg1: i32, arg2: String) -> i32 {
+/// fn my_guest_function(arg1: i32, arg2: &str) -> i32 {
 ///     arg1 + arg2.len() as i32
 /// }
 /// ```
@@ -81,7 +81,7 @@ impl Parse for NameArg {
 /// use hyperlight_guest_bin::guest_function;
 /// use hyperlight_guest::bail;
 /// #[guest_function]
-/// fn my_guest_function(arg1: i32, arg2: String) -> Result<i32, HyperlightGuestError> {
+/// fn my_guest_function(arg1: i32, arg2: &str) -> Result<i32, HyperlightGuestError> {
 ///     bail!("An error occurred");
 /// }
 /// ```
@@ -137,6 +137,147 @@ pub fn guest_function(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
+    // Compute the per-parameter "marker" type used as the `Args` tuple
+    // element when calling `register_fn`. Rust's trait solver cannot run
+    // the `SupportedParameterType::Borrowed<'a>` GAT projection backward
+    // (from `&str` to `Str`, `&[u8]` to `Bytes`, etc.), so the macro pins
+    // `Args` explicitly via turbofish.
+    let mut marker_types = Vec::new();
+    for arg in fn_declaration.sig.inputs.iter() {
+        let syn::FnArg::Typed(pat_ty) = arg else {
+            return Error::new(
+                arg.span(),
+                "Receiver (self) argument is not allowed in guest functions",
+            )
+            .to_compile_error()
+            .into();
+        };
+        if let syn::Type::Reference(r) = &*pat_ty.ty
+            && r.mutability.is_some()
+        {
+            return Error::new(
+                pat_ty.ty.span(),
+                "mutable reference parameters (&mut T) are not supported in guest functions. \
+                 Use a shared reference (&str, &[u8]) or an owned type (String, Vec<u8>) instead.",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let last_ty_ident = match &*pat_ty.ty {
+            syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+            syn::Type::Reference(r) => match &*r.elem {
+                syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+                syn::Type::Slice(_) => Some("Slice".to_string()),
+                _ => None,
+            },
+            _ => None,
+        };
+        match last_ty_ident.as_deref() {
+            Some("str") => marker_types.push(quote! { #crate_name::__private::Str }),
+            Some("Slice") => marker_types.push(quote! { #crate_name::__private::Bytes }),
+            _ => {
+                let ty = &pat_ty.ty;
+                marker_types.push(quote! { #ty });
+            }
+        }
+    }
+    let user_ret = match &fn_declaration.sig.output {
+        syn::ReturnType::Default => quote! { () },
+        syn::ReturnType::Type(_, ty) => quote! { #ty },
+    };
+
+    if let syn::ReturnType::Type(_, ty) = &fn_declaration.sig.output
+        && let syn::Type::Reference(r) = &**ty
+        && r.mutability.is_some()
+    {
+        return Error::new(
+            ty.span(),
+            "mutable reference return types (&mut T) are not supported in guest functions. \
+             Use a shared reference (&str, &[u8]) or an owned type (String, Vec<u8>) instead.",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Reject `Result<&str, _>` and `Result<&[u8], _>` returns. The
+    // borrowing dispatch path encodes the return slice in place and
+    // does not have a representation for "fallible borrowed slice".
+    // Force the user to choose: surface the fallibility through an
+    // owned `Result<String, _>` / `Result<Vec<u8>, _>`, or drop the
+    // `Result` and panic on the error path.
+    if let syn::ReturnType::Type(_, ty) = &fn_declaration.sig.output
+        && let syn::Type::Path(p) = &**ty
+        && let Some(seg) = p.path.segments.last()
+        && seg.ident == "Result"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+        && let syn::Type::Reference(inner_ref) = inner
+    {
+        let is_borrowed_slice = match &*inner_ref.elem {
+            syn::Type::Slice(_) => true,
+            syn::Type::Path(ip) => ip
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "str")
+                .unwrap_or(false),
+            _ => false,
+        };
+        if is_borrowed_slice {
+            return Error::new(
+                ty.span(),
+                "fallible borrowed return types (Result<&str, _> / Result<&[u8], _>) are not \
+                 supported by `#[guest_function]`. Return the owned form (Result<String, _> / \
+                 Result<Vec<u8>, _>) or drop the `Result` to use the borrowed-return fast path.",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
+    // Detect whether the user wrote a borrowed return type. The
+    // borrowing dispatch path resolves the return through the
+    // [`Borrows`] trait and serializes the slice directly into the
+    // shared output buffer with no intermediate allocation.
+    let borrowed_return_carrier: Option<proc_macro2::TokenStream> = match &fn_declaration.sig.output
+    {
+        syn::ReturnType::Type(_, ty) => match &**ty {
+            syn::Type::Reference(r) => match &*r.elem {
+                syn::Type::Path(p)
+                    if p.path
+                        .segments
+                        .last()
+                        .map(|s| s.ident == "str")
+                        .unwrap_or(false) =>
+                {
+                    Some(quote! { #crate_name::__private::StrRef })
+                }
+                syn::Type::Slice(_) => Some(quote! { #crate_name::__private::BytesRef }),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let registration_target = if let Some(carrier) = borrowed_return_carrier {
+        quote! {
+            #crate_name::guest_function::register::register_borrowing_fn::<
+                #carrier,
+                (#(#marker_types,)*),
+            >(#exported_name, #ident);
+        }
+    } else {
+        quote! {
+            #crate_name::guest_function::register::register_fn::<
+                <#user_ret as #crate_name::__private::ResultType<
+                    #crate_name::__private::HyperlightGuestError,
+                >>::ReturnType,
+                (#(#marker_types,)*),
+            >(#exported_name, #ident);
+        }
+    };
+
     // The generated code will replace the decorated code, so we need to
     // include the original function declaration in the output.
     let output = quote! {
@@ -148,7 +289,7 @@ pub fn guest_function(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[#crate_name::__private::linkme::distributed_slice(#crate_name::__private::GUEST_FUNCTION_INIT)]
             #[linkme(crate = #crate_name::__private::linkme)]
             static REGISTRATION: fn() = || {
-                #crate_name::guest_function::register::register_fn(#exported_name, #ident);
+                #registration_target
             };
         };
     };
@@ -203,13 +344,13 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// use hyperlight_guest_bin::dispatch;
 /// use hyperlight_guest::error::Result;
 /// use hyperlight_guest::bail;
-/// use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-/// use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
+/// use hyperlight_common::wire::FunctionCall;
+/// use hyperlight_guest_bin::host_comm::encode_return;
 /// #[dispatch]
-/// fn dispatch(fc: FunctionCall) -> Result<Vec<u8>> {
-///     let name = &fc.function_name;
+/// fn dispatch(fc: FunctionCall<'_>) -> Result<Vec<u8>> {
+///     let name = fc.name;
 ///     if name == "greet" {
-///         return Ok(get_flatbuffer_result("Hello, world!"));
+///         return encode_return("Hello, world!".to_string());
 ///     }
 ///     bail!("Unknown function: {name}");
 /// }
@@ -243,7 +384,7 @@ pub fn dispatch(_attr: TokenStream, item: TokenStream) -> TokenStream {
             mod wrapper {
                 use #crate_name::__private::{FunctionCall, HyperlightGuestError, Vec};
                 #[unsafe(no_mangle)]
-                pub fn guest_dispatch_function(function_call: FunctionCall) -> ::core::result::Result<Vec<u8>, HyperlightGuestError> {
+                pub fn guest_dispatch_function(function_call: FunctionCall<'_>) -> ::core::result::Result<Vec<u8>, HyperlightGuestError> {
                     super::#ident(function_call)
                 }
             }
@@ -271,22 +412,22 @@ pub fn dispatch(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```ignore
 /// use hyperlight_guest_bin::host_function;
 /// #[host_function]
-/// fn my_host_function(arg1: i32, arg2: String) -> i32;
+/// fn my_host_function(arg1: i32, arg2: &str) -> i32;
 /// ```
 ///
 /// or with a custom name:
 /// ```ignore
 /// use hyperlight_guest_bin::host_function;
 /// #[host_function("custom_name")]
-/// fn my_host_function(arg1: i32, arg2: String) -> i32;
+/// fn my_host_function(arg1: i32, arg2: &str) -> i32;
 /// ```
 ///
 /// or with a Result return type:
 /// ```ignore
 /// use hyperlight_guest_bin::host_function;
-/// use hyperlight_guest::error::HyperlightGuestError;
+///
 /// #[host_function]
-/// fn my_host_function(arg1: i32, arg2: String) -> Result<i32, HyperlightGuestError>;
+/// fn my_host_function(arg1: i32, arg2: &str) -> Result<i32, HyperlightGuestError>;
 /// ```
 #[proc_macro_attribute]
 pub fn host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -402,8 +543,6 @@ pub fn host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 let ident = pat.ident.clone();
-
-                // All checks passed, add the identifier to the argument list.
                 args.push(quote! { #ident });
             }
         }

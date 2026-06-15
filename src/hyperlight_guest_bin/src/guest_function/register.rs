@@ -17,11 +17,13 @@ limitations under the License.
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 
-use hyperlight_common::func::{ParameterTuple, SupportedReturnType};
+use hyperlight_common::func::{Borrows, ParameterTuple, ReturnCarrier, SupportedReturnType};
 
 use super::definition::{GuestFunc, GuestFunctionDefinition};
 use crate::REGISTERED_GUEST_FUNCTIONS;
-use crate::guest_function::definition::AsGuestFunctionDefinition;
+use crate::guest_function::definition::{
+    AsGuestFunctionDefinition, AsGuestFunctionDefinitionBorrowed,
+};
 
 /// Represents the functions that the guest exposes to the host.
 #[derive(Debug, Clone)]
@@ -76,6 +78,18 @@ impl GuestFunctionRegister<GuestFunc> {
         let gfd = f.as_guest_function_definition(name);
         self.register(gfd);
     }
+
+    pub fn register_borrowing_fn<Output, Args>(
+        &mut self,
+        name: impl Into<String>,
+        f: impl AsGuestFunctionDefinitionBorrowed<Output, Args>,
+    ) where
+        Args: ParameterTuple,
+        Output: ReturnCarrier + for<'a> Borrows<'a>,
+    {
+        let gfd = f.as_guest_function_definition_borrowed(name);
+        self.register(gfd);
+    }
 }
 
 pub fn register_function(function_definition: GuestFunctionDefinition<GuestFunc>) {
@@ -101,5 +115,21 @@ pub fn register_fn<Output, Args>(
         #[allow(static_mut_refs)]
         let gfd = &mut REGISTERED_GUEST_FUNCTIONS;
         gfd.register_fn(name, f);
+    }
+}
+
+pub fn register_borrowing_fn<Output, Args>(
+    name: impl Into<String>,
+    f: impl AsGuestFunctionDefinitionBorrowed<Output, Args>,
+) where
+    Args: ParameterTuple,
+    Output: ReturnCarrier + for<'a> Borrows<'a>,
+{
+    unsafe {
+        // This is currently safe, because we are single threaded, but we
+        // should find a better way to do this, see issue #808
+        #[allow(static_mut_refs)]
+        let gfd = &mut REGISTERED_GUEST_FUNCTIONS;
+        gfd.register_borrowing_fn(name, f);
     }
 }

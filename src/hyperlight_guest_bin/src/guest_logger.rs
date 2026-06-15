@@ -16,7 +16,7 @@ limitations under the License.
 
 use alloc::format;
 
-use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
+use hyperlight_common::wire::LogLevel;
 use log::{LevelFilter, Metadata, Record};
 
 use crate::GUEST_HANDLE;

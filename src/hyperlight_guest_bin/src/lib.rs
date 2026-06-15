@@ -24,11 +24,11 @@ use arch::dispatch::dispatch_function;
 use buddy_system_allocator::LockedHeap;
 use guest_function::register::GuestFunctionRegister;
 use guest_logger::init_logger;
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::log_level::GuestLogFilter;
 use hyperlight_common::mem::HyperlightPEB;
 #[cfg(feature = "mem_profile")]
 use hyperlight_common::outb::OutBAction;
+use hyperlight_common::wire::ErrorCode;
 use hyperlight_guest::exit::write_abort;
 use hyperlight_guest::guest_handle::handle::GuestHandle;
 
@@ -312,8 +312,8 @@ pub(crate) extern "C" fn generic_init(
 pub mod __private {
     pub use alloc::vec::Vec;
 
-    pub use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-    pub use hyperlight_common::func::ResultType;
+    pub use hyperlight_common::func::{Bytes, BytesRef, ResultType, Str, StrRef};
+    pub use hyperlight_common::wire::{FunctionCall, Param};
     pub use hyperlight_guest::error::HyperlightGuestError;
     pub use linkme;
 
@@ -327,10 +327,8 @@ pub mod __private {
 
     use alloc::string::String;
 
-    use hyperlight_common::for_each_return_type;
-
     macro_rules! impl_maybe_unwrap {
-        ($ty:ty, $enum:ident) => {
+        ($ty:ty) => {
             impl FromResult for $ty {
                 type Output = Self;
                 fn from_result(res: Result<Self::Output, HyperlightGuestError>) -> Self {
@@ -349,7 +347,16 @@ pub mod __private {
         };
     }
 
-    for_each_return_type!(impl_maybe_unwrap);
+    impl_maybe_unwrap!(());
+    impl_maybe_unwrap!(i32);
+    impl_maybe_unwrap!(u32);
+    impl_maybe_unwrap!(i64);
+    impl_maybe_unwrap!(u64);
+    impl_maybe_unwrap!(f32);
+    impl_maybe_unwrap!(f64);
+    impl_maybe_unwrap!(bool);
+    impl_maybe_unwrap!(String);
+    impl_maybe_unwrap!(Vec<u8>);
 }
 
 #[cfg(feature = "macros")]

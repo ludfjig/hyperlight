@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::type_name;
 use std::ffi::c_void;
 use std::io::Error;
 use std::mem::{align_of, size_of};
@@ -1394,18 +1393,131 @@ impl HostSharedMemory {
         Ok(())
     }
 
-    /// Pops the given given buffer into a `T` and returns it.
-    /// NOTE! the data must be a size-prefixed flatbuffer, and
-    /// buffer_start_offset must point to the beginning of the buffer
-    pub fn try_pop_buffer_into<T>(
+    /// Reserves space at the top of the stack buffer, hands `writer` a
+    /// `&mut [u8]` view directly into shared memory, then commits the
+    /// frame by writing the back-pointer and advancing the stack header.
+    ///
+    /// `writer` returns the number of bytes it actually wrote into the
+    /// region; the encoder streams straight into the mapped region with
+    /// no host-side bounce buffer.
+    ///
+    /// # Safety
+    ///
+    /// This method is itself safe to call. The internal `unsafe` block
+    /// constructs `&mut [u8]` from a raw pointer into the shared mapping
+    /// and relies on the following:
+    ///
+    /// * **Provenance and bounds.** The pointer is derived from
+    ///   `self.base_ptr()`, which has provenance over the full mapped
+    ///   region of `mem_size()` bytes. The bounds check via
+    ///   [`bounds_check!`] guarantees `stack_pointer_abs + available <=
+    ///   mem_size()`, so the entire `&mut [u8]` lies within the mapping.
+    /// * **Aliasing.** The host side holds `&mut self` for the lifetime
+    ///   of the call, which blocks every other host accessor of this
+    ///   `HostSharedMemory` (the wrapping manager is also held
+    ///   exclusively). The guest side is the vCPU, which is paused at a
+    ///   VM exit whenever the host walks this buffer; the shared mapping
+    ///   has no other consumers. No `&` or `&mut` to overlapping bytes
+    ///   exists for the duration of `writer`.
+    /// * **Initialization.** The region is byte-typed (`u8`), so any bit
+    ///   pattern in the existing bytes is a valid value. `writer` is
+    ///   free to read from the slice; postcard treats it as opaque
+    ///   storage and never relies on prior contents.
+    /// * **Header and back-pointer writes** still flow through the
+    ///   volatile [`Self::write`] path so cross-CPU visibility (and the
+    ///   internal lock sanity check) are preserved.
+    ///
+    /// Returns an error and does not modify the stack header if `writer`
+    /// reports more bytes than were reserved.
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    pub fn push_buffer_with<F>(
         &mut self,
         buffer_start_offset: usize,
         buffer_size: usize,
-    ) -> Result<T>
+        writer: F,
+    ) -> Result<()>
     where
-        T: for<'b> TryFrom<&'b [u8]>,
+        F: FnOnce(&mut [u8]) -> Result<usize>,
     {
-        // get the stackpointer
+        let stack_pointer_rel = self.read::<u64>(buffer_start_offset)? as usize;
+
+        if stack_pointer_rel > buffer_size || stack_pointer_rel < 8 {
+            return Err(new_error!(
+                "Unable to push data to buffer: Stack pointer is out of bounds. Stack pointer: {}, Buffer size: {}",
+                stack_pointer_rel,
+                buffer_size
+            ));
+        }
+
+        let available = buffer_size
+            .checked_sub(stack_pointer_rel + 8)
+            .ok_or_else(|| new_error!("No room in shared buffer"))?;
+
+        let stack_pointer_abs = stack_pointer_rel + buffer_start_offset;
+        bounds_check!(stack_pointer_abs, available, self.mem_size());
+
+        let written = {
+            // SAFETY: see method docs. `base_ptr()` has provenance over
+            // the full mapping; `stack_pointer_abs + available <=
+            // mem_size()` by bounds_check above; exclusive access for
+            // the lifetime of `writer` is guaranteed by `&mut self` plus
+            // the paused-vCPU invariant on this buffer.
+            let free_ptr = self.base_ptr().wrapping_add(stack_pointer_abs);
+            let free: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(free_ptr, available) };
+            writer(free)?
+        };
+
+        if written > available {
+            return Err(new_error!(
+                "push_buffer_with: writer reported {} bytes but only {} were available",
+                written,
+                available
+            ));
+        }
+
+        // Commit. Back-pointer first so an interrupted publish never
+        // leaves the stack pointer past an uninitialized back-pointer.
+        self.write::<u64>(stack_pointer_abs + written, stack_pointer_rel as u64)?;
+        self.write::<u64>(
+            buffer_start_offset,
+            (stack_pointer_rel + written + 8) as u64,
+        )?;
+        Ok(())
+    }
+
+    /// Runs `f` against the topmost element of the shared stack buffer
+    /// borrowed as `&[u8]` directly into shared memory, then pops the
+    /// frame regardless of whether `f` succeeded.
+    ///
+    /// Lets postcard `#[serde(borrow)]` types borrow into the mapped
+    /// bytes for the whole closure body without a host-side bounce
+    /// buffer.
+    ///
+    /// # Safety
+    ///
+    /// Same justification as [`Self::push_buffer_with`]:
+    ///
+    /// * The bounds check guarantees `element_abs + element_size <=
+    ///   mem_size()`, so the `&[u8]` lies fully within the mapping
+    ///   `base_ptr()` was derived from.
+    /// * `&mut self` plus the paused-vCPU invariant give exclusive
+    ///   access to the byte range for the closure body, so the `&[u8]`
+    ///   does not alias any other reference.
+    /// * The region is `u8`, so all bit patterns are valid. Postcard
+    ///   validates encoding-level invariants (UTF-8, lengths) and
+    ///   returns an error on corrupt input.
+    /// * The pop (zero + header publish) goes through the volatile
+    ///   [`Self::fill`] and [`Self::write`] paths.
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    pub fn with_top_buffer<R, F>(
+        &mut self,
+        buffer_start_offset: usize,
+        buffer_size: usize,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&[u8]) -> Result<R>,
+    {
         let stack_pointer_rel = self.read::<u64>(buffer_start_offset)? as usize;
 
         if stack_pointer_rel > buffer_size || stack_pointer_rel < 16 {
@@ -1416,72 +1528,38 @@ impl HostSharedMemory {
             ));
         }
 
-        // make it absolute
         let last_element_offset_abs = stack_pointer_rel + buffer_start_offset;
+        let last_element_offset_rel = self.read::<u64>(last_element_offset_abs - 8)? as usize;
 
-        // go back 8 bytes to get offset to element on top of stack
-        let last_element_offset_rel: usize =
-            self.read::<u64>(last_element_offset_abs - 8)? as usize;
-
-        // Validate element offset (guest-writable): must be in [8, stack_pointer_rel - 16]
-        // to leave room for the 8-byte back-pointer plus at least 8 bytes of element data
-        // (the minimum for a size-prefixed flatbuffer: 4-byte prefix + 4-byte root offset).
-        if last_element_offset_rel > stack_pointer_rel.saturating_sub(16)
+        if last_element_offset_rel > stack_pointer_rel.saturating_sub(8)
             || last_element_offset_rel < 8
         {
             return Err(new_error!(
                 "Corrupt buffer back-pointer: element offset {} is outside valid range [8, {}].",
                 last_element_offset_rel,
-                stack_pointer_rel.saturating_sub(16),
+                stack_pointer_rel.saturating_sub(8),
             ));
         }
 
-        // make it absolute
-        let last_element_offset_abs = last_element_offset_rel + buffer_start_offset;
+        let element_size = stack_pointer_rel - last_element_offset_rel - 8;
+        let element_abs = last_element_offset_rel + buffer_start_offset;
+        bounds_check!(element_abs, element_size, self.mem_size());
 
-        // Max bytes the element can span (excluding the 8-byte back-pointer).
-        let max_element_size = stack_pointer_rel - last_element_offset_rel - 8;
+        let result = {
+            // SAFETY: see method docs.
+            let element_ptr = self.base_ptr().wrapping_add(element_abs);
+            let bytes: &[u8] = unsafe { core::slice::from_raw_parts(element_ptr, element_size) };
+            f(bytes)
+        };
 
-        // Get the size of the flatbuffer buffer from memory
-        let fb_buffer_size = {
-            let raw_prefix = self.read::<u32>(last_element_offset_abs)?;
-            // flatbuffer byte arrays are prefixed by 4 bytes indicating
-            // the remaining size; add 4 for the prefix itself.
-            let total = raw_prefix.checked_add(4).ok_or_else(|| {
-                new_error!(
-                    "Corrupt buffer size prefix: value {} overflows when adding 4-byte header.",
-                    raw_prefix
-                )
-            })?;
-            usize::try_from(total)
-        }?;
-
-        if fb_buffer_size > max_element_size {
-            return Err(new_error!(
-                "Corrupt buffer size prefix: flatbuffer claims {} bytes but the element slot is only {} bytes.",
-                fb_buffer_size,
-                max_element_size
-            ));
-        }
-
-        let mut result_buffer = vec![0; fb_buffer_size];
-
-        self.copy_to_slice(&mut result_buffer, last_element_offset_abs)?;
-        let to_return = T::try_from(result_buffer.as_slice()).map_err(|_e| {
-            new_error!(
-                "pop_buffer_into: failed to convert buffer to {}",
-                type_name::<T>()
-            )
-        })?;
-
-        // update the stack pointer to point to the element we just popped off since that is now free
+        // Pop regardless of f's success. Zero the consumed frame
+        // including the back-pointer, then publish the new stack
+        // pointer to the guest.
+        let pop_len = stack_pointer_rel - last_element_offset_rel;
+        self.fill(0, element_abs, pop_len)?;
         self.write::<u64>(buffer_start_offset, last_element_offset_rel as u64)?;
 
-        // zero out the memory we just popped off
-        let num_bytes_to_zero = stack_pointer_rel - last_element_offset_rel;
-        self.fill(0, last_element_offset_abs, num_bytes_to_zero)?;
-
-        Ok(to_return)
+        result
     }
 }
 
@@ -2310,19 +2388,9 @@ mod tests {
         }
     }
 
-    /// Bounds checking for `try_pop_buffer_into` against corrupt guest data.
+    /// Bounds checking for `with_top_buffer` against corrupt guest data.
     mod try_pop_buffer_bounds {
         use super::*;
-
-        #[derive(Debug, PartialEq)]
-        struct RawBytes(Vec<u8>);
-
-        impl TryFrom<&[u8]> for RawBytes {
-            type Error = String;
-            fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
-                Ok(RawBytes(value.to_vec()))
-            }
-        }
 
         /// Create a buffer with stack pointer initialized to 8 (empty).
         fn make_buffer(mem_size: usize) -> super::super::HostSharedMemory {
@@ -2337,38 +2405,12 @@ mod tests {
             let mem_size = 4096;
             let mut hshm = make_buffer(mem_size);
 
-            // Size-prefixed flatbuffer-like payload: [size: u32 LE][payload]
-            let payload = b"hello";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-
-            hshm.push_buffer(0, mem_size, &data).unwrap();
-            let result: RawBytes = hshm.try_pop_buffer_into(0, mem_size).unwrap();
-            assert_eq!(result.0, data);
-        }
-
-        #[test]
-        fn malicious_flatbuffer_size_prefix() {
-            let mem_size = 4096;
-            let mut hshm = make_buffer(mem_size);
-
-            let payload = b"small";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-            hshm.push_buffer(0, mem_size, &data).unwrap();
-
-            // Corrupt size prefix at element start (offset 8) to near u32::MAX.
-            hshm.write::<u32>(8, 0xFFFF_FFFBu32).unwrap(); // +4 = 0xFFFF_FFFF
-
-            let result: Result<RawBytes> = hshm.try_pop_buffer_into(0, mem_size);
-            let err_msg = format!("{}", result.unwrap_err());
-            assert!(
-                err_msg.contains("Corrupt buffer size prefix: flatbuffer claims 4294967295 bytes but the element slot is only 9 bytes"),
-                "Unexpected error message: {}",
-                err_msg
-            );
+            let payload = b"hello, world";
+            hshm.push_buffer(0, mem_size, payload).unwrap();
+            let out = hshm
+                .with_top_buffer(0, mem_size, |bytes| Ok(bytes.to_vec()))
+                .unwrap();
+            assert_eq!(out.as_slice(), payload);
         }
 
         #[test]
@@ -2377,20 +2419,16 @@ mod tests {
             let mut hshm = make_buffer(mem_size);
 
             let payload = b"test";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-            hshm.push_buffer(0, mem_size, &data).unwrap();
+            hshm.push_buffer(0, mem_size, payload).unwrap();
 
-            // Corrupt back-pointer (offset 16) to 0 (before valid range).
-            hshm.write::<u64>(16, 0u64).unwrap();
+            // Stack pointer after push: 8 (payload, aligned) + 8 (back-pointer) = 16; SP=16.
+            // Back-pointer lives at offset SP+0 - 8 = 8 (relative). Corrupt to 0.
+            hshm.write::<u64>(8, 0u64).unwrap();
 
-            let result: Result<RawBytes> = hshm.try_pop_buffer_into(0, mem_size);
+            let result: Result<()> = hshm.with_top_buffer(0, mem_size, |_| Ok(()));
             let err_msg = format!("{}", result.unwrap_err());
             assert!(
-                err_msg.contains(
-                    "Corrupt buffer back-pointer: element offset 0 is outside valid range [8, 8]"
-                ),
+                err_msg.contains("Corrupt buffer back-pointer: element offset 0"),
                 "Unexpected error message: {}",
                 err_msg
             );
@@ -2402,94 +2440,16 @@ mod tests {
             let mut hshm = make_buffer(mem_size);
 
             let payload = b"test";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-            hshm.push_buffer(0, mem_size, &data).unwrap();
+            hshm.push_buffer(0, mem_size, payload).unwrap();
 
-            // Corrupt back-pointer (offset 16) to 9999 (past stack pointer 24).
-            hshm.write::<u64>(16, 9999u64).unwrap();
+            // Corrupt the back-pointer to a value past the stack pointer.
+            let sp = hshm.read::<u64>(0).unwrap() as usize;
+            hshm.write::<u64>(sp - 8, 9999u64).unwrap();
 
-            let result: Result<RawBytes> = hshm.try_pop_buffer_into(0, mem_size);
+            let result: Result<()> = hshm.with_top_buffer(0, mem_size, |_| Ok(()));
             let err_msg = format!("{}", result.unwrap_err());
             assert!(
-                err_msg.contains(
-                    "Corrupt buffer back-pointer: element offset 9999 is outside valid range [8, 8]"
-                ),
-                "Unexpected error message: {}",
-                err_msg
-            );
-        }
-
-        #[test]
-        fn malicious_flatbuffer_size_off_by_one() {
-            let mem_size = 4096;
-            let mut hshm = make_buffer(mem_size);
-
-            let payload = b"abcd";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-            hshm.push_buffer(0, mem_size, &data).unwrap();
-
-            // Corrupt size prefix: claim 5 bytes (total 9), exceeding the 8-byte slot.
-            hshm.write::<u32>(8, 5u32).unwrap(); // fb_buffer_size = 5 + 4 = 9
-
-            let result: Result<RawBytes> = hshm.try_pop_buffer_into(0, mem_size);
-            let err_msg = format!("{}", result.unwrap_err());
-            assert!(
-                err_msg.contains("Corrupt buffer size prefix: flatbuffer claims 9 bytes but the element slot is only 8 bytes"),
-                "Unexpected error message: {}",
-                err_msg
-            );
-        }
-
-        /// Back-pointer just below stack_pointer causes underflow in
-        /// `stack_pointer_rel - last_element_offset_rel - 8`.
-        #[test]
-        fn back_pointer_near_stack_pointer_underflow() {
-            let mem_size = 4096;
-            let mut hshm = make_buffer(mem_size);
-
-            let payload = b"test";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-            hshm.push_buffer(0, mem_size, &data).unwrap();
-
-            // stack_pointer_rel = 24. Set back-pointer to 23 (> 24 - 16 = 8, so rejected).
-            hshm.write::<u64>(16, 23u64).unwrap();
-
-            let result: Result<RawBytes> = hshm.try_pop_buffer_into(0, mem_size);
-            let err_msg = format!("{}", result.unwrap_err());
-            assert!(
-                err_msg.contains(
-                    "Corrupt buffer back-pointer: element offset 23 is outside valid range [8, 8]"
-                ),
-                "Unexpected error message: {}",
-                err_msg
-            );
-        }
-
-        /// Size prefix of 0xFFFF_FFFD causes u32 overflow: 0xFFFF_FFFD + 4 wraps.
-        #[test]
-        fn size_prefix_u32_overflow() {
-            let mem_size = 4096;
-            let mut hshm = make_buffer(mem_size);
-
-            let payload = b"test";
-            let mut data = Vec::new();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(payload);
-            hshm.push_buffer(0, mem_size, &data).unwrap();
-
-            // Write 0xFFFF_FFFD as size prefix: checked_add(4) returns None.
-            hshm.write::<u32>(8, 0xFFFF_FFFDu32).unwrap();
-
-            let result: Result<RawBytes> = hshm.try_pop_buffer_into(0, mem_size);
-            let err_msg = format!("{}", result.unwrap_err());
-            assert!(
-                err_msg.contains("Corrupt buffer size prefix: value 4294967293 overflows when adding 4-byte header"),
+                err_msg.contains("Corrupt buffer back-pointer: element offset 9999"),
                 "Unexpected error message: {}",
                 err_msg
             );

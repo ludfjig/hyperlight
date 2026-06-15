@@ -18,7 +18,7 @@ use alloc::string::String;
 use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
+use hyperlight_common::wire::{Param, ReturnType};
 
 use crate::host_comm::call_host_function;
 use crate::libc::{
@@ -70,11 +70,7 @@ extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
 
     let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
     let s = String::from_utf8_lossy(slice);
-    match call_host_function::<i32>(
-        "HostPrint",
-        Some(vec![ParameterValue::String(s.into_owned())]),
-        ReturnType::Int,
-    ) {
+    match call_host_function::<i32>("HostPrint", Some(vec![Param::String(&s)]), ReturnType::Int) {
         Ok(_) => count as isize,
         Err(_) => {
             set_errno(EIO);

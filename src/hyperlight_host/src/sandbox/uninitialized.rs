@@ -25,7 +25,7 @@ use tracing_core::LevelFilter;
 use super::host_funcs::FunctionRegistry;
 use super::snapshot::Snapshot;
 use super::uninitialized_evolve::evolve_impl_multi_use;
-use crate::func::host_functions::{HostFunction, register_host_function};
+use crate::func::host_functions::HostFunction;
 use crate::func::{ParameterTuple, SupportedReturnType};
 #[cfg(feature = "build-metadata")]
 use crate::log_build_details;
@@ -531,17 +531,18 @@ impl UninitializedSandbox {
         name: impl AsRef<str>,
         host_func: impl Into<HostFunction<Output, Args>>,
     ) -> Result<()> {
-        register_host_function(host_func, self, name.as_ref())
+        use crate::func::Registerable;
+        self.register_host_function(name.as_ref(), host_func)
     }
 
     /// Registers the special "HostPrint" function for guest printing.
     ///
-    /// This overrides the default behavior of writing to stdout.
-    /// The function expects the signature `FnMut(String) -> i32`
-    /// and will be called when the guest wants to print output.
+    /// Overrides the default behavior of writing to stdout. The function
+    /// expects the signature `FnMut(&str) -> i32` and is called when the
+    /// guest wants to print output.
     pub fn register_print(
         &mut self,
-        print_func: impl Into<HostFunction<i32, (String,)>>,
+        print_func: impl Into<HostFunction<i32, (crate::func::Str,)>>,
     ) -> Result<()> {
         self.register("HostPrint", print_func)
     }
@@ -590,7 +591,8 @@ mod tests {
     use std::{fs, thread};
 
     use crossbeam_queue::ArrayQueue;
-    use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
+    use hyperlight_common::func::OwnedReturn;
+    use hyperlight_common::wire::Param;
     use hyperlight_testing::simple_guest_as_string;
 
     use crate::sandbox::SandboxConfiguration;
@@ -608,7 +610,7 @@ mod tests {
         let mut sandbox: MultiUseSandbox = uninitialized_sandbox.evolve().unwrap();
 
         let res = sandbox
-            .call::<Vec<u8>>("ReadFromUserMemory", (4u64, buffer.to_vec()))
+            .call::<Vec<u8>>("ReadFromUserMemory", (4u64, buffer.as_slice()))
             .expect("Failed to call ReadFromUserMemory");
 
         assert_eq!(res, buffer.to_vec());
@@ -680,7 +682,9 @@ mod tests {
         {
             let mut usbox = uninitialized_sandbox();
 
-            usbox.register("test0", |arg: i32| Ok(arg + 1)).unwrap();
+            usbox
+                .register::<(i32,), i32>("test0", |arg| Ok(arg + 1))
+                .unwrap();
 
             let sandbox: Result<MultiUseSandbox> = usbox.evolve();
             assert!(sandbox.is_ok());
@@ -695,17 +699,19 @@ mod tests {
 
             let res = host_funcs
                 .unwrap()
-                .call_host_function("test0", vec![ParameterValue::Int(1)])
+                .call_host_function("test0", vec![Param::Int(1)])
                 .unwrap();
 
-            assert_eq!(res, ReturnValue::Int(2));
+            assert_eq!(res, OwnedReturn::Int(2));
         }
 
         // multiple parameters register + call
         {
             let mut usbox = uninitialized_sandbox();
 
-            usbox.register("test1", |a: i32, b: i32| Ok(a + b)).unwrap();
+            usbox
+                .register::<(i32, i32), i32>("test1", |a, b| Ok(a + b))
+                .unwrap();
 
             let sandbox: Result<MultiUseSandbox> = usbox.evolve();
             assert!(sandbox.is_ok());
@@ -720,13 +726,10 @@ mod tests {
 
             let res = host_funcs
                 .unwrap()
-                .call_host_function(
-                    "test1",
-                    vec![ParameterValue::Int(1), ParameterValue::Int(2)],
-                )
+                .call_host_function("test1", vec![Param::Int(1), Param::Int(2)])
                 .unwrap();
 
-            assert_eq!(res, ReturnValue::Int(3));
+            assert_eq!(res, OwnedReturn::Int(3));
         }
 
         // incorrect arguments register + call
@@ -734,7 +737,7 @@ mod tests {
             let mut usbox = uninitialized_sandbox();
 
             usbox
-                .register("test2", |msg: String| {
+                .register::<(crate::func::Str,), ()>("test2", |msg: &str| {
                     println!("test2 called: {}", msg);
                     Ok(())
                 })
@@ -782,8 +785,8 @@ mod tests {
 
         let (tx, rx) = channel();
 
-        let writer = move |msg| {
-            let _ = tx.send(msg);
+        let writer = move |msg: &str| {
+            let _ = tx.send(msg.to_string());
             Ok(0)
         };
 
@@ -871,7 +874,7 @@ mod tests {
 
         // writer as a function
 
-        fn fn_writer(msg: String) -> Result<i32> {
+        fn fn_writer(msg: &str) -> Result<i32> {
             assert_eq!(msg, "test2");
             Ok(0)
         }
@@ -901,7 +904,7 @@ mod tests {
 
         // create a closure over the struct method
 
-        let writer_closure = move |s| test_host_print.write(s);
+        let writer_closure = move |s: &str| test_host_print.write(s);
 
         let mut sandbox = UninitializedSandbox::new(
             GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
@@ -930,7 +933,7 @@ mod tests {
             TestHostPrint {}
         }
 
-        fn write(&mut self, msg: String) -> Result<i32> {
+        fn write(&mut self, msg: &str) -> Result<i32> {
             assert_eq!(msg, "test3");
             Ok(0)
         }
@@ -1492,7 +1495,7 @@ mod tests {
 
             // Register a custom host function
             sandbox
-                .register("CustomAdd", |a: i32, b: i32| Ok(a + b))
+                .register::<(i32, i32), i32>("CustomAdd", |a, b| Ok(a + b))
                 .expect("Failed to register custom function");
 
             let evolved: MultiUseSandbox = sandbox.evolve().expect("Failed to evolve sandbox");
@@ -1504,13 +1507,10 @@ mod tests {
                 .expect("Failed to lock host funcs");
 
             let result = host_funcs
-                .call_host_function(
-                    "CustomAdd",
-                    vec![ParameterValue::Int(10), ParameterValue::Int(20)],
-                )
+                .call_host_function("CustomAdd", vec![Param::Int(10), Param::Int(20)])
                 .expect("Failed to call CustomAdd");
 
-            assert_eq!(result, ReturnValue::Int(30));
+            assert_eq!(result, OwnedReturn::Int(30));
         }
 
         // Test 8: Create snapshot with init data (guest blob)

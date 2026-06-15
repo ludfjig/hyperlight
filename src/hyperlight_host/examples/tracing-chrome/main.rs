@@ -35,7 +35,7 @@ fn main() -> Result<()> {
 
     // do the function call
     let current_time = std::time::Instant::now();
-    let res: String = sbox.call("Echo", "Hello, World!".to_string())?;
+    let res: String = sbox.call("Echo", "Hello, World!")?;
     let elapsed = current_time.elapsed();
     println!("Function call finished in {:?}.", elapsed);
     assert_eq!(res, "Hello, World!");

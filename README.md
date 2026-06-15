@@ -34,7 +34,7 @@ sandbox.register("GetWeekday", || Ok("Monday".to_string()))?;
 let mut sandbox: MultiUseSandbox = sandbox.evolve()?;
 
 // Call a function inside the VM
-let greeting: String = sandbox.call("SayHello", "World".to_string())?;
+let greeting: String = sandbox.call("SayHello", "World")?;
 println!("{greeting}"); // "Hello, World! Today is Monday."
 ```
 
@@ -47,7 +47,7 @@ Guest state persists across calls. Use `snapshot()` and `restore()` to save and 
 fn get_weekday() -> Result<String>;
 
 #[guest_function("SayHello")]
-fn say_hello(name: String) -> Result<String> {
+fn say_hello(name: &str) -> Result<String> {
     let weekday = get_weekday()?;
     Ok(format!("Hello, {name}! Today is {weekday}."))
 }

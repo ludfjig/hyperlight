@@ -27,7 +27,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 use uuid::Uuid;
 
-fn fn_writer(_msg: String) -> Result<i32> {
+fn fn_writer(_msg: &str) -> Result<i32> {
     Ok(0)
 }
 
@@ -76,9 +76,7 @@ fn run_example() -> Result<()> {
 
             // Call a guest function 5 times to generate some log entries.
             for _ in 0..5 {
-                multiuse_sandbox
-                    .call::<String>("Echo", "a".to_string())
-                    .unwrap();
+                multiuse_sandbox.call::<String>("Echo", "a").unwrap();
             }
 
             // Define a message to send to the guest.
@@ -88,7 +86,7 @@ fn run_example() -> Result<()> {
             // Call a guest function that calls the HostPrint host function 5 times to generate some log entries.
             for _ in 0..5 {
                 multiuse_sandbox
-                    .call::<i32>("PrintOutput", msg.clone())
+                    .call::<i32>("PrintOutput", msg.as_str())
                     .unwrap();
             }
             Ok(())

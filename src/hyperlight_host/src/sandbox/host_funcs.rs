@@ -17,11 +17,10 @@ limitations under the License.
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{
-    ParameterType, ParameterValue, ReturnType, ReturnValue,
+use hyperlight_common::func::OwnedReturn;
+use hyperlight_common::wire::{
+    HostFunctionDefinition, HostFunctionDetails, Param, ParameterType, ReturnType,
 };
-use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
-use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tracing::{Span, instrument};
 
@@ -54,7 +53,7 @@ pub struct FunctionRegistry {
 /// # fn example() -> Result<()> {
 /// // Default: HostPrint already registered.
 /// let mut funcs = HostFunctions::default();
-/// funcs.register_host_function("Add", |a: i32, b: i32| Ok(a + b))?;
+/// funcs.register_host_function("Answer", || Ok(42i64))?;
 /// # Ok(())
 /// # }
 /// ```
@@ -152,13 +151,13 @@ impl FunctionRegistry {
     /// `HostPrint` function (writes to stdout with green text).
     pub(crate) fn with_default_host_print() -> Self {
         use crate::func::host_functions::HostFunction;
-        use crate::func::{ParameterTuple, SupportedReturnType};
+        use crate::func::{ParameterTuple, Str, SupportedReturnType};
 
         let mut registry = Self::default();
-        let hf: HostFunction<i32, (String,)> = default_writer_func.into();
+        let hf: HostFunction<i32, (Str,)> = default_writer_func.into();
         let entry = FunctionEntry {
             function: hf.into(),
-            parameter_types: <(String,)>::TYPE,
+            parameter_types: <(Str,)>::TYPE,
             return_type: <i32 as SupportedReturnType>::TYPE,
         };
         registry.register_host_function("HostPrint".to_string(), entry);
@@ -167,34 +166,29 @@ impl FunctionRegistry {
 
     /// Assuming a host function called `"HostPrint"` exists, and takes a
     /// single string parameter, call it with the given `msg` parameter.
-    ///
-    /// Return `Ok` if the function was found and was of the right signature,
-    /// and `Err` otherwise.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     #[allow(dead_code)]
     pub(super) fn host_print(&mut self, msg: String) -> Result<i32> {
-        let res = self.call_host_func_impl("HostPrint", vec![ParameterValue::String(msg)])?;
-        res.try_into()
-            .map_err(|_| HostFunctionNotFound("HostPrint".to_string()))
+        let res = self.call_host_func_impl("HostPrint", vec![Param::String(msg.as_str())])?;
+        match res {
+            OwnedReturn::Int(v) => Ok(v),
+            _ => Err(HostFunctionNotFound("HostPrint".to_string())),
+        }
     }
     /// From the set of registered host functions, attempt to get the one
     /// named `name`. If it exists, call it with the given arguments list
     /// `args` and return its result.
-    ///
-    /// Return `Err` if no such function exists,
-    /// its parameter list doesn't match `args`, or there was another error
-    /// getting, configuring or calling the function.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     pub(super) fn call_host_function(
         &self,
         name: &str,
-        args: Vec<ParameterValue>,
-    ) -> Result<ReturnValue> {
+        args: Vec<Param<'_>>,
+    ) -> Result<OwnedReturn> {
         self.call_host_func_impl(name, args)
     }
 
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-    fn call_host_func_impl(&self, name: &str, args: Vec<ParameterValue>) -> Result<ReturnValue> {
+    fn call_host_func_impl(&self, name: &str, args: Vec<Param<'_>>) -> Result<OwnedReturn> {
         let FunctionEntry {
             function,
             parameter_types: _,
@@ -204,14 +198,13 @@ impl FunctionRegistry {
             .get(name)
             .ok_or_else(|| HostFunctionNotFound(name.to_string()))?;
 
-        // Make the host function call
         crate::metrics::maybe_time_and_emit_host_call(name, || function.call(args))
     }
 }
 
 /// The default writer function is to write to stdout with green text.
 #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-fn default_writer_func(s: String) -> Result<i32> {
+fn default_writer_func(s: &str) -> Result<i32> {
     match std::io::stdout().is_terminal() {
         false => {
             print!("{}", s);

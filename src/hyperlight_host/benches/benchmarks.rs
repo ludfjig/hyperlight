@@ -19,10 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use flatbuffers::FlatBufferBuilder;
-use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
-use hyperlight_common::flatbuffer_wrappers::util::estimate_flatbuffer_capacity;
+use hyperlight_common::wire::{self, FunctionCall, FunctionCallType, Param, ReturnType};
 use hyperlight_host::GuestBinary;
 use hyperlight_host::mem::shared_mem::ExclusiveSharedMemory;
 use hyperlight_host::sandbox::{MultiUseSandbox, SandboxConfiguration, UninitializedSandbox};
@@ -162,7 +159,7 @@ fn sandbox_lifecycle_benchmark(c: &mut Criterion) {
 
 fn bench_guest_call(b: &mut criterion::Bencher, size: SandboxSize) {
     let mut sbox = create_multiuse_sandbox_with_size(size);
-    b.iter(|| sbox.call::<String>("Echo", "hello\n".to_string()).unwrap());
+    b.iter(|| sbox.call::<String>("Echo", "hello\n").unwrap());
 }
 
 fn bench_guest_call_with_restore(b: &mut criterion::Bencher, size: SandboxSize) {
@@ -170,7 +167,7 @@ fn bench_guest_call_with_restore(b: &mut criterion::Bencher, size: SandboxSize) 
     let snapshot = sbox.snapshot().unwrap();
 
     b.iter(|| {
-        sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+        sbox.call::<String>("Echo", "hello\n").unwrap();
         sbox.restore(snapshot.clone()).unwrap();
     });
 }
@@ -179,7 +176,7 @@ fn bench_guest_call_with_host_function(b: &mut criterion::Bencher, size: Sandbox
     let mut uninitialized_sandbox = create_uninit_sandbox_with_size(size);
 
     uninitialized_sandbox
-        .register("HostAdd", |a: i32, b: i32| Ok(a + b))
+        .register::<(i32, i32), i32>("HostAdd", |a, b| Ok(a + b))
         .unwrap();
 
     let mut multiuse_sandbox: MultiUseSandbox = uninitialized_sandbox.evolve().unwrap();
@@ -200,7 +197,7 @@ fn bench_guest_call_different_thread(b: &mut criterion::Bencher, size: SandboxSi
             // Ensure vcpu is "bound" on this main thread
             {
                 let mut sbox = sbox.lock().unwrap();
-                sbox.call::<String>("Echo", "warmup\n".to_string()).unwrap();
+                sbox.call::<String>("Echo", "warmup\n").unwrap();
             }
 
             let barrier = Arc::new(Barrier::new(2));
@@ -213,7 +210,7 @@ fn bench_guest_call_different_thread(b: &mut criterion::Bencher, size: SandboxSi
                 let mut sbox = sbox_clone.lock().unwrap();
                 let start = Instant::now();
                 // Measure the first call after thread switch
-                sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+                sbox.call::<String>("Echo", "hello\n").unwrap();
                 start.elapsed()
             });
 
@@ -312,7 +309,7 @@ fn bench_snapshot_create(b: &mut criterion::Bencher, size: SandboxSize) {
 
         for _ in 0..iters {
             // Make a call to modify memory
-            sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+            sbox.call::<String>("Echo", "hello\n").unwrap();
 
             // Measure only the snapshot creation time
             let start = Instant::now();
@@ -335,7 +332,7 @@ fn bench_snapshot_restore(b: &mut criterion::Bencher, size: SandboxSize) {
 
         for _ in 0..iters {
             // Make a call to modify memory
-            sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+            sbox.call::<String>("Echo", "hello\n").unwrap();
 
             // Measure only the restore time
             let start = Instant::now();
@@ -395,7 +392,10 @@ fn guest_call_benchmark_large_param(c: &mut Criterion) {
             || (large_vec.clone(), large_string.clone()),
             |(vec_clone, string_clone)| {
                 sandbox
-                    .call::<()>("LargeParameters", (vec_clone, string_clone))
+                    .call::<()>(
+                        "LargeParameters",
+                        (vec_clone.as_slice(), string_clone.as_str()),
+                    )
                     .unwrap()
             },
         );
@@ -411,44 +411,40 @@ fn guest_call_benchmark_large_param(c: &mut Criterion) {
 fn function_call_serialization_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("function_call_serialization");
 
-    let function_call = FunctionCall::new(
-        "TestFunction".to_string(),
-        Some(vec![
-            ParameterValue::VecBytes(vec![1; 10 * 1024 * 1024]),
-            ParameterValue::String(String::from_utf8(vec![2; 10 * 1024 * 1024]).unwrap()),
-            ParameterValue::Int(42),
-            ParameterValue::UInt(100),
-            ParameterValue::Long(1000),
-            ParameterValue::ULong(2000),
-            ParameterValue::Float(521521.53),
-            ParameterValue::Double(432.53),
-            ParameterValue::Bool(true),
-            ParameterValue::VecBytes(vec![1; 10 * 1024 * 1024]),
-            ParameterValue::String(String::from_utf8(vec![2; 10 * 1024 * 1024]).unwrap()),
-        ]),
-        FunctionCallType::Guest,
-        ReturnType::Int,
-    );
+    let bytes_a = vec![1u8; 10 * 1024 * 1024];
+    let bytes_b = vec![1u8; 10 * 1024 * 1024];
+    let string_a = String::from_utf8(vec![2u8; 10 * 1024 * 1024]).unwrap();
+    let string_b = String::from_utf8(vec![2u8; 10 * 1024 * 1024]).unwrap();
+    let function_call = FunctionCall {
+        name: "TestFunction",
+        call_type: FunctionCallType::Guest,
+        return_type: ReturnType::Int,
+        params: vec![
+            Param::VecBytes(&bytes_a),
+            Param::String(&string_a),
+            Param::Int(42),
+            Param::UInt(100),
+            Param::Long(1000),
+            Param::ULong(2000),
+            Param::Float(521521.53),
+            Param::Double(432.53),
+            Param::Bool(true),
+            Param::VecBytes(&bytes_b),
+            Param::String(&string_b),
+        ],
+    };
 
     group.bench_function("serialize_function_call", |b| {
         b.iter(|| {
-            // We specifically want to include the time to estimate the capacity in this benchmark
-            let estimated_capacity = estimate_flatbuffer_capacity(
-                function_call.function_name.as_str(),
-                function_call.parameters.as_deref().unwrap_or(&[]),
-            );
-            let mut builder = FlatBufferBuilder::with_capacity(estimated_capacity);
-            let serialized: &[u8] = function_call.encode(&mut builder);
+            let serialized = wire::encode(&function_call).unwrap();
             std::hint::black_box(serialized);
         });
     });
 
     group.bench_function("deserialize_function_call", |b| {
-        let mut builder = FlatBufferBuilder::new();
-        let bytes = function_call.clone().encode(&mut builder);
-
+        let bytes = wire::encode(&function_call).unwrap();
         b.iter(|| {
-            let deserialized: FunctionCall = bytes.try_into().unwrap();
+            let deserialized: FunctionCall<'_> = wire::decode_exact(&bytes).unwrap();
             std::hint::black_box(deserialized);
         });
     });
@@ -475,7 +471,7 @@ fn sample_workloads_benchmark(c: &mut Criterion) {
         b.iter_with_setup(
             || vec![1; 24 * 1024],
             |input| {
-                let ret: Vec<u8> = sandbox.call("24K_in_8K_out", (input,)).unwrap();
+                let ret: Vec<u8> = sandbox.call("24K_in_8K_out", (input.as_slice(),)).unwrap();
                 assert_eq!(ret.len(), 8 * 1024, "Expected output length to be 8K");
                 std::hint::black_box(ret);
             },

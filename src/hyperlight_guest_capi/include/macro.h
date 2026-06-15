@@ -10,7 +10,7 @@
 //             2. The return type of the function. This must be one of the variant names in hl_ReturnType
 //                  Note: This macro does not work for functions that return VecBytes. Instead,
 //                  use `hl_register_function_definition` directly. You'll also need to return
-//                  a flatbuffer-encoded hl_Vec* using the various hl_flatbuffer_result_from_* functions.
+//                  a flatbuffer-encoded hl_Vec* using the various hl_result_from_* functions.
 //                  See c_simpleguest/main.c for an example.
 //             3. The number of parameters the function takes
 //             4+ The types of the parameters the function takes. The must be one of the variant names
@@ -20,7 +20,7 @@
 #define HYPERLIGHT_WRAP_FUNCTION_0(function, return_type, ...) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return hl_flatbuffer_result_from_##return_type( function() \
+    return hl_result_from_##return_type( function() \
     ); \
 } \
 uintptr_t _##function##_parameter_count = 0; \
@@ -31,7 +31,7 @@ hl_ParameterType _##function##_parameter_types[] = { 0 }; \
 #define HYPERLIGHT_WRAP_FUNCTION_1(function, return_type, arg1) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return hl_flatbuffer_result_from_##return_type( function( \
+    return hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1 \
     )); \
 } \
@@ -42,7 +42,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1 }; 
 #define HYPERLIGHT_WRAP_FUNCTION_2(function, return_type, arg1, arg2) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2 \
     )); \
@@ -57,7 +57,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_3(function, return_type, arg1, arg2, arg3) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3 \
@@ -74,7 +74,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_4(function, return_type, arg1, arg2, arg3, arg4) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -92,7 +92,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_5(function, return_type, arg1, arg2, arg3, arg4, arg5) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -112,7 +112,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_6(function, return_type, arg1, arg2, arg3, arg4, arg5, arg6) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -134,7 +134,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_7(function, return_type, arg1, arg2, arg3, arg4, arg5, arg6, arg7) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -158,7 +158,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_8(function, return_type, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -184,7 +184,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_9(function, return_type, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -212,7 +212,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_10(function, return_type, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \
@@ -242,7 +242,7 @@ hl_ParameterType _##function##_parameter_types[] = { hl_ParameterType_##arg1, \
 #define HYPERLIGHT_WRAP_FUNCTION_11(function, return_type, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11) \
 hl_Vec  *_call_##function(const hl_FunctionCall *function_call) \
 { \
-    return  hl_flatbuffer_result_from_##return_type( function( \
+    return  hl_result_from_##return_type( function( \
         function_call->parameters[0].value.arg1, \
         function_call->parameters[1].value.arg2, \
         function_call->parameters[2].value.arg3, \

@@ -16,16 +16,10 @@ limitations under the License.
 #[cfg(feature = "nanvix-unstable")]
 use std::mem::offset_of;
 
-use flatbuffers::FlatBufferBuilder;
-use hyperlight_common::flatbuffer_wrappers::function_call::{
-    FunctionCall, validate_guest_function_call_buffer,
-};
-use hyperlight_common::flatbuffer_wrappers::function_types::FunctionCallResult;
-use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
-use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use hyperlight_common::vmem::{self, PAGE_TABLE_SIZE};
 #[cfg(all(feature = "crashdump", not(feature = "i686-guest")))]
 use hyperlight_common::vmem::{BasicMapping, MappingKind};
+use hyperlight_common::wire::{self, FunctionCallResult, GuestLogData, HostFunctionDetails};
 use tracing::{Span, instrument};
 
 use super::layout::SandboxMemoryLayout;
@@ -439,12 +433,20 @@ impl SandboxMemoryManager<HostSharedMemory> {
         Ok(())
     }
 
-    /// Reads a host function call from memory
+    /// Runs `f` against the raw bytes of the topmost host function call
+    /// frame in shared memory, popping the frame afterwards. The borrowed
+    /// slice is valid for the closure body, so `f` may
+    /// `wire::decode_exact::<FunctionCall<'_>>` borrowing into shared
+    /// memory without copying.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
-    pub(crate) fn get_host_function_call(&mut self) -> Result<FunctionCall> {
-        self.scratch_mem.try_pop_buffer_into::<FunctionCall>(
+    pub(crate) fn with_host_function_call_bytes<R>(
+        &mut self,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<R> {
+        self.scratch_mem.with_top_buffer(
             self.layout.get_output_data_buffer_scratch_host_offset(),
             self.layout.output_data_size,
+            f,
         )
     }
 
@@ -452,74 +454,123 @@ impl SandboxMemoryManager<HostSharedMemory> {
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn write_response_from_host_function_call(
         &mut self,
-        res: &FunctionCallResult,
+        res: &FunctionCallResult<'_>,
     ) -> Result<()> {
-        let mut builder = FlatBufferBuilder::new();
-        let data = res.encode(&mut builder);
-
-        self.scratch_mem.push_buffer(
+        self.scratch_mem.push_buffer_with(
             self.layout.get_input_data_buffer_scratch_host_offset(),
             self.layout.input_data_size,
-            data,
+            |buf| {
+                let written = wire::encode_into(res, buf)
+                    .map_err(|e| new_error!("postcard encode failed: {e}"))?;
+                Ok(written.len())
+            },
         )
     }
 
-    /// Writes a guest function call to memory
+    /// Encodes a guest function call directly into the input buffer
+    /// of shared memory via postcard, skipping any intermediate
+    /// `Vec<u8>` that a serialize-then-copy would require.
+    ///
+    /// The steady-state `call` path uses
+    /// [`Self::write_guest_function_call_with`], which also skips the
+    /// `Vec<Param<'_>>` allocation. This entry point is retained for
+    /// fuzzing, where the parameter list is supplied as a runtime
+    /// `Vec<Param<'_>>` rather than a typed tuple.
+    #[cfg(feature = "fuzzing")]
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
-    pub(crate) fn write_guest_function_call(&mut self, buffer: &[u8]) -> Result<()> {
-        validate_guest_function_call_buffer(buffer).map_err(|e| {
-            new_error!(
-                "Guest function call buffer validation failed: {}",
-                e.to_string()
-            )
-        })?;
-
-        self.scratch_mem.push_buffer(
+    pub(crate) fn write_guest_function_call_encoded(
+        &mut self,
+        fc: &hyperlight_common::wire::FunctionCall<'_>,
+    ) -> Result<()> {
+        self.scratch_mem.push_buffer_with(
             self.layout.get_input_data_buffer_scratch_host_offset(),
             self.layout.input_data_size,
-            buffer,
-        )?;
-        Ok(())
+            |buf| {
+                let written = wire::encode_into(fc, buf)
+                    .map_err(|e| new_error!("postcard encode of guest call failed: {e}"))?;
+                Ok(written.len())
+            },
+        )
     }
 
-    /// Reads a function call result from memory.
-    /// A function call result can be either an error or a successful return value.
+    /// Encodes a guest function call directly from a typed parameter
+    /// tuple, avoiding the `Vec<Param<'_>>` allocation that
+    /// [`Self::write_guest_function_call_encoded`] would require to
+    /// construct a `FunctionCall<'_>` value.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
-    pub(crate) fn get_guest_function_call_result(&mut self) -> Result<FunctionCallResult> {
-        self.scratch_mem.try_pop_buffer_into::<FunctionCallResult>(
+    pub(crate) fn write_guest_function_call_with<'a, T>(
+        &mut self,
+        name: &str,
+        return_type: hyperlight_common::wire::ReturnType,
+        args: T,
+    ) -> Result<()>
+    where
+        T: hyperlight_common::func::IntoParameters<'a>,
+    {
+        use hyperlight_common::wire::{FunctionCallType, FunctionCallWith};
+        let fc = FunctionCallWith::new(name, FunctionCallType::Guest, return_type, args, T::LEN);
+        self.scratch_mem.push_buffer_with(
+            self.layout.get_input_data_buffer_scratch_host_offset(),
+            self.layout.input_data_size,
+            |buf| {
+                let written = wire::encode_into(&fc, buf)
+                    .map_err(|e| new_error!("postcard encode of guest call failed: {e}"))?;
+                Ok(written.len())
+            },
+        )
+    }
+
+    /// Runs `f` against the raw bytes of the topmost guest function call
+    /// result frame in shared memory, popping the frame afterwards. The
+    /// borrowed slice is valid for the closure body so postcard can
+    /// `decode_exact::<FunctionCallResult<'_>>` borrowing into shared
+    /// memory without copying.
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    pub(crate) fn with_guest_function_call_result_bytes<R>(
+        &mut self,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<R> {
+        self.scratch_mem.with_top_buffer(
             self.layout.get_output_data_buffer_scratch_host_offset(),
             self.layout.output_data_size,
+            f,
         )
     }
 
     /// Read guest log data from the `SharedMemory` contained within `self`
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn read_guest_log_data(&mut self) -> Result<GuestLogData> {
-        self.scratch_mem.try_pop_buffer_into::<GuestLogData>(
+        self.scratch_mem.with_top_buffer(
             self.layout.get_output_data_buffer_scratch_host_offset(),
             self.layout.output_data_size,
+            |bytes| {
+                wire::decode_exact::<GuestLogData>(bytes)
+                    .map_err(|e| new_error!("postcard decode of guest log data failed: {e}"))
+            },
         )
     }
 
     pub(crate) fn clear_io_buffers(&mut self) {
         // Clear the output data buffer
-        loop {
-            let Ok(_) = self.scratch_mem.try_pop_buffer_into::<Vec<u8>>(
+        while self
+            .scratch_mem
+            .with_top_buffer(
                 self.layout.get_output_data_buffer_scratch_host_offset(),
                 self.layout.output_data_size,
-            ) else {
-                break;
-            };
-        }
+                |_| Ok(()),
+            )
+            .is_ok()
+        {}
         // Clear the input data buffer
-        loop {
-            let Ok(_) = self.scratch_mem.try_pop_buffer_into::<Vec<u8>>(
+        while self
+            .scratch_mem
+            .with_top_buffer(
                 self.layout.get_input_data_buffer_scratch_host_offset(),
                 self.layout.input_data_size,
-            ) else {
-                break;
-            };
-        }
+                |_| Ok(()),
+            )
+            .is_ok()
+        {}
     }
 
     /// This function restores a memory snapshot from a given snapshot.

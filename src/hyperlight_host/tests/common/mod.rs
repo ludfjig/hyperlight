@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use hyperlight_host::func::HostFunction;
+use hyperlight_host::func::{HostFunction, Str};
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::{GuestBinary, MultiUseSandbox, UninitializedSandbox};
 use hyperlight_testing::{c_simple_guest_as_string, simple_guest_as_string};
@@ -142,7 +142,7 @@ where
 }
 
 /// Runs a test with both Rust and C guest MultiUseSandboxes, with a print writer.
-pub fn with_all_sandboxes_with_writer<F>(writer: HostFunction<i32, (String,)>, f: F)
+pub fn with_all_sandboxes_with_writer<F>(writer: HostFunction<i32, (Str,)>, f: F)
 where
     F: Fn(MultiUseSandbox),
 {

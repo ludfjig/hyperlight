@@ -19,9 +19,7 @@ use alloc::slice;
 use alloc::vec::Vec;
 use core::ffi::{CStr, c_char};
 
-use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ReturnType};
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+use hyperlight_common::wire::{ErrorCode, FunctionCall, Param, ParameterType, ReturnType};
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest_bin::guest_function::definition::GuestFunctionDefinition;
 use hyperlight_guest_bin::guest_function::register::GuestFunctionRegister;
@@ -35,23 +33,19 @@ type CGuestFunc = extern "C" fn(&FfiFunctionCall) -> Box<FfiVec>;
 
 unsafe extern "C" {
     // NOTE *mut FfiVec must be a Box<FfiVec>. This will be the case as long as the guest
-    // returns a FfiVec that they created using the c-api hl_flatbuffer_result_from_* functions.
+    // returns a FfiVec that they created using the c-api hl_result_from_* functions.
     fn c_guest_dispatch_function(function_call: &FfiFunctionCall) -> *mut FfiVec;
 }
 
 #[unsafe(no_mangle)]
-pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
+pub fn guest_dispatch_function(function_call: FunctionCall<'_>) -> Result<Vec<u8>> {
     // Use &raw const to get an immutable reference to the static HashMap
     // this is to avoid the clippy warning "shared reference to mutable static"
     if let Some(registered_func) =
-        unsafe { (*(&raw const REGISTERED_C_GUEST_FUNCTIONS)).get(&function_call.function_name) }
+        unsafe { (*(&raw const REGISTERED_C_GUEST_FUNCTIONS)).get(function_call.name) }
     {
-        let function_call_parameter_types: Vec<ParameterType> = function_call
-            .parameters
-            .iter()
-            .flatten()
-            .map(|p| p.into())
-            .collect();
+        let function_call_parameter_types: Vec<ParameterType> =
+            function_call.params.iter().map(|p| p.type_tag()).collect();
         registered_func.verify_parameters(&function_call_parameter_types)?;
 
         let ffi_func_call = FfiFunctionCall::from_function_call(function_call)?;
@@ -64,7 +58,7 @@ pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
         // TODO: ideally we would define a default implementation of this with weak linkage so the guest is not required
         // to implement the function but its seems that weak linkage is an unstable feature so for now its probably better
         // to not do that.
-        let function_name = function_call.function_name.clone();
+        let function_name = alloc::string::String::from(function_call.name);
         let ffi_func_call = FfiFunctionCall::from_function_call(function_call)?;
         let function_result = unsafe { c_guest_dispatch_function(&ffi_func_call) };
         if function_result.is_null() {
@@ -101,12 +95,14 @@ pub extern "C" fn hl_register_function_definition(
 /// The caller is responsible for freeing the memory associated with given `FfiFunctionCall`.
 #[unsafe(no_mangle)]
 pub extern "C" fn hl_call_host_function(function_call: &FfiFunctionCall) {
-    let parameters = unsafe { function_call.copy_parameters() };
+    let owned_params = unsafe { function_call.copy_parameters() };
     let func_name = unsafe { function_call.copy_function_name() };
     let return_type = unsafe { function_call.copy_return_type() };
 
+    let params: Vec<Param<'_>> = owned_params.iter().map(|p| p.as_param()).collect();
+
     // Use the non-generic internal implementation
     // The C API will then call specific getter functions to fetch the properly typed return value
-    let _ = call_host_function_without_returning_result(&func_name, Some(parameters), return_type)
+    let _ = call_host_function_without_returning_result(&func_name, Some(params), return_type)
         .expect("Failed to call host function");
 }

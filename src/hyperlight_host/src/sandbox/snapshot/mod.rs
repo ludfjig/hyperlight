@@ -16,12 +16,12 @@ limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
 
-use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use hyperlight_common::layout::{scratch_base_gpa, scratch_base_gva};
 use hyperlight_common::vmem;
 use hyperlight_common::vmem::{
     BasicMapping, CowMapping, Mapping, MappingKind, PAGE_SIZE, SpaceAwareMapping, SpaceId, TableOps,
 };
+use hyperlight_common::wire::HostFunctionDetails;
 use tracing::{Span, instrument};
 
 use crate::Result;
@@ -679,8 +679,8 @@ impl Snapshot {
 #[cfg(test)]
 #[cfg(not(feature = "i686-guest"))]
 mod tests {
-    use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
     use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind, PAGE_SIZE};
+    use hyperlight_common::wire::HostFunctionDetails;
 
     use crate::hypervisor::regs::CommonSpecialRegisters;
     use crate::mem::exe::LoadInfo;

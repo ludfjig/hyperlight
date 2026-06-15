@@ -16,11 +16,10 @@ limitations under the License.
 
 use std::sync::{Arc, Mutex};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{FunctionCallResult, ParameterValue};
-use hyperlight_common::flatbuffer_wrappers::guest_error::{ErrorCode, GuestError};
-use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
-use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
 use hyperlight_common::outb::{Exception, OutBAction};
+use hyperlight_common::wire::{
+    self, ErrorCode, FunctionCall, FunctionCallResult, GuestError, GuestLogData, LogLevel,
+};
 use tracing::{Span, instrument};
 
 use super::host_funcs::FunctionRegistry;
@@ -206,18 +205,26 @@ pub(crate) fn handle_outb(
     {
         OutBAction::Log => outb_log(mem_mgr),
         OutBAction::CallFunction => {
-            let call = mem_mgr
-                .get_host_function_call()
-                .map_err(|e| HandleOutbError::ReadHostFunctionCall(e.to_string()))?;
-            let name = call.function_name.clone();
-            let args: Vec<ParameterValue> = call.parameters.unwrap_or(vec![]);
-            let res = host_funcs
+            let host_funcs_guard = host_funcs
                 .try_lock()
-                .map_err(|e| HandleOutbError::LockFailed(file!(), line!(), e.to_string()))?
-                .call_host_function(&name, args)
-                .map_err(|e| GuestError::new(ErrorCode::HostFunctionError, e.to_string()));
+                .map_err(|e| HandleOutbError::LockFailed(file!(), line!(), e.to_string()))?;
+            let res = mem_mgr
+                .with_host_function_call_bytes(|bytes| {
+                    let call: FunctionCall<'_> = wire::decode_exact(bytes).map_err(|e| {
+                        crate::new_error!("postcard decode of host function call failed: {e}")
+                    })?;
+                    Ok(host_funcs_guard.call_host_function(call.name, call.params))
+                })
+                .map_err(|e| HandleOutbError::ReadHostFunctionCall(e.to_string()))?;
+            drop(host_funcs_guard);
 
-            let func_result = FunctionCallResult::new(res);
+            let func_result: FunctionCallResult<'_> = match &res {
+                Ok(owned) => FunctionCallResult::Ok(owned.as_return_value()),
+                Err(e) => FunctionCallResult::Err(GuestError {
+                    code: ErrorCode::HostFunctionError,
+                    message: e.to_string(),
+                }),
+            };
 
             mem_mgr
                 .write_response_from_host_function_call(&func_result)
@@ -247,7 +254,7 @@ pub(crate) fn handle_outb(
 }
 #[cfg(test)]
 mod tests {
-    use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
+    use hyperlight_common::wire::{self, LogLevel};
     use hyperlight_testing::logger::{LOGGER, Logger};
     use hyperlight_testing::simple_guest_as_string;
     use tracing_core::callsite::rebuild_interest_cache;
@@ -301,7 +308,7 @@ mod tests {
             let mut mgr = new_mgr();
             let log_msg = new_guest_log_data(LogLevel::Information);
 
-            let guest_log_data_buffer: Vec<u8> = log_msg.try_into().unwrap();
+            let guest_log_data_buffer: Vec<u8> = wire::encode(&log_msg).unwrap();
             let offset = mgr.layout.get_output_data_buffer_scratch_host_offset();
             mgr.scratch_mem
                 .push_buffer(
@@ -339,7 +346,7 @@ mod tests {
                 let layout = mgr.layout;
                 let log_data = new_guest_log_data(level);
 
-                let guest_log_data_buffer: Vec<u8> = log_data.clone().try_into().unwrap();
+                let guest_log_data_buffer: Vec<u8> = wire::encode(&log_data).unwrap();
                 mgr.scratch_mem
                     .push_buffer(
                         layout.get_output_data_buffer_scratch_host_offset(),
@@ -420,7 +427,7 @@ mod tests {
                 let log_data: GuestLogData = new_guest_log_data(level);
                 subscriber.clear();
 
-                let guest_log_data_buffer: Vec<u8> = log_data.try_into().unwrap();
+                let guest_log_data_buffer: Vec<u8> = wire::encode(&log_data).unwrap();
                 mgr.scratch_mem
                     .push_buffer(
                         layout.get_output_data_buffer_scratch_host_offset(),

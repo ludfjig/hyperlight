@@ -17,19 +17,18 @@ limitations under the License.
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use flatbuffers::FlatBufferBuilder;
-use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-use hyperlight_common::flatbuffer_wrappers::function_types::{
-    ParameterValue, ReturnType, ReturnValue,
-};
-use hyperlight_common::flatbuffer_wrappers::util::estimate_flatbuffer_capacity;
+#[cfg(feature = "fuzzing")]
+use hyperlight_common::wire::ReturnType;
+use hyperlight_common::wire::{self, FunctionCallResult};
+#[cfg(feature = "fuzzing")]
+use hyperlight_common::wire::{FunctionCall, FunctionCallType};
 use tracing::{Span, instrument};
 
 use super::Callable;
 use super::file_mapping::prepare_file_cow;
 use super::host_funcs::FunctionRegistry;
 use super::snapshot::Snapshot;
-use crate::func::{ParameterTuple, SupportedReturnType};
+use crate::func::{IntoParameters, SupportedReturnType};
 use crate::hypervisor::InterruptHandle;
 use crate::hypervisor::hyperlight_vm::{HyperlightVm, HyperlightVmError};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
@@ -467,7 +466,7 @@ impl MultiUseSandbox {
     ///         assert!(!sandbox.poisoned());
     ///         
     ///         // Sandbox is now usable again
-    ///         sandbox.call::<String>("Echo", "hello".to_string())?;
+    ///         sandbox.call::<String>("Echo", "hello")?;
     ///     }
     /// }
     /// # Ok(())
@@ -588,7 +587,7 @@ impl MultiUseSandbox {
     /// assert_eq!(sum, 42);
     ///
     /// // Call function returning string
-    /// let message: String = sandbox.call_guest_function_by_name("Echo", "Hello, World!".to_string())?;
+    /// let message: String = sandbox.call_guest_function_by_name("Echo", "Hello, World!")?;
     /// assert_eq!(message, "Hello, World!");
     /// # Ok(())
     /// # }
@@ -599,10 +598,10 @@ impl MultiUseSandbox {
         note = "Deprecated in favour of call and snapshot/restore."
     )]
     #[instrument(err(Debug), skip(self, args), parent = Span::current())]
-    pub fn call_guest_function_by_name<Output: SupportedReturnType>(
+    pub fn call_guest_function_by_name<'a, Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl IntoParameters<'a>,
     ) -> Result<Output> {
         if self.poisoned {
             return Err(crate::HyperlightError::PoisonedSandbox);
@@ -655,7 +654,7 @@ impl MultiUseSandbox {
     /// assert_eq!(sum, 42);
     ///
     /// // Call function returning string
-    /// let message: String = sandbox.call("Echo", "Hello, World!".to_string())?;
+    /// let message: String = sandbox.call("Echo", "Hello, World!")?;
     /// assert_eq!(message, "Hello, World!");
     /// # Ok(())
     /// # }
@@ -675,7 +674,7 @@ impl MultiUseSandbox {
     /// let snapshot = sandbox.snapshot()?;
     ///
     /// // Call potentially unsafe guest function
-    /// let result = sandbox.call::<String>("RiskyOperation", "input".to_string());
+    /// let result = sandbox.call::<String>("RiskyOperation", "input");
     ///
     /// // Check if the call failed and poisoned the sandbox
     /// if let Err(e) = result {
@@ -690,10 +689,10 @@ impl MultiUseSandbox {
     /// # }
     /// ```
     #[instrument(err(Debug), skip(self, args), parent = Span::current())]
-    pub fn call<Output: SupportedReturnType>(
+    pub fn call<'a, Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl IntoParameters<'a>,
     ) -> Result<Output> {
         if self.poisoned {
             return Err(crate::HyperlightError::PoisonedSandbox);
@@ -701,15 +700,14 @@ impl MultiUseSandbox {
         // Reset snapshot since we are mutating the sandbox state
         self.snapshot = None;
         maybe_time_and_emit_guest_call(func_name, || {
-            let ret = self.call_guest_function_by_name_no_reset(
-                func_name,
-                Output::TYPE,
-                args.into_value(),
-            );
-            // Use the ? operator to allow converting any hyperlight_common::func::Error
-            // returned by from_value into a HyperlightError
-            let ret = Output::from_value(ret?)?;
-            Ok(ret)
+            // Encode-in-place from the parameter tuple, skipping the
+            // `Vec<Param<'a>>` that `IntoParameters::into_params` would
+            // otherwise allocate per call.
+            let res = self.dispatch_inner_with(func_name, Output::TYPE, args, |rv| {
+                Output::from_return(rv).map_err(HyperlightError::from)
+            });
+            self.post_dispatch_cleanup(&res);
+            res
         })
     }
 
@@ -855,99 +853,145 @@ impl MultiUseSandbox {
         &mut self,
         func_name: &str,
         ret_type: ReturnType,
-        args: Vec<ParameterValue>,
-    ) -> Result<ReturnValue> {
+        args: Vec<hyperlight_common::wire::Param<'_>>,
+    ) -> Result<hyperlight_common::func::OwnedReturn> {
         if self.poisoned {
             return Err(crate::HyperlightError::PoisonedSandbox);
         }
         // Reset snapshot since we are mutating the sandbox state
         self.snapshot = None;
         maybe_time_and_emit_guest_call(func_name, || {
-            self.call_guest_function_by_name_no_reset(func_name, ret_type, args)
+            let fc = FunctionCall::new(func_name, FunctionCallType::Guest, ret_type, args);
+            self.dispatch_call_owned(&fc)
         })
     }
 
-    fn call_guest_function_by_name_no_reset(
+    /// Dispatch a guest call by serializing a fully formed
+    /// `FunctionCall<'_>` into the shared-memory input buffer.
+    ///
+    /// Only the fuzzing path needs this entry point; the steady-state
+    /// `call` API uses [`Self::dispatch_inner_with`], which avoids
+    /// constructing the `FunctionCall` value at all.
+    #[cfg(feature = "fuzzing")]
+    fn dispatch_call_owned(
         &mut self,
-        function_name: &str,
-        return_type: ReturnType,
-        args: Vec<ParameterValue>,
-    ) -> Result<ReturnValue> {
-        if self.poisoned {
-            return Err(crate::HyperlightError::PoisonedSandbox);
-        }
-        // ===== KILL() TIMING POINT 1 =====
-        // Clear any stale cancellation from a previous guest function call or if kill() was called too early.
-        // Any kill() that completed (even partially) BEFORE this line has NO effect on this call.
+        fc: &FunctionCall<'_>,
+    ) -> Result<hyperlight_common::func::OwnedReturn> {
+        let res = self.dispatch_inner(fc, |rv| {
+            use hyperlight_common::func::OwnedReturn;
+            Ok(match rv {
+                hyperlight_common::wire::ReturnValue::Int(v) => OwnedReturn::Int(v),
+                hyperlight_common::wire::ReturnValue::UInt(v) => OwnedReturn::UInt(v),
+                hyperlight_common::wire::ReturnValue::Long(v) => OwnedReturn::Long(v),
+                hyperlight_common::wire::ReturnValue::ULong(v) => OwnedReturn::ULong(v),
+                hyperlight_common::wire::ReturnValue::Float(v) => OwnedReturn::Float(v),
+                hyperlight_common::wire::ReturnValue::Double(v) => OwnedReturn::Double(v),
+                hyperlight_common::wire::ReturnValue::Bool(v) => OwnedReturn::Bool(v),
+                hyperlight_common::wire::ReturnValue::Void => OwnedReturn::Void,
+                hyperlight_common::wire::ReturnValue::String(s) => {
+                    OwnedReturn::String(s.to_string())
+                }
+                hyperlight_common::wire::ReturnValue::VecBytes(b) => {
+                    OwnedReturn::VecBytes(b.to_vec())
+                }
+            })
+        });
+        self.post_dispatch_cleanup(&res);
+        res
+    }
+
+    #[cfg(feature = "fuzzing")]
+    fn dispatch_inner<R>(
+        &mut self,
+        fc: &FunctionCall<'_>,
+        decode_ok: impl for<'b> FnOnce(hyperlight_common::wire::ReturnValue<'b>) -> Result<R>,
+    ) -> Result<R> {
         self.vm.clear_cancel();
+        self.mem_mgr.write_guest_function_call_encoded(fc)?;
+        self.dispatch_after_write(decode_ok)
+    }
 
-        let res = (|| {
-            let estimated_capacity = estimate_flatbuffer_capacity(function_name, &args);
+    /// Variant of [`Self::dispatch_inner`] that serializes the request
+    /// directly from a typed parameter tuple, without first building a
+    /// `FunctionCall<'_>` value.
+    fn dispatch_inner_with<'a, R, A>(
+        &mut self,
+        name: &str,
+        return_type: hyperlight_common::wire::ReturnType,
+        args: A,
+        decode_ok: impl for<'b> FnOnce(hyperlight_common::wire::ReturnValue<'b>) -> Result<R>,
+    ) -> Result<R>
+    where
+        A: IntoParameters<'a>,
+    {
+        // ===== KILL() TIMING POINT 1 =====
+        // Clear any stale cancellation from a previous guest function call or if kill() was
+        // called too early. Any kill() that completed (even partially) BEFORE this line has
+        // NO effect on this call.
+        self.vm.clear_cancel();
+        self.mem_mgr
+            .write_guest_function_call_with(name, return_type, args)?;
+        self.dispatch_after_write(decode_ok)
+    }
 
-            let fc = FunctionCall::new(
-                function_name.to_string(),
-                Some(args),
-                FunctionCallType::Guest,
-                return_type,
-            );
+    fn dispatch_after_write<R>(
+        &mut self,
+        decode_ok: impl for<'b> FnOnce(hyperlight_common::wire::ReturnValue<'b>) -> Result<R>,
+    ) -> Result<R> {
+        let dispatch_res = self.vm.dispatch_call_from_host(
+            &mut self.mem_mgr,
+            &self.host_funcs,
+            #[cfg(gdb)]
+            self.dbg_mem_access_fn.clone(),
+        );
 
-            let mut builder = FlatBufferBuilder::with_capacity(estimated_capacity);
-            let buffer = fc.encode(&mut builder);
+        // Convert dispatch errors to HyperlightErrors to maintain backwards compatibility
+        // but first determine if sandbox should be poisoned.
+        if let Err(e) = dispatch_res {
+            let (error, should_poison) = e.promote();
+            self.poisoned |= should_poison;
+            return Err(error);
+        }
 
-            self.mem_mgr.write_guest_function_call(buffer)?;
+        self.mem_mgr.with_guest_function_call_result_bytes(|bytes| {
+            let result: FunctionCallResult<'_> = wire::decode_exact(bytes)
+                .map_err(|e| crate::new_error!("postcard decode of guest result failed: {e}"))?;
 
-            let dispatch_res = self.vm.dispatch_call_from_host(
-                &mut self.mem_mgr,
-                &self.host_funcs,
-                #[cfg(gdb)]
-                self.dbg_mem_access_fn.clone(),
-            );
-
-            // Convert dispatch errors to HyperlightErrors to maintain backwards compatibility
-            // but first determine if sandbox should be poisoned
-            if let Err(e) = dispatch_res {
-                let (error, should_poison) = e.promote();
-                self.poisoned |= should_poison;
-                return Err(error);
-            }
-
-            let guest_result = self.mem_mgr.get_guest_function_call_result()?.into_inner();
-
-            match guest_result {
-                Ok(val) => Ok(val),
-                Err(guest_error) => {
+            match result {
+                FunctionCallResult::Ok(rv) => decode_ok(rv),
+                FunctionCallResult::Err(guest_error) => {
                     metrics::counter!(
                         METRIC_GUEST_ERROR,
                         METRIC_GUEST_ERROR_LABEL_CODE => (guest_error.code as u64).to_string()
                     )
                     .increment(1);
-
                     Err(HyperlightError::GuestError(
                         guest_error.code,
                         guest_error.message,
                     ))
                 }
             }
-        })();
+        })
+    }
 
+    fn post_dispatch_cleanup<R>(&mut self, res: &Result<R>) {
         // Clear partial abort bytes so they don't leak across calls.
         self.mem_mgr.abort_buffer.clear();
-
         // In the happy path we do not need to clear io-buffers from the host because:
-        // - the serialized guest function call is zeroed out by the guest during deserialization, see call to `try_pop_shared_input_data_into::<FunctionCall>()`
-        // - the serialized guest function result is zeroed out by us (the host) during deserialization, see `get_guest_function_call_result`
-        // - any serialized host function call are zeroed out by us (the host) during deserialization, see `get_host_function_call`
-        // - any serialized host function result is zeroed out by the guest during deserialization, see `get_host_return_value`
-        if let Err(e) = &res {
+        // - the serialized guest function call is consumed by the guest in `with_shared_input_top`,
+        //   which pops the frame regardless of whether the dispatcher succeeded
+        // - the serialized guest function result is consumed by us (the host) in
+        //   `with_guest_function_call_result_bytes`, which pops the frame after decoding
+        // - any serialized host function call is consumed by us (the host) when we handle the
+        //   `OUTB_CALL_FUNCTION` outb, see `outb::handle_outb`
+        // - any serialized host function result is consumed by the guest in
+        //   `get_host_return_value`
+        // On the error path the guest may have left partial frames on either stack, so we
+        // reset both io-buffer stack pointers explicitly.
+        if let Err(e) = res {
             self.mem_mgr.clear_io_buffers();
-
-            // Determine if we should poison the sandbox.
             self.poisoned |= e.is_poison_error();
         }
-
-        // Note: clear_call_active() is automatically called when _guard is dropped here
-
-        res
     }
 
     /// Returns a handle for interrupting guest execution.
@@ -1082,10 +1126,10 @@ impl MultiUseSandbox {
 }
 
 impl Callable for MultiUseSandbox {
-    fn call<Output: SupportedReturnType>(
+    fn call<'a, Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl IntoParameters<'a>,
     ) -> Result<Output> {
         if self.poisoned {
             return Err(crate::HyperlightError::PoisonedSandbox);
@@ -1147,7 +1191,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+    use hyperlight_common::wire::ErrorCode;
     use hyperlight_testing::sandbox_sizes::{LARGE_HEAP_SIZE, MEDIUM_HEAP_SIZE, SMALL_HEAP_SIZE};
     use hyperlight_testing::simple_guest_as_string;
 
@@ -1167,18 +1211,14 @@ mod tests {
         let snapshot = sbox.snapshot().unwrap();
 
         // poison on purpose
-        let res = sbox
-            .call::<()>("guest_panic", "hello".to_string())
-            .unwrap_err();
+        let res = sbox.call::<()>("guest_panic", "hello").unwrap_err();
         assert!(
             matches!(res, HyperlightError::GuestAborted(code, context) if code == ErrorCode::UnknownError as u8 && context.contains("hello"))
         );
         assert!(sbox.poisoned());
 
         // guest calls should fail when poisoned
-        let res = sbox
-            .call::<()>("guest_panic", "hello2".to_string())
-            .unwrap_err();
+        let res = sbox.call::<()>("guest_panic", "hello2").unwrap_err();
         assert!(matches!(res, HyperlightError::PoisonedSandbox));
 
         // snapshot should fail when poisoned
@@ -1209,7 +1249,7 @@ mod tests {
         // call_guest_function_by_name (deprecated) should fail when poisoned
         #[allow(deprecated)]
         let res = sbox
-            .call_guest_function_by_name::<String>("Echo", "test".to_string())
+            .call_guest_function_by_name::<String>("Echo", "test")
             .unwrap_err();
         assert!(matches!(res, HyperlightError::PoisonedSandbox));
 
@@ -1218,14 +1258,12 @@ mod tests {
         assert!(!sbox.poisoned());
 
         // guest calls should work again after restore
-        let res = sbox.call::<String>("Echo", "hello2".to_string()).unwrap();
-        assert_eq!(res, "hello2".to_string());
+        let res = sbox.call::<String>("Echo", "hello2").unwrap();
+        assert_eq!(res, "hello2");
         assert!(!sbox.poisoned());
 
         // re-poison on purpose
-        let res = sbox
-            .call::<()>("guest_panic", "hello".to_string())
-            .unwrap_err();
+        let res = sbox.call::<()>("guest_panic", "hello").unwrap_err();
         assert!(
             matches!(res, HyperlightError::GuestAborted(code, context) if code == ErrorCode::UnknownError as u8 && context.contains("hello"))
         );
@@ -1236,8 +1274,8 @@ mod tests {
         assert!(!sbox.poisoned());
 
         // guest calls should work again
-        let res = sbox.call::<String>("Echo", "hello3".to_string()).unwrap();
-        assert_eq!(res, "hello3".to_string());
+        let res = sbox.call::<String>("Echo", "hello3").unwrap();
+        assert_eq!(res, "hello3");
         assert!(!sbox.poisoned());
 
         // snapshot should work again
@@ -1259,10 +1297,7 @@ mod tests {
         // will exhaust io if leaky
         for _ in 0..1000 {
             let result = sandbox
-                .call::<i64>(
-                    "CallGivenParamlessHostFuncThatReturnsI64",
-                    "HostError".to_string(),
-                )
+                .call::<i64>("CallGivenParamlessHostFuncThatReturnsI64", "HostError")
                 .unwrap_err();
 
             assert!(
@@ -1277,7 +1312,7 @@ mod tests {
         let sandbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
         sandbox
-            .call::<()>("CallHostExpectError", "SomeUnknownHostFunc".to_string())
+            .call::<()>("CallHostExpectError", "SomeUnknownHostFunc")
             .unwrap();
     }
 
@@ -1290,7 +1325,9 @@ mod tests {
         let path = simple_guest_as_string().unwrap();
         let mut sandbox =
             UninitializedSandbox::new(GuestBinary::FilePath(path), Some(cfg)).unwrap();
-        sandbox.register("HostAdd", |a: i32, b: i32| a + b).unwrap();
+        sandbox
+            .register::<(i32, i32), i32>("HostAdd", |a, b| a + b)
+            .unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
 
         // will exhaust io if leaky. Tests both success and error paths
@@ -1354,7 +1391,7 @@ mod tests {
         .unwrap();
 
         for _ in 0..1000 {
-            sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+            sbox1.call::<String>("Echo", "hello").unwrap();
         }
 
         let mut sbox2: MultiUseSandbox = {
@@ -1365,12 +1402,8 @@ mod tests {
         .unwrap();
 
         for i in 0..1000 {
-            sbox2
-                .call::<i32>(
-                    "PrintUsingPrintf",
-                    format!("Hello World {}\n", i).to_string(),
-                )
-                .unwrap();
+            let msg = format!("Hello World {}\n", i);
+            sbox2.call::<i32>("PrintUsingPrintf", msg.as_str()).unwrap();
         }
     }
 
@@ -1934,7 +1967,7 @@ mod tests {
         // Simulate a partial abort
         sbox.mem_mgr.abort_buffer.extend_from_slice(&[0xAA; 1020]);
 
-        let res = sbox.call::<String>("Echo", "hello".to_string());
+        let res = sbox.call::<String>("Echo", "hello");
         assert!(
             res.is_ok(),
             "Expected Ok after stale abort buffer, got: {:?}",
@@ -2176,9 +2209,7 @@ mod tests {
         let snapshot = sbox.snapshot().unwrap();
 
         // Poison the sandbox
-        let _ = sbox
-            .call::<()>("guest_panic", "hello".to_string())
-            .unwrap_err();
+        let _ = sbox.call::<()>("guest_panic", "hello").unwrap_err();
         assert!(sbox.poisoned());
 
         // map_file_cow should fail with PoisonedSandbox
@@ -3144,14 +3175,14 @@ mod tests {
         fn make_sandbox_with_add() -> MultiUseSandbox {
             let path = simple_guest_as_string().unwrap();
             let mut u = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
-            u.register_host_function("Add", |a: i32, b: i32| Ok(a + b))
+            u.register_host_function::<(i32, i32), i32>("Add", |a, b| Ok(a + b))
                 .unwrap();
             u.evolve().unwrap()
         }
 
         fn host_funcs_with_matching_add() -> HostFunctions {
             let mut hf = HostFunctions::default();
-            hf.register_host_function("Add", |a: i32, b: i32| Ok(a + b))
+            hf.register_host_function::<(i32, i32), i32>("Add", |a, b| Ok(a + b))
                 .unwrap();
             hf
         }
@@ -3164,7 +3195,7 @@ mod tests {
             let mut sbox2 =
                 MultiUseSandbox::from_snapshot(snapshot, HostFunctions::default(), None).unwrap();
             assert_eq!(sbox2.call::<i32>("GetStatic", ()).unwrap(), 11);
-            let echoed: String = sbox2.call("Echo", "hi".to_string()).unwrap();
+            let echoed: String = sbox2.call("Echo", "hi").unwrap();
             assert_eq!(echoed, "hi");
         }
 
@@ -3267,8 +3298,11 @@ mod tests {
             let snap = sbox_with_add.snapshot().unwrap();
             let path = simple_guest_as_string().unwrap();
             let mut u = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
-            u.register_host_function("Add", |a: String, b: String| Ok(format!("{a}{b}")))
-                .unwrap();
+            u.register_host_function::<(crate::func::Str, crate::func::Str), String>(
+                "Add",
+                |a: &str, b: &str| Ok(format!("{a}{b}")),
+            )
+            .unwrap();
             let mut sbox_wrong_add = u.evolve().unwrap();
             let err = sbox_wrong_add
                 .restore(snap)
@@ -3294,9 +3328,9 @@ mod tests {
 
             let path = simple_guest_as_string().unwrap();
             let mut u = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
-            u.register_host_function("Add", |a: i32, b: i32| Ok(a + b))
+            u.register_host_function::<(i32, i32), i32>("Add", |a, b| Ok(a + b))
                 .unwrap();
-            u.register_host_function("Mul", |a: i32, b: i32| Ok(a * b))
+            u.register_host_function::<(i32, i32), i32>("Mul", |a, b| Ok(a * b))
                 .unwrap();
             let mut target = u.evolve().unwrap();
 
@@ -3309,8 +3343,11 @@ mod tests {
             let mut sbox = make_sandbox_with_add();
             let snap = sbox.snapshot().unwrap();
             let mut hf = HostFunctions::default();
-            hf.register_host_function("Add", |a: String, b: String| Ok(format!("{a}{b}")))
-                .unwrap();
+            hf.register_host_function::<(crate::func::Str, crate::func::Str), String>(
+                "Add",
+                |a: &str, b: &str| Ok(format!("{a}{b}")),
+            )
+            .unwrap();
             let err = MultiUseSandbox::from_snapshot(snap, hf, None)
                 .expect_err("signature mismatch on `Add` must be rejected");
             assert!(
@@ -3332,7 +3369,7 @@ mod tests {
             sbox.call::<i32>("AddToStatic", 9i32).unwrap();
             let snap = sbox.snapshot().unwrap();
             let mut hf = host_funcs_with_matching_add();
-            hf.register_host_function("Mul", |a: i32, b: i32| Ok(a * b))
+            hf.register_host_function::<(i32, i32), i32>("Mul", |a, b| Ok(a * b))
                 .unwrap();
             let mut sbox2 = MultiUseSandbox::from_snapshot(snap, hf, None).unwrap();
             assert_eq!(sbox2.call::<i32>("GetStatic", ()).unwrap(), 9);
@@ -3377,10 +3414,7 @@ mod tests {
             let mut sbox2 = MultiUseSandbox::from_snapshot(snap, hf, None).unwrap();
 
             let got: i64 = sbox2
-                .call(
-                    "CallGivenParamlessHostFuncThatReturnsI64",
-                    "Echo42".to_string(),
-                )
+                .call("CallGivenParamlessHostFuncThatReturnsI64", "Echo42")
                 .unwrap();
             assert_eq!(got, 42);
         }
@@ -3394,7 +3428,7 @@ mod tests {
                 Snapshot::from_env(GuestBinary::FilePath(path), SandboxConfiguration::default())
                     .unwrap();
             let mut hf = HostFunctions::default();
-            hf.register_host_function("Unrelated", |a: i32| Ok(a + 1))
+            hf.register_host_function::<(i32,), i32>("Unrelated", |a| Ok(a + 1))
                 .unwrap();
             let mut sbox = MultiUseSandbox::from_snapshot(Arc::new(snap), hf, None).unwrap();
             assert_eq!(sbox.call::<i32>("GetStatic", ()).unwrap(), 0);

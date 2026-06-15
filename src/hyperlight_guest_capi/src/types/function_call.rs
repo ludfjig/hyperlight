@@ -21,13 +21,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{CStr, c_char};
 
-use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
+use hyperlight_common::wire::{FunctionCall, ReturnType};
 use hyperlight_guest::error::Result;
 
-use crate::types::FfiParameter;
+use crate::types::{FfiParameter, OwnedParam};
 
-/// An FFI version of `FunctionCall`
+/// An FFI version of a wire `FunctionCall`.
 #[repr(C)]
 pub struct FfiFunctionCall {
     function_name: *const c_char,
@@ -37,42 +36,46 @@ pub struct FfiFunctionCall {
 }
 
 impl FfiFunctionCall {
-    /// Create a new `FfiFunctionCall` by consuming a FunctionCall.
-    pub fn from_function_call(value: FunctionCall) -> Result<Self> {
-        let leaked_function_name = CString::new(value.function_name.as_str())
+    /// Create a new `FfiFunctionCall` by copying a wire [`FunctionCall`] into
+    /// owned FFI storage.
+    pub fn from_function_call(value: FunctionCall<'_>) -> Result<Self> {
+        let leaked_function_name = CString::new(value.name)
             .expect("Failed to convert function name to CString")
             .into_raw();
 
-        let (parameters, parameter_len) = match value.parameters {
-            Some(p) => {
-                let parameters: Vec<FfiParameter> = p
-                    .into_iter()
-                    .map(|param| FfiParameter::from_parameter_value(param).unwrap())
-                    .collect();
-                let boxed = parameters.into_boxed_slice();
-                let parameters_len = boxed.len();
-                let leaked_param_vec = Box::into_raw(boxed);
-                (leaked_param_vec as *const FfiParameter, parameters_len)
-            }
-            None => (core::ptr::null(), 0),
+        let (parameters, parameter_len) = if value.params.is_empty() {
+            (core::ptr::null(), 0)
+        } else {
+            let parameters: Vec<FfiParameter> = value
+                .params
+                .into_iter()
+                .map(|p| FfiParameter::from_param(p).unwrap())
+                .collect();
+            let boxed = parameters.into_boxed_slice();
+            let parameters_len = boxed.len();
+            let leaked_param_vec = Box::into_raw(boxed);
+            (leaked_param_vec as *const FfiParameter, parameters_len)
         };
 
         Ok(Self {
             function_name: leaked_function_name,
             parameters,
             parameters_len: parameter_len,
-            return_type: value.expected_return_type,
+            return_type: value.return_type,
         })
     }
 
-    /// Copies the parameters of `self` into a new `Vec<ParameterValue>`.
+    /// Copies the parameters of `self` into a new `Vec<OwnedParam>`.
     /// # Safety
     /// `self` must be an unmodified version of what `from_function_call` returned.
-    pub unsafe fn copy_parameters(&self) -> Vec<ParameterValue> {
+    pub unsafe fn copy_parameters(&self) -> Vec<OwnedParam> {
+        if self.parameters.is_null() {
+            return Vec::new();
+        }
         let slice = unsafe { slice::from_raw_parts(self.parameters, self.parameters_len) };
         slice
             .iter()
-            .map(|param| unsafe { param.copy_to_parameter_value() })
+            .map(|param| unsafe { param.copy_to_owned_param() })
             .collect()
     }
 

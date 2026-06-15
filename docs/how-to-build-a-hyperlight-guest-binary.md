@@ -64,7 +64,7 @@ fn get_weekday() -> Result<String>;
 
 // Register a guest function the host can call.
 #[guest_function("SayHello")]
-fn say_hello(name: String) -> Result<String> {
+fn say_hello(name: &str) -> Result<String> {
     let weekday = get_weekday()?;
     Ok(alloc::format!("Hello, {name}! Today is {weekday}."))
 }

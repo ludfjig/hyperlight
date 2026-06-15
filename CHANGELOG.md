@@ -4,6 +4,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Prerelease] - Unreleased
 
+### Added
+* `#[guest_function]` now supports borrowed return types `&'a str` and `&'a [u8]` whose lifetime ties to an input parameter. The encode path serializes the slice straight from the input wire buffer into the output wire buffer with zero intermediate allocations and a single memcpy. Useful for forwarding bytes the function already has, for example `fn echo<'a>(input: &'a [u8]) -> &'a [u8] { input }`. Functions that build their output dynamically continue to use owned `String` or `Vec<u8>` returns.
+
+### Changed
+* **Breaking:** The wire format for `FunctionCall`, `Param`, `ReturnValue`, and `FunctionCallResult` is now postcard rather than flatbuffers. Wire-level interoperability with `v0.15.0` guests/hosts is broken in both directions. Build host and guest from the same version.
+* **Breaking:** The user-supplied `guest_dispatch_function` fallback still returns `Result<Vec<u8>>`, but the bytes inside that `Vec` must now be a postcard-encoded `FunctionCallResult` (no longer a flatbuffer). Hand-rolled dispatchers that built flatbuffer payloads must switch to `hyperlight_common::wire::encode(&FunctionCallResult::Ok(rv))`.
+* **Breaking:** `ErrorCode` variants `GuestFunctionIncorrecNoOfParameters`, `GispatchFunctionPointerNotSet`, and `GsCheckFailed` were renamed to `GuestFunctionIncorrectNoOfParameters`, `DispatchFunctionPointerNotSet`, and `StackCheckFailed`. Numeric wire values are unchanged.
+* **Breaking:** The C ABI helpers `hl_flatbuffer_result_from_*` were renamed to `hl_result_from_*` to reflect the postcard wire format. The signatures and the macro entry points in `macro.h` are unchanged.
+* **Breaking:** `#[host_function]` and `#[guest_function]` parameters of type `String` and `Vec<u8>` must be rewritten as `&str` and `&[u8]`. Parameters are deserialized as borrows into the wire buffer using `serde(borrow)`, which avoids per-call allocations. Return types may still be owned `String` or `Vec<u8>`.
+
 ## [v0.15.0] - 2026-05-06
 
 ### Added

@@ -15,19 +15,14 @@ limitations under the License.
 */
 
 use alloc::format;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use flatbuffers::FlatBufferBuilder;
-use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-use hyperlight_common::flatbuffer_wrappers::function_types::{
-    FunctionCallResult, ParameterValue, ReturnType, ReturnValue,
-};
-use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
-use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
-use hyperlight_common::flatbuffer_wrappers::util::estimate_flatbuffer_capacity;
 use hyperlight_common::outb::OutBAction;
+use hyperlight_common::wire::{
+    self, ErrorCode, FunctionCall, FunctionCallResult, FunctionCallType, GuestLogData, LogLevel,
+    Param, ReturnType, ReturnValue,
+};
 use tracing::instrument;
 
 use super::handle::GuestHandle;
@@ -59,75 +54,75 @@ impl GuestHandle {
         }
     }
 
-    /// Get a return value from a host function call.
-    /// This usually requires a host function to be called first using
-    /// `call_host_function_internal`.
-    ///
-    /// When calling `call_host_function<T>`, this function is called
-    /// internally to get the return value.
+    /// Pop a host return value from the shared input stack and convert it
+    /// to the requested type via [`SupportedReturnType::from_return`].
     #[instrument(skip_all, level = "Trace")]
-    pub fn get_host_return_value<T: TryFrom<ReturnValue>>(&self) -> Result<T> {
-        let inner = self
-            .try_pop_shared_input_data_into::<FunctionCallResult>()
-            .expect("Unable to deserialize a return value from host")
-            .into_inner();
-
-        match inner {
-            Ok(ret) => T::try_from(ret).map_err(|_| {
-                let expected = core::any::type_name::<T>();
+    pub fn get_host_return_value<T>(&self) -> Result<T>
+    where
+        T: hyperlight_common::func::SupportedReturnType,
+    {
+        self.with_shared_input_top(|bytes| {
+            let result: FunctionCallResult<'_> = wire::decode_exact(bytes).map_err(|e| {
                 HyperlightGuestError::new(
-                    ErrorCode::UnsupportedParameterType,
-                    format!("Host return value could not be converted to expected {expected}",),
+                    ErrorCode::GuestError,
+                    format!("Failed to decode host return value: {e:?}"),
                 )
-            }),
-            Err(e) => Err(HyperlightGuestError {
-                kind: e.code,
-                message: e.message,
-            }),
-        }
+            })?;
+            match result {
+                FunctionCallResult::Ok(rv) => T::from_return(rv).map_err(Into::into),
+                FunctionCallResult::Err(e) => Err(HyperlightGuestError {
+                    kind: e.code,
+                    message: e.message,
+                }),
+            }
+        })
     }
 
-    pub fn get_host_return_raw(&self) -> Result<ReturnValue> {
-        let inner = self
-            .try_pop_shared_input_data_into::<FunctionCallResult>()
-            .expect("Unable to deserialize a return value from host")
-            .into_inner();
-
-        match inner {
-            Ok(ret) => Ok(ret),
-            Err(e) => Err(HyperlightGuestError {
-                kind: e.code,
-                message: e.message,
-            }),
-        }
+    /// Pop a host return value from the shared input stack and return it
+    /// as an [`OwnedReturn`] so the caller can store or forward it.
+    pub fn get_host_return_raw(&self) -> Result<hyperlight_common::func::OwnedReturn> {
+        self.with_shared_input_top(|bytes| {
+            let result: FunctionCallResult<'_> = wire::decode_exact(bytes).map_err(|e| {
+                HyperlightGuestError::new(
+                    ErrorCode::GuestError,
+                    format!("Failed to decode host return value: {e:?}"),
+                )
+            })?;
+            match result {
+                FunctionCallResult::Ok(rv) => Ok(rv_to_owned(rv)),
+                FunctionCallResult::Err(e) => Err(HyperlightGuestError {
+                    kind: e.code,
+                    message: e.message,
+                }),
+            }
+        })
     }
 
-    /// Call a host function without reading its return value from shared mem.
-    /// This is used by both the Rust and C APIs to reduce code duplication.
-    ///
-    /// Note: The function return value must be obtained by calling
-    /// `get_host_return_value`.
+    /// Encode and push a host function call onto the shared output stack,
+    /// then trigger the host via the `CallFunction` OUT port. The reply
+    /// is left on the shared input stack for [`get_host_return_value`].
     #[instrument(skip_all, level = "Trace")]
     pub fn call_host_function_without_returning_result(
         &self,
         function_name: &str,
-        parameters: Option<Vec<ParameterValue>>,
+        parameters: Option<Vec<Param<'_>>>,
         return_type: ReturnType,
     ) -> Result<()> {
-        let estimated_capacity =
-            estimate_flatbuffer_capacity(function_name, parameters.as_deref().unwrap_or(&[]));
-
-        let host_function_call = FunctionCall::new(
-            function_name.to_string(),
-            parameters,
-            FunctionCallType::Host,
+        let params = parameters.unwrap_or_default();
+        let call = FunctionCall {
+            name: function_name,
+            call_type: FunctionCallType::Host,
             return_type,
-        );
+            params,
+        };
 
-        let mut builder = FlatBufferBuilder::with_capacity(estimated_capacity);
-
-        let host_function_call_buffer = host_function_call.encode(&mut builder);
-        self.push_shared_output_data(host_function_call_buffer)?;
+        let bytes = wire::encode(&call).map_err(|e| {
+            HyperlightGuestError::new(
+                ErrorCode::GuestError,
+                format!("Failed to encode host function call: {e:?}"),
+            )
+        })?;
+        self.push_shared_output_data(&bytes)?;
 
         unsafe {
             out32(OutBAction::CallFunction as u16, 0);
@@ -136,19 +131,58 @@ impl GuestHandle {
         Ok(())
     }
 
-    /// Call a host function with the given parameters and return type.
-    /// This function serializes the function call and its parameters,
-    /// sends it to the host, and then retrieves the return value.
-    ///
-    /// The return value is deserialized into the specified type `T`.
+    /// Call a host function and decode the reply as `T`.
     #[instrument(skip_all, level = "Info")]
-    pub fn call_host_function<T: TryFrom<ReturnValue>>(
+    pub fn call_host_function<T>(
         &self,
         function_name: &str,
-        parameters: Option<Vec<ParameterValue>>,
+        parameters: Option<Vec<Param<'_>>>,
         return_type: ReturnType,
-    ) -> Result<T> {
+    ) -> Result<T>
+    where
+        T: hyperlight_common::func::SupportedReturnType,
+    {
         self.call_host_function_without_returning_result(function_name, parameters, return_type)?;
+        self.get_host_return_value::<T>()
+    }
+
+    /// Encode-in-place variant of [`Self::call_host_function`] that
+    /// serializes a typed parameter tuple straight into the shared
+    /// output buffer, skipping the `Vec<Param<'_>>` and the
+    /// intermediate encoded `Vec<u8>`.
+    #[instrument(skip_all, level = "Info")]
+    pub fn call_host_function_with<'a, T, A>(
+        &self,
+        function_name: &str,
+        args: A,
+        return_type: ReturnType,
+    ) -> Result<T>
+    where
+        T: hyperlight_common::func::SupportedReturnType,
+        A: hyperlight_common::func::IntoParameters<'a>,
+    {
+        use hyperlight_common::wire::FunctionCallWith;
+        let fc = FunctionCallWith::new(
+            function_name,
+            FunctionCallType::Host,
+            return_type,
+            args,
+            A::LEN,
+        );
+        self.push_shared_output_with(|buf| {
+            let written = wire::encode_into(&fc, buf).map_err(|e| {
+                HyperlightGuestError::new(
+                    ErrorCode::GuestError,
+                    format!("Failed to encode host function call: {e:?}"),
+                )
+            })?;
+            Ok(written.len())
+        })?;
+
+        unsafe {
+            out32(OutBAction::CallFunction as u16, 0);
+        }
+
         self.get_host_return_value::<T>()
     }
 
@@ -164,18 +198,16 @@ impl GuestHandle {
     ) {
         // Closure to send log message to host
         let _send_to_host = || {
-            let guest_log_data = GuestLogData::new(
-                message.to_string(),
-                source.to_string(),
-                log_level,
-                caller.to_string(),
-                source_file.to_string(),
+            let guest_log_data = GuestLogData {
+                message: message.to_string(),
+                source: source.to_string(),
+                level: log_level,
+                caller: caller.to_string(),
+                source_file: source_file.to_string(),
                 line,
-            );
+            };
 
-            let bytes: Vec<u8> = guest_log_data
-                .try_into()
-                .expect("Failed to convert GuestLogData to bytes");
+            let bytes = wire::encode(&guest_log_data).expect("encode GuestLogData");
 
             self.push_shared_output_data(&bytes)
                 .expect("Unable to push log data to shared output data");
@@ -203,5 +235,21 @@ impl GuestHandle {
         {
             _send_to_host();
         }
+    }
+}
+
+fn rv_to_owned(rv: ReturnValue<'_>) -> hyperlight_common::func::OwnedReturn {
+    use hyperlight_common::func::OwnedReturn;
+    match rv {
+        ReturnValue::Int(v) => OwnedReturn::Int(v),
+        ReturnValue::UInt(v) => OwnedReturn::UInt(v),
+        ReturnValue::Long(v) => OwnedReturn::Long(v),
+        ReturnValue::ULong(v) => OwnedReturn::ULong(v),
+        ReturnValue::Float(v) => OwnedReturn::Float(v),
+        ReturnValue::Double(v) => OwnedReturn::Double(v),
+        ReturnValue::Bool(v) => OwnedReturn::Bool(v),
+        ReturnValue::Void => OwnedReturn::Void,
+        ReturnValue::String(s) => OwnedReturn::String(String::from(s)),
+        ReturnValue::VecBytes(b) => OwnedReturn::VecBytes(b.to_vec()),
     }
 }
