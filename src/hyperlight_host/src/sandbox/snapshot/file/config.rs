@@ -66,6 +66,7 @@ pub(super) enum Hypervisor {
     Kvm,
     Mshv,
     Whp,
+    Hvf,
 }
 
 impl Hypervisor {
@@ -81,6 +82,8 @@ impl Hypervisor {
             Some(HypervisorType::Mshv) => Some(Self::Mshv),
             #[cfg(target_os = "windows")]
             Some(HypervisorType::Whp) => Some(Self::Whp),
+            #[cfg(hvf)]
+            Some(HypervisorType::Hvf) => Some(Self::Hvf),
             None => None,
         }
     }
@@ -90,6 +93,7 @@ impl Hypervisor {
             Self::Kvm => "KVM",
             Self::Mshv => "MSHV",
             Self::Whp => "WHP",
+            Self::Hvf => "HVF",
         }
     }
 
@@ -101,6 +105,7 @@ impl Hypervisor {
             Self::Kvm => "kvm",
             Self::Mshv => "mshv",
             Self::Whp => "whp",
+            Self::Hvf => "hvf",
         }
     }
 }
