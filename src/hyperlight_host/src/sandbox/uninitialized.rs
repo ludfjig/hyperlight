@@ -416,7 +416,7 @@ mod tests {
     use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
     use crate::{MultiUseSandbox, Result, UninitializedSandbox, new_error};
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn guest_binary_loads_from_non_utf8_path() {
         use std::ffi::OsString;
