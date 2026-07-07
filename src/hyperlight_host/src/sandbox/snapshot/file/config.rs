@@ -451,11 +451,18 @@ impl OciSnapshotConfig {
                 pt
             ));
         }
-        if (self.layout.snapshot_size as u64).saturating_add(pt as u64) != self.memory_size {
+        // The total memory size might be bigger because it has to
+        // take into account the host page size, as well as the guest
+        // page size.
+        let total_size = (self.layout.snapshot_size as u64)
+            .saturating_add(pt as u64)
+            .next_multiple_of(page_size::get() as u64);
+        if total_size != self.memory_size {
             return Err(crate::new_error!(
-                "snapshot snapshot_size ({}) + pt_size ({}) does not equal memory_size ({})",
+                "snapshot snapshot_size ({}) + pt_size ({}), rounded to {}, does not equal memory_size ({})",
                 self.layout.snapshot_size,
                 pt,
+                total_size,
                 self.memory_size
             ));
         }
