@@ -1254,7 +1254,7 @@ mod tests {
 
     use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
     use hyperlight_testing::sandbox_sizes::{LARGE_HEAP_SIZE, MEDIUM_HEAP_SIZE, SMALL_HEAP_SIZE};
-    use hyperlight_testing::simple_guest_as_pathbuf;
+    use hyperlight_testing::{c_simple_guest_as_pathbuf, simple_guest_as_pathbuf};
 
     #[cfg(not(gdb))]
     use crate::hypervisor::hyperlight_vm::{HyperlightVmError, test_support::VmOperation};
@@ -1262,6 +1262,7 @@ mod tests {
     use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
     use crate::mem::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, SharedMemory as _};
     use crate::sandbox::SandboxConfiguration;
+    use crate::sandbox::uninitialized::{GuestBlob, GuestEnvironment};
     use crate::{
         GuestBinary, HyperlightError, MultiUseSandbox, Result, SandboxStatus, UninitializedSandbox,
     };
@@ -2485,7 +2486,7 @@ mod tests {
         target.restore(snapshot).unwrap();
         assert_eq!(target.mem_mgr.layout.heap_size(), 0x6000);
         assert!(target.call::<i32>("CallMalloc", 0x10_000i32).is_err());
-        assert!(target.poisoned());
+        assert!(target.status().is_poisoned());
     }
 
     #[test]
@@ -2515,7 +2516,7 @@ mod tests {
         assert_eq!(target.mem_mgr.layout.input_data_size(), 0x2000);
         assert_eq!(target.mem_mgr.layout.output_data_size(), 0x2000);
         assert!(target.call::<String>("Echo", large).is_err());
-        assert!(!target.poisoned());
+        assert!(!target.status().is_poisoned());
         assert_eq!(
             target.call::<String>("Echo", "small".to_string()).unwrap(),
             "small"
@@ -2573,6 +2574,203 @@ mod tests {
         target.restore(small_snapshot).unwrap();
         assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 11);
         assert_eq!(target.mem_mgr.layout.heap_size(), 0x6000);
+    }
+
+    #[test]
+    fn snapshot_restore_replaces_rust_guest_with_c_guest() {
+        let init_data = b"cross-layout-init-data";
+        let source_env = GuestEnvironment {
+            guest_binary: GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
+            init_data: Some(GuestBlob {
+                data: init_data,
+                permissions: MemoryRegionFlags::READ | MemoryRegionFlags::WRITE,
+            }),
+        };
+        let mut source = UninitializedSandbox::new(source_env, None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        let mut target = UninitializedSandbox::new(
+            GuestBinary::FilePath(simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+
+        assert_eq!(source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
+        assert_eq!(target.call::<i32>("AddToStatic", 17i32).unwrap(), 17);
+        target.set_pt_root_finder(Box::new(|_, _, root| vec![root]));
+        assert!(target.pt_root_finder.is_some());
+
+        assert_ne!(
+            source.mem_mgr.layout.code_size(),
+            target.mem_mgr.layout.code_size()
+        );
+        assert_ne!(
+            source.mem_mgr.layout.init_data_size(),
+            target.mem_mgr.layout.init_data_size()
+        );
+        assert_ne!(
+            source.mem_mgr.layout.init_data_permissions(),
+            target.mem_mgr.layout.init_data_permissions()
+        );
+
+        let snapshot = source.snapshot().unwrap();
+        target.restore(snapshot).unwrap();
+        assert!(target.pt_root_finder.is_none());
+        assert_eq!(target.call::<i32>("StackAllocate", 512i32).unwrap(), 512);
+        assert!(matches!(
+            target.call::<i32>("GetStatic", ()),
+            Err(HyperlightError::GuestError(
+                ErrorCode::GuestFunctionNotFound,
+                name
+            )) if name == "GetStatic"
+        ));
+    }
+
+    #[test]
+    fn snapshot_restore_replaces_c_guest_with_rust_guest() {
+        let mut source = UninitializedSandbox::new(
+            GuestBinary::FilePath(simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+        assert_eq!(source.call::<i32>("AddToStatic", 42i32).unwrap(), 42);
+        let snapshot = source.snapshot().unwrap();
+
+        let mut target = UninitializedSandbox::new(
+            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+        assert_eq!(target.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
+
+        target.restore(snapshot).unwrap();
+        assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 42);
+        assert!(matches!(
+            target.call::<i32>("StackAllocate", 512i32),
+            Err(HyperlightError::GuestError(
+                ErrorCode::GuestFunctionNotFound,
+                name
+            )) if name == "StackAllocate"
+        ));
+    }
+
+    #[test]
+    fn snapshot_restore_alternates_c_and_rust_guests() {
+        let mut c_source = UninitializedSandbox::new(
+            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+        assert_eq!(c_source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
+        let c_snapshot = c_source.snapshot().unwrap();
+
+        let mut rust_source = UninitializedSandbox::new(
+            GuestBinary::FilePath(simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+        rust_source.call::<i32>("AddToStatic", 42i32).unwrap();
+        let rust_snapshot = rust_source.snapshot().unwrap();
+
+        let mut target = UninitializedSandbox::new(
+            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+        assert_eq!(target.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
+
+        target.restore(rust_snapshot).unwrap();
+        assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 42);
+        assert!(matches!(
+            target.call::<i32>("StackAllocate", 512i32),
+            Err(HyperlightError::GuestError(
+                ErrorCode::GuestFunctionNotFound,
+                name
+            )) if name == "StackAllocate"
+        ));
+
+        target.restore(c_snapshot).unwrap();
+        assert_eq!(target.call::<i32>("StackAllocate", 512i32).unwrap(), 512);
+        assert!(matches!(
+            target.call::<i32>("GetStatic", ()),
+            Err(HyperlightError::GuestError(
+                ErrorCode::GuestFunctionNotFound,
+                name
+            )) if name == "GetStatic"
+        ));
+    }
+
+    #[test]
+    fn snapshot_restore_keeps_target_host_function_implementation() {
+        let path = simple_guest_as_pathbuf();
+        let mut source = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
+        source
+            .register_host_function("Echo42", || Ok(1i64))
+            .unwrap();
+        let mut source = source.evolve().unwrap();
+        let snapshot = source.snapshot().unwrap();
+
+        let path = simple_guest_as_pathbuf();
+        let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
+        target
+            .register_host_function("Echo42", || Ok(42i64))
+            .unwrap();
+        let mut target = target.evolve().unwrap();
+
+        target.restore(snapshot).unwrap();
+        assert_eq!(
+            target
+                .call::<i64>(
+                    "CallGivenParamlessHostFuncThatReturnsI64",
+                    "Echo42".to_string(),
+                )
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_recovers_poison_with_different_guest() {
+        let mut source = UninitializedSandbox::new(
+            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
+            None,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+        let snapshot = source.snapshot().unwrap();
+
+        let path = simple_guest_as_pathbuf();
+        let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        assert!(target.call::<()>("ExhaustHeap", ()).is_err());
+        assert!(target.status().is_poisoned());
+
+        target.restore(snapshot).unwrap();
+        assert!(!target.status().is_poisoned());
+        assert_eq!(target.call::<i32>("StackAllocate", 512i32).unwrap(), 512);
+        assert!(matches!(
+            target.call::<i32>("GetStatic", ()),
+            Err(HyperlightError::GuestError(
+                ErrorCode::GuestFunctionNotFound,
+                name
+            )) if name == "GetStatic"
+        ));
     }
 
     /// Validation runs before any memory or vCPU mutation, so a
