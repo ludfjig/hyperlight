@@ -1418,11 +1418,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_200_sandboxes() {
-        const NUM_THREADS: usize = 10;
-        const SANDBOXES_PER_THREAD: usize = 20;
-
+    fn create_many_on_threads_test<const NUM_THREADS: usize, const SANDBOXES_PER_THREAD: usize>() {
         // barrier to make sure all threads start their work simultaneously
         let start_barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
         let mut thread_handles = vec![];
@@ -1453,6 +1449,21 @@ mod tests {
         for handle in thread_handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn create_200_sandboxes() {
+        create_many_on_threads_test::<20, 10>();
+    }
+
+    #[test]
+    fn create_200_threads() {
+        create_many_on_threads_test::<200, 1>();
+    }
+
+    #[test]
+    fn create_2000_sandboxes() {
+        create_many_on_threads_test::<200, 10>();
     }
 
     #[test]
@@ -1899,11 +1910,27 @@ mod tests {
         // bits that are reserved in aarch64 DBGBVR0_EL1
         const DIRTY_VALUE: u64 = 0xFFFF_FEDC_7654_3210;
         sandbox.call::<()>("SetDr0", DIRTY_VALUE).unwrap();
-        let dr0_dirty: u64 = sandbox.call("GetDr0", ()).unwrap();
-        assert_eq!(
-            dr0_dirty, DIRTY_VALUE,
-            "DR0 should be dirty after SetDr0 call"
-        );
+
+        // Validate that DR0 was in fact dirtied
+        #[cfg(not(hvf))]
+        {
+            // This check does not work on hvf, because it relies on
+            // state being persisted across sandbox calls in a system
+            // register that is not usually supported by Hyperlight
+            // (DBGBVR0), whereas hvf may (if there is a lot of
+            // contention on the system) destroy and re-create its
+            // vcpu, preserving only the "supported" hyperlight state
+            // msrs.
+            //
+            // We could disable this test entirely on hvf, but a test
+            // that occasionally checks for what it is meant to is
+            // probably better than one that never does.
+            let dr0_dirty: u64 = sandbox.call("GetDr0", ()).unwrap();
+            assert_eq!(
+                dr0_dirty, DIRTY_VALUE,
+                "DR0 should be dirty after SetDr0 call"
+            );
+        }
 
         // Restore to the snapshot - this should reset vCPU state including debug registers
         sandbox.restore(snapshot).unwrap();

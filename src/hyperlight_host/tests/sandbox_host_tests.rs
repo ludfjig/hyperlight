@@ -327,7 +327,8 @@ fn callback_test() {
 
 #[test]
 fn callback_test_parallel() {
-    let handles: Vec<_> = (0..100)
+    let n_threads = 100;
+    let handles: Vec<_> = (0..n_threads)
         .map(|_| {
             std::thread::spawn(|| {
                 callback_test_helper();
