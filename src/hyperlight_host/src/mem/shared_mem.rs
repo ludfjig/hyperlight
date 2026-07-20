@@ -2757,13 +2757,18 @@ mod tests {
         }
 
         /// Returns true if `status` indicates the process died from a
-        /// memory access fault (SIGSEGV on unix, STATUS_ACCESS_VIOLATION
-        /// (or 0xDEAD) on Windows).
+        /// memory access fault (SIGBUS on macos, SIGSEGV on linux,
+        /// STATUS_ACCESS_VIOLATION (or 0xDEAD) on Windows).
         fn killed_by_access_violation(status: &std::process::ExitStatus) -> bool {
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
-                status.signal() == Some(libc::SIGSEGV)
+                let expected_signal = if cfg!(target_os = "macos") {
+                    libc::SIGBUS
+                } else {
+                    libc::SIGSEGV
+                };
+                status.signal() == Some(expected_signal)
             }
             #[cfg(windows)]
             {

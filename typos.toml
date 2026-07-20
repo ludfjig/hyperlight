@@ -16,3 +16,5 @@ ist="ist"
 finitel="finitel"
 # writables as number of writable buffers
 writables="writables"
+# itme is an acronym used in HVF support for "Into TiMoutable Error"
+itme="itme"

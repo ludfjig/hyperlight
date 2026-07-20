@@ -255,6 +255,9 @@ pub enum RunVcpuError {
     #[cfg(target_arch = "aarch64")]
     #[error("Flush MMIO pending state failed: {0}")]
     FlushMmioPending(String),
+    #[cfg(hvf)]
+    #[error("HVF sync error: {0}")]
+    HvfSync(HvfSyncError),
     #[error("Unknown error: {0}")]
     Unknown(HypervisorError),
 }
@@ -396,6 +399,35 @@ pub enum HypervisorError {
     #[cfg(target_os = "windows")]
     #[error("Windows error: {0}")]
     WindowsError(#[from] windows_result::Error),
+    #[cfg(hvf)]
+    #[error("HVF error: {0}")]
+    HvfError(hvf::bindings::hv_return_t),
+}
+
+/// HVF-specific error synchronising vcpu state
+#[cfg(hvf)]
+#[derive(Debug, thiserror::Error)]
+pub enum MemorySpaceInstallError {
+    #[error("Failed to update VM/VCPU state: {0}")]
+    Hypervisor(#[from] HypervisorError),
+    #[error("Unexpected VCPU exit: {0:?}")]
+    UnexpectedExit(hvf::bindings::hv_vcpu_exit_t),
+    #[error("Failed to allocate ReadonlySharedMemory: {0}")]
+    SharedMemoryCreation(#[from] crate::mem::shared_mem::SharedMemoryError),
+}
+#[cfg(hvf)]
+#[derive(Debug, thiserror::Error)]
+pub enum HvfSyncError {
+    #[error("Error creating VCPU: {0}")]
+    CreateVcpu(HypervisorError),
+    #[error("Error resetting VCPU: {0}")]
+    ResetVcpu(HypervisorError),
+    #[error("Error reading/writing registers: {0}")]
+    Register(#[from] RegisterError),
+    #[error("Error updating memory space: {0}")]
+    MemorySpace(#[from] MemorySpaceInstallError),
+    #[error("Invariant violation: vcpu in unexpected sync state: {0}")]
+    SyncInvariant(String),
 }
 
 /// Trait for single-vCPU VMs. Provides a common interface for basic VM operations.
