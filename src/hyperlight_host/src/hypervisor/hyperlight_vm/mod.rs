@@ -525,17 +525,25 @@ impl HyperlightVm {
     pub(crate) fn update_snapshot_mapping(
         &mut self,
         snapshot: SnapshotSharedMemory<GuestSharedMemory>,
-    ) -> Result<(), UpdateRegionError> {
+    ) -> Result<Option<SnapshotSharedMemory<GuestSharedMemory>>, UpdateRegionError> {
         let guest_base = crate::mem::layout::SandboxMemoryLayout::BASE_ADDRESS as u64;
         let rgn = snapshot.mapping_at(guest_base, MemoryRegionType::Snapshot);
 
-        if let Some(old_snapshot) = self.snapshot_memory.replace(snapshot) {
+        if let Some(old_snapshot) = self.snapshot_memory.as_ref() {
             let old_rgn = old_snapshot.mapping_at(guest_base, MemoryRegionType::Snapshot);
             self.vm.unmap_memory((self.snapshot_slot, &old_rgn))?;
         }
-        unsafe { self.vm.map_memory((self.snapshot_slot, &rgn))? };
+        // SAFETY: `snapshot` owns the mapped region and is stored in `self` on success.
+        if let Err(err) = unsafe { self.vm.map_memory((self.snapshot_slot, &rgn)) } {
+            if let Some(old_snapshot) = self.snapshot_memory.as_ref() {
+                let old_rgn = old_snapshot.mapping_at(guest_base, MemoryRegionType::Snapshot);
+                // SAFETY: `old_snapshot` remains owned by `self` throughout rollback.
+                unsafe { self.vm.map_memory((self.snapshot_slot, &old_rgn))? };
+            }
+            return Err(err.into());
+        }
 
-        Ok(())
+        Ok(self.snapshot_memory.replace(snapshot))
     }
 
     /// Update the scratch mapping to point to a new GuestSharedMemory
@@ -546,13 +554,47 @@ impl HyperlightVm {
         let guest_base = hyperlight_common::layout::scratch_base_gpa(scratch.mem_size());
         let rgn = scratch.mapping_at(guest_base, MemoryRegionType::Scratch);
 
-        if let Some(old_scratch) = self.scratch_memory.replace(scratch) {
+        if let Some(old_scratch) = self.scratch_memory.as_ref() {
             let old_base = hyperlight_common::layout::scratch_base_gpa(old_scratch.mem_size());
             let old_rgn = old_scratch.mapping_at(old_base, MemoryRegionType::Scratch);
             self.vm.unmap_memory((self.scratch_slot, &old_rgn))?;
         }
-        unsafe { self.vm.map_memory((self.scratch_slot, &rgn))? };
+        // SAFETY: `scratch` owns the mapped region and is stored in `self` on success.
+        if let Err(err) = unsafe { self.vm.map_memory((self.scratch_slot, &rgn)) } {
+            if let Some(old_scratch) = self.scratch_memory.as_ref() {
+                let old_base = hyperlight_common::layout::scratch_base_gpa(old_scratch.mem_size());
+                let old_rgn = old_scratch.mapping_at(old_base, MemoryRegionType::Scratch);
+                // SAFETY: `old_scratch` remains owned by `self` throughout rollback.
+                unsafe { self.vm.map_memory((self.scratch_slot, &old_rgn))? };
+            }
+            return Err(err.into());
+        }
+        self.scratch_memory = Some(scratch);
 
+        Ok(())
+    }
+
+    pub(crate) fn update_base_mappings(
+        &mut self,
+        snapshot: SnapshotSharedMemory<GuestSharedMemory>,
+        scratch: GuestSharedMemory,
+    ) -> Result<(), UpdateRegionError> {
+        let old_snapshot = self.update_snapshot_mapping(snapshot)?;
+        if let Err(err) = self.update_scratch_mapping(scratch) {
+            if let Some(old_snapshot) = old_snapshot {
+                self.update_snapshot_mapping(old_snapshot)?;
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    #[cfg(gdb)]
+    pub(crate) fn clear_guest_debug_state(&mut self) -> Result<(), DebugError> {
+        self.sw_breakpoints.clear();
+        if let Some(entry_addr) = self.one_shot_entry_bp.take() {
+            self.vm.remove_hw_breakpoint(entry_addr)?;
+        }
         Ok(())
     }
 

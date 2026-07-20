@@ -519,29 +519,52 @@ impl MultiUseSandbox {
             snapshot.validate_compatibility(&self.mem_mgr.layout, &host_funcs)?;
         }
 
-        let (gsnapshot, gscratch) = self.mem_mgr.restore_snapshot(&snapshot)?;
-        if let Some(gsnapshot) = gsnapshot {
-            self.vm
-                .update_snapshot_mapping(gsnapshot)
-                .map_err(|e| HyperlightError::HyperlightVmError(e.into()))?;
-        }
-        if let Some(gscratch) = gscratch {
-            self.vm
-                .update_scratch_mapping(gscratch)
-                .map_err(|e| HyperlightError::HyperlightVmError(e.into()))?;
-        }
-
         let sregs = snapshot.sregs().ok_or_else(|| {
             HyperlightError::Error("snapshot from running sandbox should have sregs".to_string())
         })?;
-        // TODO (ludfjig): Go through the rest of possible errors in this `MultiUseSandbox::restore` function
-        // and determine if they should also poison the sandbox.
+
+        let (candidate_mem_mgr, candidate_guest_mem_mgr) =
+            SandboxMemoryManager::from_snapshot(&snapshot).and_then(SandboxMemoryManager::build)?;
+        let current_regions: Vec<MemoryRegion> = self.vm.get_mapped_regions().cloned().collect();
+        for region in &current_regions {
+            self.vm
+                .unmap_region(region)
+                .map_err(HyperlightVmError::UnmapRegion)
+                .map_err(HyperlightError::HyperlightVmError)
+                .map_err(|err| self.fail_restore(err))?;
+        }
+
+        self.vm
+            .update_base_mappings(
+                candidate_guest_mem_mgr.shared_mem,
+                candidate_guest_mem_mgr.scratch_mem,
+            )
+            .map_err(|err| HyperlightError::HyperlightVmError(err.into()))
+            .map_err(|err| self.fail_restore(err))?;
+
+        #[cfg(gdb)]
+        self.vm
+            .clear_guest_debug_state()
+            .map_err(|err| crate::new_error!("failed to clear guest debug state: {err}"))
+            .map_err(|err| self.fail_restore(err))?;
+
         self.vm
             .reset_vcpu(snapshot.root_pt_gpa(), sregs)
-            .map_err(|e| {
-                self.poisoned = true;
-                HyperlightVmError::Restore(e)
-            })?;
+            .map_err(HyperlightVmError::Restore)
+            .map_err(HyperlightError::HyperlightVmError)
+            .map_err(|err| self.fail_restore(err))?;
+
+        #[cfg(gdb)]
+        {
+            let dbg_mem_access_fn = self.dbg_mem_access_fn.clone();
+            let mut dbg_mem_access_fn = dbg_mem_access_fn
+                .lock()
+                .map_err(|err| crate::new_error!("failed to lock debug memory manager: {err}"))
+                .map_err(|err| self.fail_restore(err))?;
+            *dbg_mem_access_fn = candidate_mem_mgr.clone();
+        }
+
+        self.mem_mgr = candidate_mem_mgr;
 
         self.vm.set_stack_top(snapshot.stack_top_gva());
         self.vm.set_next_action(snapshot.next_action());
@@ -550,13 +573,6 @@ impl MultiUseSandbox {
         #[cfg(crashdump)]
         self.vm
             .set_crashdump_entry_point(snapshot.original_entrypoint());
-
-        let current_regions: Vec<MemoryRegion> = self.vm.get_mapped_regions().cloned().collect();
-        for region in &current_regions {
-            self.vm
-                .unmap_region(region)
-                .map_err(HyperlightVmError::UnmapRegion)?;
-        }
 
         // The restored snapshot is now our most current snapshot
         self.snapshot = Some(snapshot.clone());
@@ -573,6 +589,12 @@ impl MultiUseSandbox {
         self.poisoned = false;
 
         Ok(())
+    }
+
+    fn fail_restore(&mut self, err: HyperlightError) -> HyperlightError {
+        self.poisoned = true;
+        self.snapshot = None;
+        err
     }
 
     /// Calls a guest function by name with the specified arguments.
@@ -1139,6 +1161,7 @@ mod tests {
     use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
     use crate::mem::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, SharedMemory as _};
     use crate::sandbox::SandboxConfiguration;
+    use crate::sandbox::snapshot::Snapshot;
     use crate::{GuestBinary, HyperlightError, MultiUseSandbox, Result, UninitializedSandbox};
 
     #[test]
@@ -1761,6 +1784,29 @@ mod tests {
         assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 108);
         target.restore(good_snapshot).unwrap();
         assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 8);
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_missing_sregs_before_mutation() {
+        let path = simple_guest_as_string().unwrap();
+        let snapshot = Arc::new(
+            Snapshot::from_env(GuestBinary::FilePath(path), SandboxConfiguration::default())
+                .unwrap(),
+        );
+
+        let path = simple_guest_as_string().unwrap();
+        let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        target.call::<i32>("AddToStatic", 5i32).unwrap();
+        let cached_snapshot = target.snapshot().unwrap();
+
+        let err = target.restore(snapshot).unwrap_err();
+        assert!(matches!(err, HyperlightError::Error(message) if message.contains("sregs")));
+        assert!(!target.poisoned());
+        assert!(Arc::ptr_eq(&target.snapshot().unwrap(), &cached_snapshot));
+        assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 5);
     }
 
     /// `snapshot.regions()` is empty post-compaction, so restore
