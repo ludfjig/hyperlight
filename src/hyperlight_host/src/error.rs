@@ -256,11 +256,6 @@ pub enum HyperlightError {
     #[error("Failed To Convert Return Value {0:?} to {1:?}")]
     ReturnValueConversionFailure(ReturnValue, &'static str),
 
-    /// Tried to restore a snapshot into a sandbox whose memory
-    /// layout is not compatible with the snapshot's.
-    #[error("Snapshot memory layout is not compatible with this sandbox")]
-    SnapshotLayoutMismatch,
-
     /// Tried to restore a snapshot into a sandbox whose registered
     /// host functions do not satisfy the snapshot's required set.
     #[error(
@@ -418,7 +413,6 @@ impl HyperlightError {
             | HyperlightError::RefCellMutBorrowFailed(_)
             | HyperlightError::ReturnValueConversionFailure(_, _)
             | HyperlightError::RestoreFailedUnrecoverably { .. }
-            | HyperlightError::SnapshotLayoutMismatch
             | HyperlightError::SnapshotHostFunctionMismatch { .. }
             | HyperlightError::SystemTimeError(_)
             | HyperlightError::TryFromSliceError(_)

@@ -200,6 +200,11 @@ impl PreparedMemoryRestore {
     pub(crate) fn replaces_snapshot(&self) -> bool {
         matches!(self.mapping_update, BaseMappingUpdate::ReplaceSnapshot(_))
     }
+
+    #[cfg(test)]
+    pub(crate) fn replaces_all(&self) -> bool {
+        matches!(self.mapping_update, BaseMappingUpdate::ReplaceAll { .. })
+    }
 }
 
 /// Buffer for building guest page tables during snapshot creation.
