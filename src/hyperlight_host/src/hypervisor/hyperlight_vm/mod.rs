@@ -45,7 +45,7 @@ use crate::hypervisor::virtual_machine::{
 };
 use crate::hypervisor::{InterruptHandle, InterruptHandleImpl};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
-use crate::mem::mgr::{SandboxMemoryManager, SnapshotSharedMemory};
+use crate::mem::mgr::{BaseMappingUpdate, SandboxMemoryManager, SnapshotSharedMemory};
 use crate::mem::shared_mem::{GuestSharedMemory, HostSharedMemory, SharedMemory};
 use crate::metrics::{METRIC_ERRONEOUS_VCPU_KICKS, METRIC_GUEST_CANCELLATION};
 use crate::sandbox::host_funcs::FunctionRegistry;
@@ -576,6 +576,21 @@ impl HyperlightVm {
 
     pub(crate) fn update_base_mappings(
         &mut self,
+        update: BaseMappingUpdate,
+    ) -> Result<(), UpdateRegionError> {
+        match update {
+            BaseMappingUpdate::Keep => Ok(()),
+            BaseMappingUpdate::ReplaceSnapshot(snapshot) => {
+                self.update_snapshot_mapping(snapshot).map(|_| ())
+            }
+            BaseMappingUpdate::ReplaceAll { snapshot, scratch } => {
+                self.replace_base_mappings(snapshot, scratch)
+            }
+        }
+    }
+
+    fn replace_base_mappings(
+        &mut self,
         snapshot: SnapshotSharedMemory<GuestSharedMemory>,
         scratch: GuestSharedMemory,
     ) -> Result<(), UpdateRegionError> {
@@ -623,6 +638,11 @@ impl HyperlightVm {
     #[cfg(crashdump)]
     pub(crate) fn set_crashdump_entry_point(&mut self, entry_point: u64) {
         self.rt_cfg.entry_point = Some(entry_point);
+    }
+
+    #[cfg(crashdump)]
+    pub(crate) fn clear_crashdump_binary_path(&mut self) {
+        self.rt_cfg.binary_path = None;
     }
 
     pub(crate) fn interrupt_handle(&self) -> Arc<dyn InterruptHandle> {

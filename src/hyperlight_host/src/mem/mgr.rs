@@ -151,10 +151,53 @@ pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
     pub(crate) abort_buffer: Vec<u8>,
     /// Generation counter: how many snapshots have been taken from
     /// this sandbox's execution path from init to here. Incremented
-    /// on each `snapshot` call; on `restore_snapshot` we inherit the
+    /// on each `snapshot` call; on restore we inherit the
     /// restored snapshot's own generation number so the guest-visible
     /// counter tracks which snapshot the sandbox is a clone of.
     pub(crate) snapshot_count: u64,
+}
+
+pub(crate) enum BaseMappingUpdate {
+    Keep,
+    ReplaceSnapshot(SnapshotSharedMemory<GuestSharedMemory>),
+    ReplaceAll {
+        snapshot: SnapshotSharedMemory<GuestSharedMemory>,
+        scratch: GuestSharedMemory,
+    },
+}
+
+pub(crate) struct PreparedMemoryRestore {
+    manager: SandboxMemoryManager<HostSharedMemory>,
+    mapping_update: BaseMappingUpdate,
+}
+
+impl PreparedMemoryRestore {
+    pub(crate) fn reset_reused_scratch(&mut self) -> Result<()> {
+        if !matches!(self.mapping_update, BaseMappingUpdate::ReplaceAll { .. }) {
+            self.manager.scratch_mem.zero()?;
+            self.manager.update_scratch_bookkeeping()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_parts(self) -> (SandboxMemoryManager<HostSharedMemory>, BaseMappingUpdate) {
+        (self.manager, self.mapping_update)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keeps_mappings(&self) -> bool {
+        matches!(self.mapping_update, BaseMappingUpdate::Keep)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replaces_snapshot(&self) -> bool {
+        matches!(self.mapping_update, BaseMappingUpdate::ReplaceSnapshot(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replaces_all(&self) -> bool {
+        matches!(self.mapping_update, BaseMappingUpdate::ReplaceAll { .. })
+    }
 }
 
 /// Buffer for building guest page tables during snapshot creation.
@@ -383,6 +426,41 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
 }
 
 impl SandboxMemoryManager<HostSharedMemory> {
+    pub(crate) fn prepare_restore(&self, snapshot: &Snapshot) -> Result<PreparedMemoryRestore> {
+        let mut candidate = self.clone();
+        let mapping_update = if snapshot.layout().get_scratch_size() != self.scratch_mem.mem_size()
+        {
+            let (snapshot_host, snapshot_guest) = snapshot.memory().to_mgr_snapshot_mem()?.build();
+            let (scratch_host, scratch_guest) =
+                ExclusiveSharedMemory::new(snapshot.layout().get_scratch_size())?.build();
+            candidate.shared_mem = snapshot_host;
+            candidate.scratch_mem = scratch_host;
+            BaseMappingUpdate::ReplaceAll {
+                snapshot: snapshot_guest,
+                scratch: scratch_guest,
+            }
+        } else if *snapshot.memory() == self.shared_mem {
+            BaseMappingUpdate::Keep
+        } else {
+            let (host, guest) = snapshot.memory().to_mgr_snapshot_mem()?.build();
+            candidate.shared_mem = host;
+            BaseMappingUpdate::ReplaceSnapshot(guest)
+        };
+
+        candidate.layout = *snapshot.layout();
+        candidate.next_action = snapshot.next_action();
+        candidate.snapshot_count = snapshot.snapshot_generation();
+        candidate.original_entrypoint = snapshot.original_entrypoint();
+        if matches!(mapping_update, BaseMappingUpdate::ReplaceAll { .. }) {
+            candidate.update_scratch_bookkeeping()?;
+        }
+
+        Ok(PreparedMemoryRestore {
+            manager: candidate,
+            mapping_update,
+        })
+    }
+
     /// Reads a host function call from memory
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn get_host_function_call(&mut self) -> Result<FunctionCall> {

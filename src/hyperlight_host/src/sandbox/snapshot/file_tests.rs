@@ -2684,9 +2684,8 @@ fn snapshot_with_no_host_functions_round_trips() {
         MultiUseSandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
 }
 
-// Snapshot lineage and restore semantics. `restore` accepts any
-// snapshot whose memory layout and host-function set match the sandbox.
-// Snapshots within a compatible set are interchangeable.
+// Snapshot lineage and restore semantics. `restore` accepts snapshots
+// whose required host functions match the sandbox.
 
 #[test]
 fn linear_chain_restore_in_order() {
