@@ -136,7 +136,7 @@ pub struct MultiUseSandbox {
 ///
 /// Returns a list of root page table GPAs to walk. If the list is
 /// empty, only `root_pt_gpa` is used.
-pub type PtRootFinder = Box<dyn Fn(&[u8], &[u8], u64) -> Vec<u64> + Send>;
+pub type PtRootFinder = Arc<dyn Fn(&[u8], &[u8], u64) -> Vec<u64> + Send + Sync>;
 
 impl MultiUseSandbox {
     fn ensure_usable(&self) -> Result<()> {
@@ -180,8 +180,12 @@ impl MultiUseSandbox {
     /// Set a callback that discovers page table roots from guest memory.
     /// The callback receives (snapshot_mem, scratch_mem, cr3) and returns
     /// the list of root GPAs to walk during snapshot creation.
+    ///
+    /// In-memory snapshots retain the finder across restore. The finder is not
+    /// serialized.
     pub fn set_pt_root_finder(&mut self, finder: PtRootFinder) {
         self.pt_root_finder = Some(finder);
+        self.snapshot = None;
     }
 
     /// Create a `MultiUseSandbox` directly from a [`Snapshot`],
@@ -365,13 +369,14 @@ impl MultiUseSandbox {
         #[cfg(gdb)]
         let dbg_mem_wrapper = Arc::new(Mutex::new(hshm.clone()));
 
-        let sbox = MultiUseSandbox::from_uninit(
+        let mut sbox = MultiUseSandbox::from_uninit(
             host_funcs,
             hshm,
             vm,
             #[cfg(gdb)]
             dbg_mem_wrapper,
         );
+        sbox.pt_root_finder = snapshot.pt_root_finder().cloned();
         Ok(sbox)
     }
 
@@ -462,6 +467,7 @@ impl MultiUseSandbox {
             msrs,
             next_action,
             host_functions,
+            self.pt_root_finder.clone(),
         )?;
         let snapshot = Arc::new(memory_snapshot);
         self.snapshot = Some(snapshot.clone());
@@ -682,7 +688,7 @@ impl MultiUseSandbox {
             self.vm.clear_crashdump_binary_path();
         }
 
-        self.pt_root_finder = None;
+        self.pt_root_finder = snapshot.pt_root_finder().cloned();
 
         // The restored snapshot is now our most current snapshot
         self.snapshot = Some(snapshot.clone());
@@ -1249,6 +1255,7 @@ fn warn_on_layout_override(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -1262,6 +1269,7 @@ mod tests {
     use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
     use crate::mem::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, SharedMemory as _};
     use crate::sandbox::SandboxConfiguration;
+    use crate::sandbox::snapshot::Snapshot;
     use crate::sandbox::uninitialized::{GuestBlob, GuestEnvironment};
     use crate::{
         GuestBinary, HyperlightError, MultiUseSandbox, Result, SandboxStatus, UninitializedSandbox,
@@ -1280,6 +1288,23 @@ mod tests {
         assert!(!SandboxStatus::Unrecoverable.is_ready());
         assert!(!SandboxStatus::Unrecoverable.is_poisoned());
         assert!(SandboxStatus::Unrecoverable.is_unrecoverable());
+    }
+
+    trait AmbiguousIfSync<Marker> {
+        fn assert_not_sync() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    #[test]
+    fn snapshot_and_sandbox_thread_safety() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send::<MultiUseSandbox>();
+        let _ = <MultiUseSandbox as AmbiguousIfSync<_>>::assert_not_sync;
+        assert_send_sync::<Snapshot>();
     }
 
     #[test]
@@ -2590,6 +2615,8 @@ mod tests {
             .unwrap()
             .evolve()
             .unwrap();
+        let source_finder: crate::sandbox::PtRootFinder = Arc::new(|_, _, root| vec![root]);
+        source.set_pt_root_finder(source_finder.clone());
         let mut target =
             UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_as_pathbuf()), None)
                 .unwrap()
@@ -2598,8 +2625,7 @@ mod tests {
 
         assert_eq!(source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
         assert_eq!(target.call::<i32>("AddToStatic", 17i32).unwrap(), 17);
-        target.set_pt_root_finder(Box::new(|_, _, root| vec![root]));
-        assert!(target.pt_root_finder.is_some());
+        target.set_pt_root_finder(Arc::new(|_, _, _| Vec::new()));
 
         assert_ne!(
             source.mem_mgr.layout.code_size(),
@@ -2616,7 +2642,10 @@ mod tests {
 
         let snapshot = source.snapshot().unwrap();
         target.restore(snapshot).unwrap();
-        assert!(target.pt_root_finder.is_none());
+        assert!(Arc::ptr_eq(
+            target.pt_root_finder.as_ref().unwrap(),
+            &source_finder
+        ));
         assert_eq!(target.call::<i32>("StackAllocate", 512i32).unwrap(), 512);
         assert!(matches!(
             target.call::<i32>("GetStatic", ()),
@@ -2625,6 +2654,68 @@ mod tests {
                 name
             )) if name == "GetStatic"
         ));
+    }
+
+    #[test]
+    fn snapshot_restore_clears_absent_pt_root_finder() {
+        let path = simple_guest_as_pathbuf();
+        let mut source = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        let snapshot = source.snapshot().unwrap();
+        assert!(snapshot.pt_root_finder().is_none());
+
+        let path = simple_guest_as_pathbuf();
+        let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        target.set_pt_root_finder(Arc::new(|_, _, root| vec![root]));
+
+        target.restore(snapshot).unwrap();
+        assert!(target.pt_root_finder.is_none());
+    }
+
+    #[test]
+    fn snapshot_restore_uses_retained_pt_root_finder() {
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let source_calls_in_finder = source_calls.clone();
+        let source_finder: crate::sandbox::PtRootFinder = Arc::new(move |_, _, _| {
+            source_calls_in_finder.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        });
+        let path = simple_guest_as_pathbuf();
+        let mut source = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        source.set_pt_root_finder(source_finder);
+        let snapshot = source.snapshot().unwrap();
+
+        let target_calls = Arc::new(AtomicUsize::new(0));
+        let target_calls_in_finder = target_calls.clone();
+        let target_finder: crate::sandbox::PtRootFinder = Arc::new(move |_, _, root| {
+            target_calls_in_finder.fetch_add(1, Ordering::Relaxed);
+            vec![root]
+        });
+        let path = simple_guest_as_pathbuf();
+        let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+            .unwrap()
+            .evolve()
+            .unwrap();
+        target.set_pt_root_finder(target_finder);
+        target.restore(snapshot).unwrap();
+
+        let source_calls_before = source_calls.load(Ordering::Relaxed);
+        target.call::<i32>("GetStatic", ()).unwrap();
+        target.snapshot().unwrap();
+
+        assert_eq!(
+            source_calls.load(Ordering::Relaxed),
+            source_calls_before + 1
+        );
+        assert_eq!(target_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
