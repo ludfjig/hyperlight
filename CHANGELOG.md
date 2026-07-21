@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 * `MultiUseSandbox::restore` has been made more flexible and now accepts snapshots from any guest binary or memory layout when host functions are compatible.
+* **Breaking:** `PtRootFinder` now uses `Arc` and requires `Sync`.
 
 ### Removed
 

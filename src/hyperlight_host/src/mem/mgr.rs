@@ -34,6 +34,7 @@ use crate::hypervisor::regs::CommonSpecialRegisters;
 use crate::mem::memory_region::MemoryRegion;
 #[cfg(crashdump)]
 use crate::mem::memory_region::{CrashDumpRegion, MemoryRegionFlags, MemoryRegionType};
+use crate::sandbox::PtRootFinder;
 use crate::sandbox::snapshot::{NextAction, Snapshot};
 use crate::{Result, new_error};
 
@@ -351,6 +352,7 @@ where
         sregs: CommonSpecialRegisters,
         next_action: NextAction,
         host_functions: HostFunctionDetails,
+        pt_root_finder: Option<PtRootFinder>,
     ) -> Result<Snapshot> {
         self.snapshot_count += 1;
         Snapshot::new(
@@ -366,6 +368,7 @@ where
             self.original_entrypoint,
             self.snapshot_count,
             host_functions,
+            pt_root_finder,
         )
     }
 }

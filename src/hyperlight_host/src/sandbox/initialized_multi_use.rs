@@ -105,7 +105,7 @@ pub struct MultiUseSandbox {
 ///
 /// Returns a list of root page table GPAs to walk. If the list is
 /// empty, only `root_pt_gpa` is used.
-pub type PtRootFinder = Box<dyn Fn(&[u8], &[u8], u64) -> Vec<u64> + Send>;
+pub type PtRootFinder = Arc<dyn Fn(&[u8], &[u8], u64) -> Vec<u64> + Send + Sync>;
 
 impl MultiUseSandbox {
     /// Move an `UninitializedSandbox` into a new `MultiUseSandbox` instance.
@@ -135,8 +135,12 @@ impl MultiUseSandbox {
     /// Set a callback that discovers page table roots from guest memory.
     /// The callback receives (snapshot_mem, scratch_mem, cr3) and returns
     /// the list of root GPAs to walk during snapshot creation.
+    ///
+    /// In-memory snapshots retain the finder across restore. The finder is not
+    /// serialized.
     pub fn set_pt_root_finder(&mut self, finder: PtRootFinder) {
         self.pt_root_finder = Some(finder);
+        self.snapshot = None;
     }
 
     /// Create a `MultiUseSandbox` directly from a [`Snapshot`],
@@ -309,13 +313,14 @@ impl MultiUseSandbox {
         #[cfg(gdb)]
         let dbg_mem_wrapper = Arc::new(Mutex::new(hshm.clone()));
 
-        let sbox = MultiUseSandbox::from_uninit(
+        let mut sbox = MultiUseSandbox::from_uninit(
             host_funcs,
             hshm,
             vm,
             #[cfg(gdb)]
             dbg_mem_wrapper,
         );
+        sbox.pt_root_finder = snapshot.pt_root_finder().cloned();
         Ok(sbox)
     }
 
@@ -397,6 +402,7 @@ impl MultiUseSandbox {
             sregs,
             next_action,
             host_functions,
+            self.pt_root_finder.clone(),
         )?;
         let snapshot = Arc::new(memory_snapshot);
         self.snapshot = Some(snapshot.clone());
@@ -577,7 +583,7 @@ impl MultiUseSandbox {
             self.vm.clear_crashdump_binary_path();
         }
 
-        self.pt_root_finder = None;
+        self.pt_root_finder = snapshot.pt_root_finder().cloned();
 
         // The restored snapshot is now our most current snapshot
         self.snapshot = Some(snapshot.clone());
@@ -1170,6 +1176,23 @@ mod tests {
     use crate::sandbox::snapshot::Snapshot;
     use crate::sandbox::uninitialized::{GuestBlob, GuestEnvironment};
     use crate::{GuestBinary, HyperlightError, MultiUseSandbox, Result, UninitializedSandbox};
+
+    trait AmbiguousIfSync<Marker> {
+        fn assert_not_sync() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    #[test]
+    fn snapshot_and_sandbox_thread_safety() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send::<MultiUseSandbox>();
+        let _ = <MultiUseSandbox as AmbiguousIfSync<_>>::assert_not_sync;
+        assert_send_sync::<Snapshot>();
+    }
 
     #[test]
     fn poison() {
@@ -1958,6 +1981,8 @@ mod tests {
             .unwrap()
             .evolve()
             .unwrap();
+        let source_finder: crate::sandbox::PtRootFinder = Arc::new(|_, _, root| vec![root]);
+        source.set_pt_root_finder(source_finder.clone());
         let mut target = UninitializedSandbox::new(
             GuestBinary::FilePath(simple_guest_as_string().unwrap()),
             None,
@@ -1968,8 +1993,7 @@ mod tests {
 
         assert_eq!(source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
         assert_eq!(target.call::<i32>("AddToStatic", 17i32).unwrap(), 17);
-        target.set_pt_root_finder(Box::new(|_, _, root| vec![root]));
-        assert!(target.pt_root_finder.is_some());
+        target.set_pt_root_finder(Arc::new(|_, _, _| Vec::new()));
 
         assert_ne!(
             source.mem_mgr.layout.code_size(),
@@ -1986,7 +2010,10 @@ mod tests {
 
         let snapshot = source.snapshot().unwrap();
         target.restore(snapshot).unwrap();
-        assert!(target.pt_root_finder.is_none());
+        assert!(Arc::ptr_eq(
+            target.pt_root_finder.as_ref().unwrap(),
+            &source_finder
+        ));
         assert_eq!(target.call::<i32>("StackAllocate", 512i32).unwrap(), 512);
         assert!(matches!(
             target.call::<i32>("GetStatic", ()),
