@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use hyperlight_common::resource::BorrowedResourceGuard;
 use hyperlight_host::{GuestBinary, MultiUseSandbox, UninitializedSandbox};
-use hyperlight_testing::{c_simple_guest_as_pathbuf, simple_guest_as_pathbuf, wit_guest_as_pathbuf};
+use hyperlight_testing::{
+    c_simple_guest_as_pathbuf, simple_guest_as_pathbuf, wit_guest_as_pathbuf,
+};
 
 extern crate alloc;
 mod bindings {
@@ -361,13 +363,11 @@ mod wit_test {
 
     #[test]
     fn restore_rust_and_c_snapshots_replace_wit_guest() {
-        let mut rust_source = UninitializedSandbox::new(
-            GuestBinary::FilePath(simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut rust_source =
+            UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(rust_source.call::<i32>("AddToStatic", 42i32).unwrap(), 42);
         let rust_snapshot = rust_source.snapshot().unwrap();
 
@@ -381,13 +381,11 @@ mod wit_test {
         rust_target.sb.restore(rust_snapshot).unwrap();
         assert_eq!(rust_target.sb.call::<i32>("GetStatic", ()).unwrap(), 42);
 
-        let mut c_source = UninitializedSandbox::new(
-            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut c_source =
+            UninitializedSandbox::new(GuestBinary::FilePath(c_simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(c_source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
         let c_snapshot = c_source.snapshot().unwrap();
 
@@ -407,13 +405,11 @@ mod wit_test {
 
     #[test]
     fn restore_chain_replaces_each_guest() {
-        let mut rust_source = UninitializedSandbox::new(
-            GuestBinary::FilePath(simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut rust_source =
+            UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(rust_source.call::<i32>("AddToStatic", 42i32).unwrap(), 42);
         let rust_snapshot = rust_source.snapshot().unwrap();
 

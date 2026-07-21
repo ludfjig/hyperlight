@@ -1256,9 +1256,9 @@ mod tests {
     use hyperlight_testing::sandbox_sizes::{LARGE_HEAP_SIZE, MEDIUM_HEAP_SIZE, SMALL_HEAP_SIZE};
     use hyperlight_testing::{c_simple_guest_as_pathbuf, simple_guest_as_pathbuf};
 
+    use crate::func::host_functions::Registerable;
     #[cfg(not(gdb))]
     use crate::hypervisor::hyperlight_vm::{HyperlightVmError, test_support::VmOperation};
-    use crate::func::host_functions::Registerable;
     use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
     use crate::mem::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, SharedMemory as _};
     use crate::sandbox::SandboxConfiguration;
@@ -2590,13 +2590,11 @@ mod tests {
             .unwrap()
             .evolve()
             .unwrap();
-        let mut target = UninitializedSandbox::new(
-            GuestBinary::FilePath(simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut target =
+            UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
 
         assert_eq!(source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
         assert_eq!(target.call::<i32>("AddToStatic", 17i32).unwrap(), 17);
@@ -2631,23 +2629,19 @@ mod tests {
 
     #[test]
     fn snapshot_restore_replaces_c_guest_with_rust_guest() {
-        let mut source = UninitializedSandbox::new(
-            GuestBinary::FilePath(simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut source =
+            UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(source.call::<i32>("AddToStatic", 42i32).unwrap(), 42);
         let snapshot = source.snapshot().unwrap();
 
-        let mut target = UninitializedSandbox::new(
-            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut target =
+            UninitializedSandbox::new(GuestBinary::FilePath(c_simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(target.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
 
         target.restore(snapshot).unwrap();
@@ -2663,33 +2657,27 @@ mod tests {
 
     #[test]
     fn snapshot_restore_alternates_c_and_rust_guests() {
-        let mut c_source = UninitializedSandbox::new(
-            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut c_source =
+            UninitializedSandbox::new(GuestBinary::FilePath(c_simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(c_source.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
         let c_snapshot = c_source.snapshot().unwrap();
 
-        let mut rust_source = UninitializedSandbox::new(
-            GuestBinary::FilePath(simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut rust_source =
+            UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         rust_source.call::<i32>("AddToStatic", 42i32).unwrap();
         let rust_snapshot = rust_source.snapshot().unwrap();
 
-        let mut target = UninitializedSandbox::new(
-            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut target =
+            UninitializedSandbox::new(GuestBinary::FilePath(c_simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         assert_eq!(target.call::<i32>("StackAllocate", 256i32).unwrap(), 256);
 
         target.restore(rust_snapshot).unwrap();
@@ -2744,13 +2732,11 @@ mod tests {
 
     #[test]
     fn snapshot_restore_recovers_poison_with_different_guest() {
-        let mut source = UninitializedSandbox::new(
-            GuestBinary::FilePath(c_simple_guest_as_pathbuf()),
-            None,
-        )
-        .unwrap()
-        .evolve()
-        .unwrap();
+        let mut source =
+            UninitializedSandbox::new(GuestBinary::FilePath(c_simple_guest_as_pathbuf()), None)
+                .unwrap()
+                .evolve()
+                .unwrap();
         let snapshot = source.snapshot().unwrap();
 
         let path = simple_guest_as_pathbuf();
