@@ -45,7 +45,7 @@ use crate::hypervisor::virtual_machine::XSAVE_BUFFER_SIZE;
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::TimerThread;
 use crate::hypervisor::virtual_machine::{
     CreateVmError, MapMemoryError, RegisterError, RunVcpuError, UnmapMemoryError, VirtualMachine,
-    VmExit, validate_allowed_msrs,
+    VmExit, validate_guest_msrs,
 };
 use crate::mem::memory_region::MemoryRegion;
 #[cfg(feature = "trace_guest")]
@@ -73,6 +73,8 @@ const CPUID_FUNCTION_STRUCTURED_EXTENDED_FEATURES: u32 = 0x7;
 const CPUID_FUNCTION_EXTENDED_FEATURE_INFORMATION: u32 = 0x8000_0001;
 const CPUID_FEATURE_VMX: u32 = 1 << 5;
 const CPUID_FEATURE_SVM: u32 = 1 << 2;
+/// CPUID.1:ECX[21], x2APIC support.
+const CPUID_FEATURE_X2APIC: u32 = 1 << 21;
 /// CPUID.(EAX=7,ECX=0):ECX[7], shadow-stack support.
 const CPUID_FEATURE_SHSTK: u32 = 1 << 7;
 /// CPUID.(EAX=7,ECX=0):EDX[20], indirect-branch-tracking support.
@@ -199,8 +201,13 @@ impl KvmVm {
             .map_err(|e| CreateVmError::InitializeVm(e.into()))?;
         for entry in kvm_cpuid.as_mut_slice().iter_mut() {
             match entry.function {
-                // Hyperlight does not support nested Intel virtualization.
-                CPUID_FUNCTION_FEATURE_INFORMATION => entry.ecx &= !CPUID_FEATURE_VMX,
+                CPUID_FUNCTION_FEATURE_INFORMATION => {
+                    // Hyperlight does not support nested Intel virtualization.
+                    entry.ecx &= !CPUID_FEATURE_VMX;
+                    // Hyperlight keeps the APIC in xAPIC mode and denies the
+                    // x2APIC MSRs, so it does not advertise x2APIC.
+                    entry.ecx &= !CPUID_FEATURE_X2APIC;
+                }
                 // Hyperlight does not support nested AMD virtualization.
                 CPUID_FUNCTION_EXTENDED_FEATURE_INFORMATION => {
                     entry.ecx &= !CPUID_FEATURE_SVM;
@@ -338,11 +345,11 @@ impl KvmVm {
         }
     }
 
-    /// Installs a deny filter containing the validated allow list.
+    /// Installs a deny filter that permits only the declared guest MSRs.
     /// Requires `KVM_CAP_X86_MSR_FILTER`.
     pub(crate) fn configure_msr_access(
         &self,
-        allowed: &[u32],
+        guest_msrs: &[u32],
     ) -> std::result::Result<(), CreateVmError> {
         let hv = KVM.as_ref().map_err(|e| e.clone())?;
         if !hv.check_extension(Cap::X86MsrFilter) {
@@ -350,10 +357,10 @@ impl KvmVm {
             return Err(CreateVmError::MsrFilterNotSupported);
         }
 
-        validate_allowed_msrs(self, allowed)?;
+        validate_guest_msrs(self, guest_msrs)?;
 
         // Each contiguous group consumes one KVM filter range.
-        let groups = coalesce_msr_ranges(allowed);
+        let groups = coalesce_msr_ranges(guest_msrs);
         if groups.len() > KVM_MSR_FILTER_MAX_RANGES {
             return Err(CreateVmError::TooManyMsrRanges(groups.len()));
         }
@@ -568,10 +575,13 @@ impl VirtualMachine for KvmVm {
         Ok(())
     }
 
-    fn msr_reset_indices(&self, allowed: &[u32]) -> std::result::Result<Vec<u32>, CreateVmError> {
+    fn msr_reset_indices(
+        &self,
+        guest_msrs: &[u32],
+    ) -> std::result::Result<Vec<u32>, CreateVmError> {
         Ok([MSR_KERNEL_GS_BASE, MSR_TSC]
             .into_iter()
-            .chain(allowed.iter().copied())
+            .chain(guest_msrs.iter().copied())
             .collect())
     }
 

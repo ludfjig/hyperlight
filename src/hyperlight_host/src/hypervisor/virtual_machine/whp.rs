@@ -319,9 +319,6 @@ impl WhpVm {
             #[cfg(feature = "hw-interrupts")]
             Self::enable_lapic_emulation(p)?;
 
-            // Hyper-V permits MSR intercepts only for unimplemented indices.
-            // Implemented MSR isolation therefore depends on reset.
-
             WHvSetupPartition(p).map_err(|e| CreateVmError::InitializeVm(e.into()))?;
             WHvCreateVirtualProcessor(p, 0, 0)
                 .map_err(|e| CreateVmError::CreateVcpuFd(e.into()))?;
@@ -842,8 +839,11 @@ impl VirtualMachine for WhpVm {
         Ok(())
     }
 
-    fn msr_reset_indices(&self, allowed: &[u32]) -> std::result::Result<Vec<u32>, CreateVmError> {
-        crate::hypervisor::virtual_machine::hyperv_msr_reset_indices(self, allowed)
+    fn msr_reset_indices(
+        &self,
+        guest_msrs: &[u32],
+    ) -> std::result::Result<Vec<u32>, CreateVmError> {
+        crate::hypervisor::virtual_machine::hyperv_msr_reset_indices(self, guest_msrs)
     }
 
     fn debug_regs(&self) -> std::result::Result<CommonDebugRegs, RegisterError> {

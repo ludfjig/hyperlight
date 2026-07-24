@@ -1310,6 +1310,47 @@ fn write_msr(msr: u32, value: u64) {
     }
 }
 
+/// Attempts to enter VMX operation by setting `CR4.VMXE`, the prerequisite for
+/// `VMXON` and any nested VM-enter or VM-exit. Hyperlight hides VMX from guest
+/// CPUID, so `CR4.VMXE` is a reserved bit and the write faults.
+#[guest_function("EnableVmxOperation")]
+#[cfg(target_arch = "x86_64")]
+fn enable_vmx_operation() {
+    // SAFETY: The test guest runs at CPL0. The write is expected to fault, and
+    // the sandbox is discarded afterward.
+    unsafe {
+        core::arch::asm!(
+            "mov {cr4}, cr4",
+            "or {cr4}, {vmxe}",
+            "mov cr4, {cr4}",
+            cr4 = out(reg) _,
+            vmxe = const 1u64 << 13,
+            options(nostack)
+        );
+    }
+}
+
+/// Returns whether the guest CPUID advertises x2APIC (`CPUID.1:ECX[21]`).
+#[guest_function("X2apicSupported")]
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+fn x2apic_supported() -> bool {
+    // SAFETY: CPUID leaf 1 is always available on x86_64.
+    unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 21) != 0
+}
+
+/// Executes `VMLAUNCH`, a VM-enter. The guest can never enter VMX operation, so
+/// the instruction raises `#UD` before any VMCS-field MSR load or store runs.
+#[guest_function("ExecuteVmlaunch")]
+#[cfg(target_arch = "x86_64")]
+fn execute_vmlaunch() {
+    // SAFETY: The test guest runs at CPL0. The instruction is expected to fault
+    // (#UD outside VMX operation), and the sandbox is discarded afterward.
+    unsafe {
+        core::arch::asm!("vmlaunch", options(nostack));
+    }
+}
+
 #[hyperlight_guest_bin::main]
 #[instrument(skip_all, parent = Span::current(), level= "Trace")]
 fn main() {
