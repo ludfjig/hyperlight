@@ -24,6 +24,12 @@ use crate::hypervisor::gdb::DebugError;
 use crate::hypervisor::regs::{
     CommonDebugRegs, CommonFpu, CommonRegisters, CommonSpecialRegisters,
 };
+#[cfg(all(target_arch = "x86_64", any(mshv3, target_os = "windows")))]
+use crate::hypervisor::regs::{
+    MSR_MTRR_CAP, filterless_core_reset_candidates, hyperv_mtrr_reset_indices,
+};
+#[cfg(target_arch = "x86_64")]
+use crate::hypervisor::regs::{MsrEntry, is_resettable_msr};
 use crate::mem::memory_region::MemoryRegion;
 #[cfg(feature = "trace_guest")]
 use crate::sandbox::trace::TraceContext as SandboxTraceContext;
@@ -183,6 +189,33 @@ pub enum CreateVmError {
     HypervisorNotAvailable(HypervisorError),
     #[error("Initialize VM failed: {0}")]
     InitializeVm(HypervisorError),
+    #[cfg(all(kvm, target_arch = "x86_64"))]
+    #[error("KVM MSR filtering requires KVM_CAP_X86_MSR_FILTER")]
+    MsrFilterNotSupported,
+    #[cfg(target_arch = "x86_64")]
+    #[error("MSR {msr:#x} cannot be declared as a guest MSR: {reason}")]
+    MsrNotDeclarable { msr: u32, reason: String },
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to read IA32_MTRRCAP: {0}")]
+    GetMtrrCap(RegisterError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Guest-visible MTRRs cannot be reset: {0}")]
+    RequiredMtrrsNotResettable(RegisterError),
+    #[cfg(all(target_arch = "x86_64", any(mshv3, target_os = "windows")))]
+    #[error("Core reset MSR {msr:#x} is readable but not writable on this host")]
+    MsrNotResettable { msr: u32 },
+    #[cfg(target_arch = "x86_64")]
+    #[error("Guest exposes {advertised} variable MTRR pairs, expected at most {maximum}")]
+    UnexpectedVariableMtrrCount { advertised: u8, maximum: u8 },
+    #[cfg(all(kvm, target_arch = "x86_64"))]
+    #[error("Too many guest MSR filter ranges: {0}. Maximum is 16")]
+    TooManyMsrRanges(usize),
+    #[cfg(target_os = "windows")]
+    #[error("Get Partition Property failed: {0}")]
+    GetPartitionProperty(HypervisorError),
+    #[cfg(target_os = "windows")]
+    #[error("WHP exposes {advertised} processor feature banks, expected {expected}")]
+    UnexpectedProcessorFeatureBankCount { advertised: u32, expected: u32 },
     #[error("Set Partition Property failed: {0}")]
     SetPartitionProperty(HypervisorError),
     #[cfg(target_os = "windows")]
@@ -224,6 +257,12 @@ pub enum RegisterError {
     GetSregs(HypervisorError),
     #[error("Failed to set special registers: {0}")]
     SetSregs(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Snapshot APIC_BASE {value:#x} enables unsupported x2APIC mode")]
+    InvalidSnapshotApicBase {
+        /// APIC_BASE value supplied by the snapshot.
+        value: u64,
+    },
     #[error("Failed to get debug registers: {0}")]
     GetDebugRegs(HypervisorError),
     #[error("Failed to set debug registers: {0}")]
@@ -241,6 +280,32 @@ pub enum RegisterError {
     },
     #[error("Invalid xsave alignment")]
     InvalidXsaveAlignment,
+    #[cfg(target_arch = "x86_64")]
+    #[error("MSR operation not supported on this hypervisor")]
+    MsrsUnsupported,
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to build MSR list: {0}")]
+    MsrBuild(String),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to get MSRs: {0}")]
+    GetMsrs(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to set MSRs: {0}")]
+    SetMsrs(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Snapshot MSR index {index:#x} is not in this VM's reset set")]
+    InvalidSnapshotMsrIndex {
+        /// Architectural MSR index supplied by the snapshot.
+        index: u32,
+    },
+    #[cfg(all(kvm, target_arch = "x86_64"))]
+    #[error("MSR batch short count: expected {expected}, applied {actual}")]
+    MsrShortCount {
+        /// Number of MSRs requested
+        expected: usize,
+        /// Number of MSRs actually applied before KVM stopped
+        actual: usize,
+    },
     #[cfg(target_os = "windows")]
     #[error("Failed to get xsave size: {0}")]
     GetXsaveSize(#[from] HypervisorError),
@@ -359,6 +424,17 @@ pub(crate) trait VirtualMachine: Debug + Send {
     #[allow(dead_code)]
     fn set_debug_regs(&self, drs: &CommonDebugRegs) -> std::result::Result<(), RegisterError>;
 
+    /// Reads the requested MSRs.
+    #[cfg(target_arch = "x86_64")]
+    fn msrs(&self, indices: &[u32]) -> std::result::Result<Vec<MsrEntry>, RegisterError>;
+    /// Writes the supplied MSRs.
+    #[cfg(target_arch = "x86_64")]
+    fn set_msrs(&self, msrs: &[MsrEntry]) -> std::result::Result<(), RegisterError>;
+    /// Returns the MSRs whose state this backend must reset.
+    #[cfg(target_arch = "x86_64")]
+    fn msr_reset_indices(&self, guest_msrs: &[u32])
+    -> std::result::Result<Vec<u32>, CreateVmError>;
+
     /// Get xsave
     #[allow(dead_code)]
     #[cfg(not(target_arch = "aarch64"))]
@@ -383,6 +459,94 @@ pub(crate) trait VirtualMachine: Debug + Send {
     /// Get partition handle
     #[cfg(target_os = "windows")]
     fn partition_handle(&self) -> windows::Win32::System::Hypervisor::WHV_PARTITION_HANDLE;
+}
+
+/// Why an MSR failed the read-then-write-back probe that restore relies on.
+#[cfg(target_arch = "x86_64")]
+enum MsrProbe {
+    /// The host cannot read the MSR.
+    Unreadable,
+    /// The host reads the MSR but rejects writing the value back.
+    Unwritable,
+}
+
+/// Reads `msr` and writes the captured value back, the round trip restore
+/// replays. Success means the host can reset the MSR.
+#[cfg(target_arch = "x86_64")]
+fn probe_resettable(vm: &dyn VirtualMachine, msr: u32) -> Result<(), MsrProbe> {
+    let captured = vm.msrs(&[msr]).map_err(|_| MsrProbe::Unreadable)?;
+    vm.set_msrs(&captured).map_err(|_| MsrProbe::Unwritable)
+}
+
+/// Validates that each declared guest MSR is restorable: reset replays a
+/// captured value, so the host must read and write it.
+/// Rejects e.g. a variable MTRR above the host VCNT.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn validate_guest_msrs(
+    vm: &dyn VirtualMachine,
+    guest_msrs: &[u32],
+) -> std::result::Result<(), CreateVmError> {
+    for &msr in guest_msrs {
+        if !is_resettable_msr(msr) {
+            return Err(CreateVmError::MsrNotDeclarable {
+                msr,
+                reason: "MSR is not a resettable MSR".to_string(),
+            });
+        }
+        // A declared MSR is user-named, so either failure is a config error.
+        probe_resettable(vm, msr).map_err(|probe| CreateVmError::MsrNotDeclarable {
+            msr,
+            reason: match probe {
+                MsrProbe::Unreadable => "MSR cannot be read on this host",
+                MsrProbe::Unwritable => "MSR cannot be written on this host",
+            }
+            .to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Returns every guest-visible MTRR a filterless (MSHV/WHP) host must reset.
+#[cfg(all(target_arch = "x86_64", any(mshv3, target_os = "windows")))]
+pub(crate) fn mtrr_reset_indices(
+    vm: &dyn VirtualMachine,
+) -> std::result::Result<Vec<u32>, CreateVmError> {
+    let mtrr_cap = vm
+        .msrs(&[MSR_MTRR_CAP])
+        .map_err(CreateVmError::GetMtrrCap)?[0]
+        .value;
+    let indices = hyperv_mtrr_reset_indices(mtrr_cap)?;
+    vm.msrs(&indices)
+        .map_err(CreateVmError::RequiredMtrrsNotResettable)?;
+    Ok(indices)
+}
+
+/// Builds the reset index set required by a filterless Hyper-V backend.
+#[cfg(all(target_arch = "x86_64", any(mshv3, target_os = "windows")))]
+pub(crate) fn hyperv_msr_reset_indices(
+    vm: &dyn VirtualMachine,
+    guest_msrs: &[u32],
+) -> std::result::Result<Vec<u32>, CreateVmError> {
+    validate_guest_msrs(vm, guest_msrs)?;
+    let mut indices = filterless_core_reset_candidates()
+        .filter_map(|index| match probe_resettable(vm, index) {
+            // Readable and writable, so it joins the reset set.
+            Ok(()) => Some(Ok(index)),
+            // A read failure means the feature is absent, so nothing is retained. This is fine.
+            Err(MsrProbe::Unreadable) => None,
+            // A readable candidate must be writable, or restore cannot scrub it.
+            Err(MsrProbe::Unwritable) => Some(Err(CreateVmError::MsrNotResettable { msr: index })),
+        })
+        .collect::<Result<Vec<u32>, _>>()?;
+    // Guest-visible MTRRs, sized from the host MTRRCAP. mtrr_reset_indices
+    // read-probes them. Hyper-V stores MTRRs unconditionally, so a readable
+    // MTRR is always writable and needs no write probe.
+    indices.extend(mtrr_reset_indices(vm)?);
+    // The declared guest MSRs, validated above.
+    indices.extend(guest_msrs.iter().copied());
+    indices.sort_unstable();
+    indices.dedup();
+    Ok(indices)
 }
 
 #[cfg(test)]
