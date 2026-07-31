@@ -345,7 +345,9 @@ impl Default for SandboxConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuestMsrError, SandboxConfiguration};
+    #[cfg(target_arch = "x86_64")]
+    use super::GuestMsrError;
+    use super::SandboxConfiguration;
 
     #[test]
     #[cfg(target_arch = "x86_64")]
