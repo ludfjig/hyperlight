@@ -57,3 +57,10 @@ pub mod version_note;
 
 /// cbindgen:ignore
 pub mod virtq;
+
+/// cbindgen:ignore
+pub mod arch {
+    #[cfg(target_arch = "aarch64")]
+    #[path = "aarch64/exn.rs"]
+    pub mod exn;
+}

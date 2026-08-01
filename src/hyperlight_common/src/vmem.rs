@@ -37,7 +37,7 @@ pub use arch::ATTR_INDEX_NORMAL;
 /// Utility function to extract an (inclusive on both ends) bit range
 /// from a quadword.
 #[inline(always)]
-pub(in crate::vmem) fn bits<const HIGH_BIT: u8, const LOW_BIT: u8>(x: u64) -> u64 {
+pub(crate) fn bits<const HIGH_BIT: u8, const LOW_BIT: u8>(x: u64) -> u64 {
     (x & ((1 << (HIGH_BIT + 1)) - 1)) >> LOW_BIT
 }
 

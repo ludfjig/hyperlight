@@ -15,6 +15,7 @@ limitations under the License.
  */
 use core::fmt::Write;
 
+use hyperlight_common::arch::exn::{DataFault, DataFaultKind, Exception, decode_syndrome};
 use hyperlight_common::vmem::{
     BasicMapping, CowMapping, MappingKind, PAGE_SIZE, PhysAddr, VirtAddr,
 };
@@ -25,67 +26,6 @@ use hyperlight_guest::layout::{MAIN_STACK_LIMIT_GVA, MAIN_STACK_TOP_GVA};
 use super::super::mrs;
 use super::types::*;
 use crate::HyperlightAbortWriter;
-
-/// Utility function to extract an (inclusive on both ends) bit range
-/// from a quadword.
-#[inline(always)]
-fn bits<const HIGH_BIT: u8, const LOW_BIT: u8>(x: u64) -> u64 {
-    (x & ((1 << (HIGH_BIT + 1)) - 1)) >> LOW_BIT
-}
-
-const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0b100100;
-const ESR_EC_DATA_ABORT_SAME_EL: u64 = 0b100101;
-
-// some of the data in these is not used presently, but is logically
-// part of the code being decoded & should be accounted for
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone)]
-enum DataFault {
-    TranslationFault(i64),
-    PermissionFault(i64),
-    Other(u64),
-}
-fn decode_data_fault(dfsc: u64) -> DataFault {
-    if bits::<5, 2>(dfsc) == 0b0011 {
-        DataFault::PermissionFault(bits::<1, 0>(dfsc) as i64)
-    } else if bits::<5, 2>(dfsc) == 0b0001 {
-        DataFault::TranslationFault(bits::<1, 0>(dfsc) as i64)
-    } else if bits::<5, 2>(dfsc) == 0b1010 {
-        if bits::<1, 0>(dfsc) >= 2 {
-            DataFault::TranslationFault(bits::<1, 0>(dfsc) as i64 - 4)
-        } else {
-            DataFault::Other(dfsc)
-        }
-    } else {
-        DataFault::Other(dfsc)
-    }
-}
-
-// some of the data in these is not used presently, but is logically
-// part of the code being decoded & should be accounted for
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone)]
-enum Exception {
-    /// lower el?, faulting address, status code
-    DataFault(bool, u64, DataFault),
-    Other(u64),
-}
-fn decode_syndrome(esr: u64) -> Exception {
-    let ec = bits::<31, 26>(esr);
-    match ec {
-        ESR_EC_DATA_ABORT_LOWER_EL => Exception::DataFault(
-            true,
-            unsafe { mrs!(FAR_EL1) },
-            decode_data_fault(bits::<5, 0>(esr)),
-        ),
-        ESR_EC_DATA_ABORT_SAME_EL => Exception::DataFault(
-            false,
-            unsafe { mrs!(FAR_EL1) },
-            decode_data_fault(bits::<5, 0>(esr)),
-        ),
-        _ => Exception::Other(esr),
-    }
-}
 
 fn handle_stack_fault(far: u64) {
     // TODO: perhaps we should have a sanity check that the
@@ -159,9 +99,13 @@ pub extern "Rust" fn _debug_print(x: &str) {
     hyperlight_guest::exit::debug_print(x);
 }
 
-fn handle_internal_fault(exn: Exception) -> bool {
+fn handle_internal_fault(exn: Exception, far: u64) -> bool {
     match exn {
-        Exception::DataFault(false, far, DataFault::TranslationFault(_)) => {
+        Exception::DataFault(DataFault {
+            from_lower_el: false,
+            kind: DataFaultKind::TranslationFault(_),
+            ..
+        }) => {
             if (MAIN_STACK_LIMIT_GVA..MAIN_STACK_TOP_GVA).contains(&far) {
                 handle_stack_fault(far);
                 true
@@ -169,7 +113,12 @@ fn handle_internal_fault(exn: Exception) -> bool {
                 false
             }
         }
-        Exception::DataFault(false, far, DataFault::PermissionFault(_)) => {
+        Exception::DataFault(DataFault {
+            from_lower_el: false,
+            is_write: true,
+            kind: DataFaultKind::PermissionFault(_),
+            ..
+        }) => {
             let mut orig_mappings = crate::paging::virt_to_phys(far);
             if let Some(mapping) = orig_mappings.next()
                 && let None = orig_mappings.next()
@@ -191,17 +140,17 @@ pub(super) extern "C" fn handle_exception(
     _regs: *mut ExceptionContext,
 ) {
     let esr = unsafe { mrs!(ESR_EL1) };
+    let far = unsafe { mrs!(FAR_EL1) };
 
     if typ == ExceptionType::Synchronous && from == ExceptionFrom::CurrentSP0 {
         let exn = decode_syndrome(esr);
-        if handle_internal_fault(exn) {
+        if handle_internal_fault(exn, far) {
             return;
         }
     }
 
     // Die with some diagnostic information
     let elr = unsafe { mrs!(ELR_EL1) };
-    let far = unsafe { mrs!(FAR_EL1) };
     let insn_bytes = unsafe { (elr as *const [u8; 8]).read_volatile() };
     // amd64 provides the exception vector as the first byte of the
     // abort sequence after the guest error identifier code, but the
