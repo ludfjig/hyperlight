@@ -138,7 +138,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        hypervisor: [kvm, mshv3, hyperv-ws2025]
+        hypervisor: [kvm, mshv3, hyperv-ws2025, hvf]
         cpu: [amd, intel, apple]
         arch: [X64, arm64]
         config: [debug, release]
@@ -148,25 +148,26 @@ jobs:
             hypervisor: mshv3
           - cpu: apple
             hypervisor: hyperv-ws2025
+          - arch: X64
+            hypervisor: hvf
           - cpu: apple
             arch: X64
           - cpu: amd
             arch: arm64
           - cpu: intel
             arch: arm64
-    runs-on: ${{ fromJson(
-        format('["self-hosted", "{0}", "{1}"{2}]',
-          matrix.hypervisor == 'hyperv-ws2025' && 'Windows' || 'Linux',
-          matrix.arch,
-          matrix.arch == 'X64'
-            && format(', "1ES.Pool=hld-{0}-{1}", "JobId=regen-goldens-{2}-{3}-{4}-{5}"',
-                 matrix.hypervisor == 'hyperv-ws2025' && 'win2025' || matrix.hypervisor == 'mshv3' && 'azlinux3-mshv' || matrix.hypervisor,
-                 matrix.cpu,
-                 matrix.config,
-                 github.run_id,
-                 github.run_number,
-                 github.run_attempt)
-            || ', "kvm", "ubuntu-24.04"')) }}
+    runs-on: ${{ fromJson(matrix.arch == 'X64'
+        && format('["self-hosted", "{0}", "X64", "1ES.Pool=hld-{1}-{2}", "JobId=regen-goldens-{3}-{4}-{5}-{6}"]',
+            matrix.hypervisor == 'hyperv-ws2025' && 'Windows' || 'Linux',
+            matrix.hypervisor == 'hyperv-ws2025' && 'win2025' || matrix.hypervisor == 'mshv3' && 'azlinux3-mshv' || matrix.hypervisor,
+            matrix.cpu,
+            matrix.config,
+            github.run_id,
+            github.run_number,
+            github.run_attempt)
+        || format('["self-hosted", "{0}", "arm64", "{1}"]',
+            matrix.hypervisor == 'hvf' && 'macos' || 'Linux',
+            matrix.hypervisor)) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

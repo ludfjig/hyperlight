@@ -622,6 +622,7 @@ snapshot-goldens-pull target=default-target which="all" image=default-snapshot-g
     if [[ -e /dev/mshv ]]; then hv=mshv
     elif [[ -e /dev/kvm ]]; then hv=kvm
     elif [[ "${OS:-}" == "Windows_NT" ]]; then hv=whp
+    elif [[ "$(sysctl -n kern.hv_support)" == "1" ]]; then hv=hvf
     else echo "snapshot-goldens-pull: no hypervisor found" >&2; exit 1
     fi
     # Mirror of `CpuVendor::golden_tag` in file/config.rs. x86_64 reads

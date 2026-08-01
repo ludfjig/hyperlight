@@ -149,7 +149,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        hypervisor: ['hyperv-ws2025', mshv3, kvm]
+        hypervisor: ['hyperv-ws2025', mshv3, kvm, hvf]
         cpu_vendor: [amd, intel, apple]
         arch: [X64, arm64]
         config: [debug, release]
@@ -158,6 +158,8 @@ jobs:
           hypervisor: hyperv-ws2025
         - cpu_vendor: apple
           hypervisor: mshv3
+        - arch: X64
+          hypervisor: hvf
         - cpu_vendor: amd
           arch: arm64
         - cpu_vendor: intel
