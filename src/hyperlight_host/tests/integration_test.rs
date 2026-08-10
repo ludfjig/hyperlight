@@ -589,7 +589,7 @@ fn corrupt_output_size_prefix_rejected() {
         );
         let err_msg = format!("{:?}", res.unwrap_err());
         assert!(
-            err_msg.contains("Corrupt buffer size prefix: flatbuffer claims 4294967295 bytes but the element slot is only 8 bytes"),
+            err_msg.contains("SharedMemory(Stack(CorruptPrefix(4294967295, 8)))"),
             "Unexpected error message: {err_msg}"
         );
     });
@@ -606,9 +606,7 @@ fn corrupt_output_back_pointer_rejected() {
         );
         let err_msg = format!("{:?}", res.unwrap_err());
         assert!(
-            err_msg.contains(
-                "Corrupt buffer back-pointer: element offset 57005 is outside valid range [8, 8]"
-            ),
+            err_msg.contains("SharedMemory(Stack(CorruptBackPointer(57005, 8)))"),
             "Unexpected error message: {err_msg}"
         );
     });

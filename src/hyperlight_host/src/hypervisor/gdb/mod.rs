@@ -159,12 +159,12 @@ impl<'a> DebugMemoryView<'a> {
                 .mem_mgr
                 .shared_mem
                 .copy_from_slice(data, resolved.offset)
-                .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e))),
+                .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e.into()))),
             BaseGpaRegion::Scratch(()) => self
                 .mem_mgr
                 .scratch_mem
                 .copy_from_slice(data, resolved.offset)
-                .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e))),
+                .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e.into()))),
             _ => Err(DebugMemoryAccessError::WriteToReadOnly),
         }
     }

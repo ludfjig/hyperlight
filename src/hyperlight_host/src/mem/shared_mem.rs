@@ -23,6 +23,7 @@ use std::ptr::null_mut;
 use std::sync::{Arc, RwLock};
 
 use bytemuck::Pod;
+use thiserror::Error;
 use tracing::{Span, instrument};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -42,20 +43,147 @@ use windows::core::PCSTR;
 use super::memory_region::{
     HostGuestMemoryRegion, MemoryRegion, MemoryRegionFlags, MemoryRegionKind, MemoryRegionType,
 };
-#[cfg(target_os = "windows")]
-use crate::HyperlightError::WindowsAPIError;
-use crate::{HyperlightError, Result, log_then_return, new_error};
+use crate::log_then_return;
+
+type Result<T> = core::result::Result<T, SharedMemoryError>;
+
+/// Whether a [`StackError`] was encountered whilst pushing or popping
+/// from the guest stack
+#[derive(Debug)]
+pub enum StackOp {
+    /// The error was encountered while pushing to the guest stack
+    Push,
+    /// The error was encountered while popping from the guest stack
+    Pop,
+}
+/// An error related to the stack discipline of guest I/O
+#[derive(Error, Debug)]
+pub enum StackError {
+    /// The stack pointer for a stack entry was out-of-bounds for the
+    /// stack
+    #[error(
+        "Unable to {0:?} data from buffer: Stack pointer is out of bounds. Stack pointer: {1}, Buffer size: {2}"
+    )]
+    SpOob(StackOp, usize, usize),
+
+    /// The back pointer for a stack entry was corrupt
+    #[error("Corrupt buffer back-pointer: element offset {0} is outside valid range [8, {1}].")]
+    CorruptBackPointer(usize, usize),
+
+    /// A stack entry size prefix was too large for necessary
+    /// operations on it to remain in the range of a u32
+    #[error("Corrupt buffer size prefix: value {0} overflows when adding 4-byte header.")]
+    OverflowingPrefix(u32),
+
+    /// It was not possible to convert a stack entry size prefix into
+    /// a usize. This should be impossible on all currently supported
+    /// architectures, since usize is 64 bits on all of them.
+    #[error("Prefix too large: {0}")]
+    PrefixTooLarge(std::num::TryFromIntError),
+
+    /// A stack entry size prefix is larger than its
+    /// logically-enclosing element
+    #[error(
+        "Corrupt buffer size prefix: flatbuffer claims {0} bytes but the element slot is only {1} bytes."
+    )]
+    CorruptPrefix(usize, usize),
+
+    /// An error was encountered during a routine error conversion
+    /// that should have been infallible
+    #[error("pop_buffer_into: failed to convert buffer to {0}")]
+    ConvertError(String),
+
+    /// There was not enough free space available on the stack for an
+    /// element to be pushed
+    #[error("Not enough space in buffer to push data. Required: {0}, Available: {1}")]
+    BufferFullError(usize, usize),
+}
+/// This is just an alias for std::backtrace::Backtrace that we
+/// introduce to stop thiserror from using its backtrace
+/// functionality, which depends on nightly APIs.
+type ThisErrorHackBacktrace = std::backtrace::Backtrace;
+
+/// An error encountered while setting up or manipulating a shared memory region
+#[derive(Error, Debug)]
+pub enum SharedMemoryError {
+    /// Some operation on the shared memory attempted to read or write
+    /// out of bounds
+    #[error("Cannot access a value with size {0} at offset {1} in memory of size {2}")]
+    Bounds(usize, usize, usize),
+
+    /// When creating a memory with contents from a file, metadata for
+    /// that file could not be read
+    #[error("Could not access metadata for file: {0}")]
+    FileMetadata(std::io::Error),
+
+    /// When creating a memory with contents from a file, that file
+    /// was logically larger than the range of a usize.
+    #[error("File size exceeded usize: {0}")]
+    FileTooLarge(std::num::TryFromIntError),
+
+    /// The locking discipline used to enforce temporary exclusive
+    /// access by the host to a shared memory failed in some way
+    #[error("Could not acquire memory lock: {0} at {1}")]
+    LockError(String, ThisErrorHackBacktrace),
+
+    /// A request to allocate a shared memory could not be fulfilled
+    /// by the host operating system
+    #[error("Memory Allocation Failed with OS Error {0:?}.")]
+    MemoryAllocationFailed(Option<i32>),
+
+    /// A ruqest to allocate a shared shared memory had an invalid
+    /// size, due either to bounds or alignment.
+    #[error(
+        "Memory request does not satisfy constraints: 0x{1:x} < 0x{0:x} <= 0x{2:x} && 0x{0:x} % 0x{3:x} = 0"
+    )]
+    MemoryRequest(usize, usize, usize, usize),
+
+    /// An request to mmap a file or create an anonymous memory could
+    /// not be fulfilled by the host operating system
+    #[error("mmap failed with os error {0:?}")]
+    MmapFailed(Option<i32>),
+
+    /// A request to change the host-side permissions on the guard
+    /// pages of a shared memory region could not be fulfilled by the
+    /// host operating system
+    #[error("mprotect failed with os error {0:?}")]
+    MprotectFailed(Option<i32>),
+
+    /// A Windows virtual memory API call failed
+    #[cfg(target_os = "windows")]
+    #[error("Windows API Error Result {0:?}")]
+    WindowsAPIError(#[from] windows_result::Error),
+
+    /// Calling code attempted to take exclusive (write) access to a
+    /// [`ReadonlySharedMemory`].
+    #[error("Cannot take exclusive access to a ReadonlySharedMemory")]
+    ReadonlySharedMemoryExclusiveRequest,
+
+    /// The stack discipline of guest I/O was violated in some way
+    #[error("{0}")]
+    Stack(#[from] StackError),
+
+    /// An error was encountered when trying to convert a slice of raw
+    /// bytes into some logical data
+    #[error("Error reading slice {0}")]
+    TryFromSlice(#[from] std::array::TryFromSliceError),
+
+    /// An error was encountered during a routine error conversion
+    /// that should have been infallible
+    #[error("Error reading int: {0}")]
+    TryFromInt(#[from] std::num::TryFromIntError),
+}
+impl<T> From<std::sync::TryLockError<T>> for SharedMemoryError {
+    fn from(e: std::sync::TryLockError<T>) -> SharedMemoryError {
+        SharedMemoryError::LockError(format!("{:?}", e), std::backtrace::Backtrace::capture())
+    }
+}
 
 /// Makes sure that the given `offset` and `size` are within the bounds of the memory with size `mem_size`.
 macro_rules! bounds_check {
     ($offset:expr, $size:expr, $mem_size:expr) => {
         if $offset.checked_add($size).is_none_or(|end| end > $mem_size) {
-            return Err(new_error!(
-                "Cannot read value from offset {} with size {} in memory of size {}",
-                $offset,
-                $size,
-                $mem_size
-            ));
+            return Err(SharedMemoryError::Bounds($offset, $size, $mem_size));
         }
     };
 }
@@ -284,7 +412,7 @@ impl Placeholder {
             )
         };
         if addr.is_null() {
-            log_then_return!(HyperlightError::MemoryAllocationFailed(
+            log_then_return!(SharedMemoryError::MemoryAllocationFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
@@ -307,7 +435,7 @@ impl Placeholder {
             )
         } {
             // `self` drops here, releasing the unsplit reservation.
-            log_then_return!(WindowsAPIError(e.clone()));
+            log_then_return!(SharedMemoryError::WindowsAPIError(e.clone()));
         }
         let addr = self.addr;
         let total = self.size;
@@ -359,7 +487,7 @@ impl Placeholder {
         };
         if mapped.Value.is_null() {
             // `self` drops here, releasing the placeholder.
-            log_then_return!(HyperlightError::MemoryAllocationFailed(
+            log_then_return!(SharedMemoryError::MemoryAllocationFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
@@ -532,6 +660,29 @@ pub struct ExclusiveSharedMemory {
 unsafe impl Send for ExclusiveSharedMemory {}
 
 impl ExclusiveSharedMemory {
+    /// Helper function used to abstract common checks from Windows
+    /// and Linux implementations of [`ExclusiveSharedMemory::new()`]
+    fn total_size(min_size_bytes: usize) -> Result<usize> {
+        if min_size_bytes > 0 &&
+            // guard page around the memory
+            let Some(total_size) = min_size_bytes.checked_add(2 * page_size::get()) &&
+            total_size % page_size::get() == 0 &&
+            // usize and isize are guaranteed to be the same size, and
+            // isize::MAX should be positive, so this cast should be
+            // safe.
+            total_size <= isize::MAX as usize
+        {
+            Ok(total_size)
+        } else {
+            Err(SharedMemoryError::MemoryRequest(
+                min_size_bytes,
+                2,
+                isize::MAX as usize - 2 * page_size::get(),
+                page_size::get(),
+            ))
+        }
+    }
+
     /// Create a new region of shared memory with the given minimum
     /// size in bytes. The region will be surrounded by guard pages.
     ///
@@ -543,32 +694,11 @@ impl ExclusiveSharedMemory {
             MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE, c_int, mmap, off_t,
             size_t,
         };
+
+        let total_size = Self::total_size(min_size_bytes)?;
+
         #[cfg(not(miri))]
         use libc::{MAP_NORESERVE, PROT_NONE, mprotect};
-
-        if min_size_bytes == 0 {
-            return Err(new_error!("Cannot create shared memory with size 0"));
-        }
-
-        let total_size = min_size_bytes
-            .checked_add(2 * page_size::get()) // guard page around the memory
-            .ok_or_else(|| new_error!("Memory required for sandbox exceeded usize::MAX"))?;
-
-        if total_size % page_size::get() != 0 {
-            return Err(new_error!(
-                "shared memory must be a multiple of {}",
-                page_size::get()
-            ));
-        }
-
-        // usize and isize are guaranteed to be the same size, and
-        // isize::MAX should be positive, so this cast should be safe.
-        if total_size > isize::MAX as usize {
-            return Err(HyperlightError::MemoryRequestTooBig(
-                total_size,
-                isize::MAX as usize,
-            ));
-        }
 
         // allocate the memory
         #[cfg(not(miri))]
@@ -587,7 +717,7 @@ impl ExclusiveSharedMemory {
             )
         };
         if addr == MAP_FAILED {
-            log_then_return!(HyperlightError::MmapFailed(
+            log_then_return!(SharedMemoryError::MmapFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
@@ -601,7 +731,7 @@ impl ExclusiveSharedMemory {
         {
             let res = unsafe { mprotect(mmap.base, page_size::get(), PROT_NONE) };
             if res != 0 {
-                return Err(HyperlightError::MprotectFailed(
+                return Err(SharedMemoryError::MprotectFailed(
                     Error::last_os_error().raw_os_error(),
                 ));
             }
@@ -613,7 +743,7 @@ impl ExclusiveSharedMemory {
                 )
             };
             if res != 0 {
-                return Err(HyperlightError::MprotectFailed(
+                return Err(SharedMemoryError::MprotectFailed(
                     Error::last_os_error().raw_os_error(),
                 ));
             }
@@ -640,29 +770,7 @@ impl ExclusiveSharedMemory {
     #[cfg(target_os = "windows")]
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     pub fn new(min_size_bytes: usize) -> Result<Self> {
-        if min_size_bytes == 0 {
-            return Err(new_error!("Cannot create shared memory with size 0"));
-        }
-
-        let total_size = min_size_bytes
-            .checked_add(2 * page_size::get())
-            .ok_or_else(|| new_error!("Memory required for sandbox exceeded {}", usize::MAX))?;
-
-        if total_size % page_size::get() != 0 {
-            return Err(new_error!(
-                "shared memory must be a multiple of {}",
-                page_size::get()
-            ));
-        }
-
-        // usize and isize are guaranteed to be the same size, and
-        // isize::MAX should be positive, so this cast should be safe.
-        if total_size > isize::MAX as usize {
-            return Err(HyperlightError::MemoryRequestTooBig(
-                total_size,
-                isize::MAX as usize,
-            ));
-        }
+        let total_size = Self::total_size(min_size_bytes)?;
 
         let mut dwmaximumsizehigh = 0;
         let mut dwmaximumsizelow = 0;
@@ -689,7 +797,7 @@ impl ExclusiveSharedMemory {
         };
 
         if handle.is_invalid() {
-            log_then_return!(HyperlightError::MemoryAllocationFailed(
+            log_then_return!(SharedMemoryError::MemoryAllocationFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
@@ -699,7 +807,7 @@ impl ExclusiveSharedMemory {
         let addr = unsafe { MapViewOfFile(file_mapping.0, file_map, 0, 0, 0) };
 
         if addr.Value.is_null() {
-            log_then_return!(HyperlightError::MemoryAllocationFailed(
+            log_then_return!(SharedMemoryError::MemoryAllocationFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
@@ -723,7 +831,7 @@ impl ExclusiveSharedMemory {
                 &mut unused_out_old_prot_flags,
             )
         } {
-            log_then_return!(WindowsAPIError(e.clone()));
+            log_then_return!(SharedMemoryError::WindowsAPIError(e.clone()));
         }
 
         let last_guard_page_start = unsafe { view.addr.add(total_size - page_size::get()) };
@@ -735,7 +843,7 @@ impl ExclusiveSharedMemory {
                 &mut unused_out_old_prot_flags,
             )
         } {
-            log_then_return!(WindowsAPIError(e.clone()));
+            log_then_return!(SharedMemoryError::WindowsAPIError(e.clone()));
         }
 
         Ok(Self {
@@ -955,10 +1063,7 @@ impl SharedMemory for GuestSharedMemory {
         &mut self,
         f: F,
     ) -> Result<T> {
-        let guard = self
-            .lock
-            .try_write()
-            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+        let guard = self.lock.try_write()?;
         let mut excl = ExclusiveSharedMemory {
             region: self.region.clone(),
         };
@@ -1152,10 +1257,7 @@ impl HostSharedMemory {
     pub fn copy_to_slice(&self, slice: &mut [u8], offset: usize) -> Result<()> {
         bounds_check!(offset, slice.len(), self.mem_size());
         let base = self.base_ptr().wrapping_add(offset);
-        let guard = self
-            .lock
-            .try_read()
-            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+        let guard = self.lock.try_read()?;
 
         const CHUNK: usize = size_of::<u128>();
         let len = slice.len();
@@ -1203,10 +1305,7 @@ impl HostSharedMemory {
     pub fn copy_from_slice(&self, slice: &[u8], offset: usize) -> Result<()> {
         bounds_check!(offset, slice.len(), self.mem_size());
         let base = self.base_ptr().wrapping_add(offset);
-        let guard = self
-            .lock
-            .try_read()
-            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+        let guard = self.lock.try_read()?;
 
         const CHUNK: usize = size_of::<u128>();
         let len = slice.len();
@@ -1254,10 +1353,7 @@ impl HostSharedMemory {
     pub fn fill(&mut self, value: u8, offset: usize, len: usize) -> Result<()> {
         bounds_check!(offset, len, self.mem_size());
         let base = self.base_ptr().wrapping_add(offset);
-        let guard = self
-            .lock
-            .try_read()
-            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+        let guard = self.lock.try_read()?;
 
         const CHUNK: usize = size_of::<u128>();
         let value_u128 = u128::from_ne_bytes([value; CHUNK]);
@@ -1307,25 +1403,20 @@ impl HostSharedMemory {
         data: &[u8],
     ) -> Result<()> {
         let stack_pointer_rel = self.read::<u64>(buffer_start_offset)? as usize;
-        let buffer_size_u64: u64 = buffer_size.try_into()?;
 
         if stack_pointer_rel > buffer_size || stack_pointer_rel < 8 {
-            return Err(new_error!(
-                "Unable to push data to buffer: Stack pointer is out of bounds. Stack pointer: {}, Buffer size: {}",
+            Err(StackError::SpOob(
+                StackOp::Push,
                 stack_pointer_rel,
-                buffer_size_u64
-            ));
+                buffer_size,
+            ))?;
         }
 
         let size_required = data.len() + 8;
         let size_available = buffer_size - stack_pointer_rel;
 
         if size_required > size_available {
-            return Err(new_error!(
-                "Not enough space in buffer to push data. Required: {}, Available: {}",
-                size_required,
-                size_available
-            ));
+            Err(StackError::BufferFullError(size_required, size_available))?;
         }
 
         // get absolute
@@ -1361,11 +1452,11 @@ impl HostSharedMemory {
         let stack_pointer_rel = self.read::<u64>(buffer_start_offset)? as usize;
 
         if stack_pointer_rel > buffer_size || stack_pointer_rel < 16 {
-            return Err(new_error!(
-                "Unable to pop data from buffer: Stack pointer is out of bounds. Stack pointer: {}, Buffer size: {}",
+            Err(StackError::SpOob(
+                StackOp::Pop,
                 stack_pointer_rel,
-                buffer_size
-            ));
+                buffer_size,
+            ))?;
         }
 
         // make it absolute
@@ -1381,11 +1472,10 @@ impl HostSharedMemory {
         if last_element_offset_rel > stack_pointer_rel.saturating_sub(16)
             || last_element_offset_rel < 8
         {
-            return Err(new_error!(
-                "Corrupt buffer back-pointer: element offset {} is outside valid range [8, {}].",
+            Err(StackError::CorruptBackPointer(
                 last_element_offset_rel,
                 stack_pointer_rel.saturating_sub(16),
-            ));
+            ))?;
         }
 
         // make it absolute
@@ -1399,32 +1489,21 @@ impl HostSharedMemory {
             let raw_prefix = self.read::<u32>(last_element_offset_abs)?;
             // flatbuffer byte arrays are prefixed by 4 bytes indicating
             // the remaining size; add 4 for the prefix itself.
-            let total = raw_prefix.checked_add(4).ok_or_else(|| {
-                new_error!(
-                    "Corrupt buffer size prefix: value {} overflows when adding 4-byte header.",
-                    raw_prefix
-                )
-            })?;
-            usize::try_from(total)
-        }?;
+            let total = raw_prefix
+                .checked_add(4)
+                .ok_or(StackError::OverflowingPrefix(raw_prefix))?;
+            usize::try_from(total).map_err(StackError::PrefixTooLarge)?
+        };
 
         if fb_buffer_size > max_element_size {
-            return Err(new_error!(
-                "Corrupt buffer size prefix: flatbuffer claims {} bytes but the element slot is only {} bytes.",
-                fb_buffer_size,
-                max_element_size
-            ));
+            Err(StackError::CorruptPrefix(fb_buffer_size, max_element_size))?;
         }
 
         let mut result_buffer = vec![0; fb_buffer_size];
 
         self.copy_to_slice(&mut result_buffer, last_element_offset_abs)?;
-        let to_return = T::try_from(result_buffer.as_slice()).map_err(|_e| {
-            new_error!(
-                "pop_buffer_into: failed to convert buffer to {}",
-                type_name::<T>()
-            )
-        })?;
+        let to_return = T::try_from(result_buffer.as_slice())
+            .map_err(|_| StackError::ConvertError(type_name::<T>().to_string()))?;
 
         // update the stack pointer to point to the element we just popped off since that is now free
         self.write::<u64>(buffer_start_offset, last_element_offset_rel as u64)?;
@@ -1445,10 +1524,7 @@ impl SharedMemory for HostSharedMemory {
         &mut self,
         f: F,
     ) -> Result<T> {
-        let guard = self
-            .lock
-            .try_write()
-            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+        let guard = self.lock.try_write()?;
         let mut excl = ExclusiveSharedMemory {
             region: self.region.clone(),
         };
@@ -1488,17 +1564,15 @@ unsafe impl Sync for ReadonlySharedMemory {}
 
 impl ReadonlySharedMemory {
     pub(crate) fn from_bytes(contents: &[u8], guest_mapped_size: usize) -> Result<Self> {
-        if guest_mapped_size == 0 || !guest_mapped_size.is_multiple_of(page_size::get()) {
-            return Err(new_error!(
-                "guest_mapped_size {} must be a non-zero multiple of PAGE_SIZE",
-                guest_mapped_size
-            ));
-        }
-        if guest_mapped_size > contents.len() {
-            return Err(new_error!(
-                "guest_mapped_size {} exceeds blob length {}",
+        if guest_mapped_size == 0
+            || guest_mapped_size > contents.len()
+            || !guest_mapped_size.is_multiple_of(page_size::get())
+        {
+            return Err(SharedMemoryError::MemoryRequest(
                 guest_mapped_size,
-                contents.len()
+                0,
+                contents.len(),
+                page_size::get(),
             ));
         }
         let mut anon =
@@ -1524,21 +1598,17 @@ impl ReadonlySharedMemory {
     pub(crate) fn from_file(file: &std::fs::File, guest_mapped_size: usize) -> Result<Self> {
         let len: usize = file
             .metadata()
-            .map_err(|e| new_error!("Failed to read file metadata: {}", e))?
+            .map_err(SharedMemoryError::FileMetadata)?
             .len()
             .try_into()
-            .map_err(|_| new_error!("File length exceeds usize::MAX"))?;
+            .map_err(SharedMemoryError::FileTooLarge)?;
 
-        if len == 0 {
-            return Err(new_error!(
-                "Cannot create file-backed shared memory with size 0"
-            ));
-        }
-
-        if !len.is_multiple_of(page_size::get()) {
-            return Err(new_error!(
-                "file length {} must be a multiple of PAGE_SIZE",
-                len
+        if len == 0 || !len.is_multiple_of(page_size::get()) {
+            return Err(SharedMemoryError::MemoryRequest(
+                len,
+                0,
+                usize::MAX,
+                page_size::get(),
             ));
         }
 
@@ -1546,10 +1616,11 @@ impl ReadonlySharedMemory {
             || guest_mapped_size > len
             || !guest_mapped_size.is_multiple_of(page_size::get())
         {
-            return Err(new_error!(
-                "guest_mapped_size {} must be a non-zero multiple of PAGE_SIZE no greater than file length {}",
+            return Err(SharedMemoryError::MemoryRequest(
                 guest_mapped_size,
-                len
+                0,
+                len,
+                page_size::get(),
             ));
         }
 
@@ -1574,9 +1645,14 @@ impl ReadonlySharedMemory {
             mmap, off_t, size_t,
         };
 
-        let total_size = len.checked_add(2 * page_size::get()).ok_or_else(|| {
-            new_error!("Memory required for file-backed mapping exceeded usize::MAX")
-        })?;
+        let total_size =
+            len.checked_add(2 * page_size::get())
+                .ok_or(SharedMemoryError::MemoryRequest(
+                    len,
+                    0,
+                    usize::MAX - 2 * page_size::get(),
+                    1,
+                ))?;
 
         let fd = file.as_raw_fd();
 
@@ -1596,7 +1672,7 @@ impl ReadonlySharedMemory {
             )
         };
         if base == MAP_FAILED {
-            return Err(HyperlightError::MmapFailed(
+            return Err(SharedMemoryError::MmapFailed(
                 std::io::Error::last_os_error().raw_os_error(),
             ));
         }
@@ -1636,7 +1712,7 @@ impl ReadonlySharedMemory {
             )
         };
         if mapped == MAP_FAILED {
-            return Err(HyperlightError::MmapFailed(
+            return Err(SharedMemoryError::MmapFailed(
                 std::io::Error::last_os_error().raw_os_error(),
             ));
         }
@@ -1655,9 +1731,14 @@ impl ReadonlySharedMemory {
     fn map_file(file: &std::fs::File, len: usize) -> Result<Arc<HostMapping>> {
         use std::os::windows::io::AsRawHandle;
 
-        let total_size = len.checked_add(2 * page_size::get()).ok_or_else(|| {
-            new_error!("Memory required for file-backed mapping exceeded usize::MAX")
-        })?;
+        let total_size =
+            len.checked_add(2 * page_size::get())
+                .ok_or(SharedMemoryError::MemoryRequest(
+                    len,
+                    0,
+                    usize::MAX - 2 * page_size::get(),
+                    1,
+                ))?;
 
         let file_handle = HANDLE(file.as_raw_handle());
 
@@ -1677,7 +1758,7 @@ impl ReadonlySharedMemory {
         let raw_handle =
             unsafe { CreateFileMappingA(file_handle, None, PAGE_READONLY, 0, 0, PCSTR::null()) }?;
         if raw_handle.is_invalid() {
-            log_then_return!(HyperlightError::MemoryAllocationFailed(
+            log_then_return!(SharedMemoryError::MemoryAllocationFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
@@ -1773,9 +1854,7 @@ impl SharedMemory for ReadonlySharedMemory {
         &mut self,
         _: F,
     ) -> Result<T> {
-        Err(new_error!(
-            "Cannot take exclusive access to a ReadonlySharedMemory"
-        ))
+        Err(SharedMemoryError::ReadonlySharedMemoryExclusiveRequest)
     }
     // However, just access to the contents as a slice is doable
     fn with_contents<T, F: FnOnce(&[u8]) -> T>(&mut self, f: F) -> Result<T> {
@@ -1796,8 +1875,7 @@ mod tests {
 
     #[cfg(not(miri))]
     use super::HostSharedMemory;
-    use super::{ExclusiveSharedMemory, SharedMemory};
-    use crate::Result;
+    use super::{ExclusiveSharedMemory, Result, SharedMemory};
     #[cfg(not(miri))]
     use crate::mem::shared_mem_tests::read_write_test_suite;
 
@@ -2593,7 +2671,7 @@ mod tests {
             let tmp = make_temp_file(0);
             let err = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
                 .expect_err("empty file should be rejected");
-            assert!(format!("{}", err).contains("size 0"));
+            assert!(format!("{}", err).contains("0x0 < 0x0"));
         }
 
         #[test]
@@ -2601,7 +2679,11 @@ mod tests {
             let tmp = make_temp_file(page_size::get() + 1);
             let err = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
                 .expect_err("unaligned file length should be rejected");
-            assert!(format!("{}", err).contains("multiple of PAGE_SIZE"));
+            assert!(format!("{}", err).contains(&format!(
+                "0x{:x} % 0x{:x} = 0",
+                page_size::get() + 1,
+                page_size::get()
+            )));
         }
 
         #[test]
@@ -2609,7 +2691,7 @@ mod tests {
             let tmp = make_temp_file(page_size::get());
             let err = ReadonlySharedMemory::from_file(tmp.as_file(), 0)
                 .expect_err("zero guest_mapped_size should be rejected");
-            assert!(format!("{}", err).contains("guest_mapped_size"));
+            assert!(format!("{}", err).contains("0x0 < 0x0"));
         }
 
         #[test]
@@ -2617,7 +2699,11 @@ mod tests {
             let tmp = make_temp_file(2 * page_size::get());
             let err = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get() + 1)
                 .expect_err("unaligned guest_mapped_size should be rejected");
-            assert!(format!("{}", err).contains("guest_mapped_size"));
+            assert!(format!("{}", err).contains(&format!(
+                "0x{:x} % 0x{:x} = ",
+                page_size::get() + 1,
+                page_size::get()
+            )));
         }
 
         #[test]
@@ -2625,7 +2711,11 @@ mod tests {
             let tmp = make_temp_file(page_size::get());
             let err = ReadonlySharedMemory::from_file(tmp.as_file(), 2 * page_size::get())
                 .expect_err("guest_mapped_size > file length should be rejected");
-            assert!(format!("{}", err).contains("guest_mapped_size"));
+            assert!(format!("{}", err).contains(&format!(
+                "0x{:x} <= 0x{:x}",
+                2 * page_size::get(),
+                page_size::get()
+            )));
         }
 
         /// Tests in this submodule are `#[ignore]`'d because each one

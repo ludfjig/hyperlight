@@ -178,7 +178,7 @@ pub(crate) enum VmExit {
 }
 
 /// VM error
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum VmError {
     #[error("Failed to create vm: {0}")]
     CreateVm(#[from] CreateVmError),
@@ -241,7 +241,7 @@ pub enum CreateVmError {
 }
 
 /// RunVCPU error
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum RunVcpuError {
     #[error("Failed to decode message type: {0}")]
     DecodeIOMessage(u32),
@@ -343,7 +343,7 @@ pub enum RegisterError {
     ConversionFailed(String),
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ResetVcpuError {
     #[error("Single-operation vcpu reset not supported on this hypervisor")]
     NotSupported,
@@ -356,7 +356,7 @@ pub enum ResetVcpuError {
 }
 
 /// Map memory error
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum MapMemoryError {
     #[cfg(target_os = "windows")]
     #[error("Address conversion failed: {0}")]
@@ -381,7 +381,7 @@ pub enum MapMemoryError {
 }
 
 /// Unmap memory error
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum UnmapMemoryError {
     #[error("Hypervisor error: {0}")]
     Hypervisor(HypervisorError),

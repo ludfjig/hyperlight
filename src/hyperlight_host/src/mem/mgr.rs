@@ -390,10 +390,12 @@ impl SandboxMemoryManager<HostSharedMemory> {
     /// Reads a host function call from memory
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn get_host_function_call(&mut self) -> Result<FunctionCall> {
-        self.scratch_mem.try_pop_buffer_into::<FunctionCall>(
-            self.layout.get_output_data_buffer_scratch_host_offset(),
-            self.layout.output_data_size(),
-        )
+        self.scratch_mem
+            .try_pop_buffer_into::<FunctionCall>(
+                self.layout.get_output_data_buffer_scratch_host_offset(),
+                self.layout.output_data_size(),
+            )
+            .map_err(From::from)
     }
 
     /// Writes a host function call result to memory
@@ -405,11 +407,13 @@ impl SandboxMemoryManager<HostSharedMemory> {
         let mut builder = FlatBufferBuilder::new();
         let data = res.encode(&mut builder);
 
-        self.scratch_mem.push_buffer(
-            self.layout.get_input_data_buffer_scratch_host_offset(),
-            self.layout.input_data_size(),
-            data,
-        )
+        self.scratch_mem
+            .push_buffer(
+                self.layout.get_input_data_buffer_scratch_host_offset(),
+                self.layout.input_data_size(),
+                data,
+            )
+            .map_err(From::from)
     }
 
     /// Writes a guest function call to memory
@@ -434,19 +438,23 @@ impl SandboxMemoryManager<HostSharedMemory> {
     /// A function call result can be either an error or a successful return value.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn get_guest_function_call_result(&mut self) -> Result<FunctionCallResult> {
-        self.scratch_mem.try_pop_buffer_into::<FunctionCallResult>(
-            self.layout.get_output_data_buffer_scratch_host_offset(),
-            self.layout.output_data_size(),
-        )
+        self.scratch_mem
+            .try_pop_buffer_into::<FunctionCallResult>(
+                self.layout.get_output_data_buffer_scratch_host_offset(),
+                self.layout.output_data_size(),
+            )
+            .map_err(From::from)
     }
 
     /// Read guest log data from the `SharedMemory` contained within `self`
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn read_guest_log_data(&mut self) -> Result<GuestLogData> {
-        self.scratch_mem.try_pop_buffer_into::<GuestLogData>(
-            self.layout.get_output_data_buffer_scratch_host_offset(),
-            self.layout.output_data_size(),
-        )
+        self.scratch_mem
+            .try_pop_buffer_into::<GuestLogData>(
+                self.layout.get_output_data_buffer_scratch_host_offset(),
+                self.layout.output_data_size(),
+            )
+            .map_err(From::from)
     }
 
     pub(crate) fn clear_io_buffers(&mut self) {
@@ -527,7 +535,9 @@ impl SandboxMemoryManager<HostSharedMemory> {
     fn update_scratch_bookkeeping_item(&mut self, offset: u64, value: u64) -> Result<()> {
         let scratch_size = self.scratch_mem.mem_size();
         let base_offset = scratch_size - offset as usize;
-        self.scratch_mem.write::<u64>(base_offset, value)
+        self.scratch_mem
+            .write::<u64>(base_offset, value)
+            .map_err(From::from)
     }
 
     fn update_scratch_bookkeeping(&mut self) -> Result<()> {

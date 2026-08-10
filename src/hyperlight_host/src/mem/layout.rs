@@ -158,7 +158,7 @@ pub(crate) trait ReadableSharedMemory {
 #[cfg(readable_shared_mem)]
 impl ReadableSharedMemory for &HostSharedMemory {
     fn copy_to_slice(&self, slice: &mut [u8], offset: usize) -> Result<()> {
-        HostSharedMemory::copy_to_slice(self, slice, offset)
+        Ok(HostSharedMemory::copy_to_slice(self, slice, offset)?)
     }
 }
 /// Coherence workaround for the blanket impl below.

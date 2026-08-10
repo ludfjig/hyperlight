@@ -42,9 +42,6 @@ pub enum HyperlightError {
     /// Anyhow error
     #[error("Anyhow Error was returned: {0}")]
     AnyhowError(#[from] anyhow::Error),
-    /// Memory access out of bounds
-    #[error("Offset: {0} out of bounds, Max is: {1}")]
-    BoundsCheckFailed(u64, usize),
 
     /// Checked Add Overflow
     #[error("Couldn't add offset to base address. Offset: {0}, Base Address: {1}")]
@@ -154,18 +151,6 @@ pub enum HyperlightError {
     #[error("Memory Access Violation at address {0:#x} of type {1}, but memory is marked as {2}")]
     MemoryAccessViolation(u64, MemoryRegionFlags, MemoryRegionFlags),
 
-    /// Memory Allocation Failed.
-    #[error("Memory Allocation Failed with OS Error {0:?}.")]
-    MemoryAllocationFailed(Option<i32>),
-
-    /// Memory Protection Failed
-    #[error("Memory Protection Failed with OS Error {0:?}.")]
-    MemoryProtectionFailed(Option<i32>),
-
-    /// Memory region size mismatch
-    #[error("Memory region size mismatch: host size {0:?}, guest size {1:?} region {2:?}")]
-    MemoryRegionSizeMismatch(usize, usize, String),
-
     /// The memory request exceeds the maximum size allowed
     #[error("Memory requested {0} exceeds maximum size allowed {1}")]
     MemoryRequestTooBig(usize, usize),
@@ -178,14 +163,6 @@ pub enum HyperlightError {
     /// Metric Not Found.
     #[error("Metric Not Found {0:?}.")]
     MetricNotFound(&'static str),
-
-    /// mmap Failed.
-    #[error("mmap failed with os error {0:?}")]
-    MmapFailed(Option<i32>),
-
-    /// mprotect Failed.
-    #[error("mprotect failed with os error {0:?}")]
-    MprotectFailed(Option<i32>),
 
     /// No Hypervisor was found for Sandbox.
     #[error("No Hypervisor was found for Sandbox")]
@@ -239,6 +216,10 @@ pub enum HyperlightError {
     /// Failed to get value from return value
     #[error("Failed To Convert Return Value {0:?} to {1:?}")]
     ReturnValueConversionFailure(ReturnValue, &'static str),
+
+    /// Error creating or operating on memory shared with the guest
+    #[error("Failed to execute shared memory operation: {0}")]
+    SharedMemory(#[from] crate::mem::shared_mem::SharedMemoryError),
 
     /// Tried to restore a snapshot into a sandbox whose memory
     /// layout is not compatible with the snapshot's.
@@ -347,7 +328,6 @@ impl HyperlightError {
             | HyperlightError::PoisonedSandbox
             | HyperlightError::ExecutionAccessViolation(_)
             | HyperlightError::MemoryAccessViolation(_, _, _)
-            | HyperlightError::MemoryRegionSizeMismatch(_, _, _)
             // HyperlightVmError::Restore is already handled manually in restore(), but we mark it
             // as poisoning here too for defense in depth.
             | HyperlightError::HyperlightVmError(HyperlightVmError::Restore(_)) => true,
@@ -365,7 +345,6 @@ impl HyperlightError {
 
             // All other errors do not poison the sandbox.
             HyperlightError::AnyhowError(_)
-            | HyperlightError::BoundsCheckFailed(_, _)
             | HyperlightError::CheckedAddOverflow(_, _)
             | HyperlightError::CStringConversionError(_)
             | HyperlightError::Error(_)
@@ -386,13 +365,9 @@ impl HyperlightError {
             | HyperlightError::InvalidFlatBuffer(_)
             | HyperlightError::JsonConversionFailure(_)
             | HyperlightError::LockAttemptFailed(_)
-            | HyperlightError::MemoryAllocationFailed(_)
-            | HyperlightError::MemoryProtectionFailed(_)
             | HyperlightError::MemoryRequestTooBig(_, _)
             | HyperlightError::MemoryRequestTooSmall(_, _)
             | HyperlightError::MetricNotFound(_)
-            | HyperlightError::MmapFailed(_)
-            | HyperlightError::MprotectFailed(_)
             | HyperlightError::NoHypervisorFound()
             | HyperlightError::NoMemorySnapshot
             | HyperlightError::ParameterValueConversionFailure(_, _)
@@ -409,7 +384,8 @@ impl HyperlightError {
             | HyperlightError::UnexpectedParameterValueType(_, _)
             | HyperlightError::UnexpectedReturnValueType(_, _)
             | HyperlightError::UTF8StringConversionFailure(_)
-            | HyperlightError::VectorCapacityIncorrect(_, _, _) => false,
+            | HyperlightError::VectorCapacityIncorrect(_, _, _)
+            | HyperlightError::SharedMemory(_) => false,
 
             #[cfg(target_os = "windows")]
             HyperlightError::CrossBeamReceiveError(_) => false,
