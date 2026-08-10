@@ -81,7 +81,7 @@ impl HyperlightVm {
         #[cfg(crashdump)] rt_cfg: SandboxRuntimeConfig,
         #[cfg(feature = "mem_profile")] trace_info: MemTraceInfo,
     ) -> std::result::Result<Self, CreateHyperlightVmError> {
-        let vm: BoxedVm = match get_available_hypervisor() {
+        let mut vm: BoxedVm = match get_available_hypervisor() {
             #[cfg(kvm)]
             Some(HypervisorType::Kvm) => {
                 let kvm_vm = KvmVm::new().map_err(VmError::CreateVm)?;
