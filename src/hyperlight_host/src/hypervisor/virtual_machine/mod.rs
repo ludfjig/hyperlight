@@ -121,6 +121,10 @@ pub(crate) const XSAVE_MIN_SIZE: usize = 576;
 #[cfg(all(any(kvm, mshv3), test, not(target_arch = "aarch64")))]
 pub(crate) const XSAVE_BUFFER_SIZE: usize = 4096;
 
+/// Architectural XCR0 reset value. Only x87 state is enabled.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const XCR0_RESET: u64 = 1;
+
 // Compiler error if no hypervisor type is available (not applicable on aarch64 yet)
 #[cfg(not(any(kvm, mshv3, target_os = "windows", target_arch = "aarch64")))]
 compile_error!(
@@ -271,6 +275,15 @@ pub enum RegisterError {
     GetXsave(HypervisorError),
     #[error("Failed to set xsave: {0}")]
     SetXsave(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to get XCRs: {0}")]
+    GetXcrs(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to set XCRs: {0}")]
+    SetXcrs(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Hypervisor did not return XCR0")]
+    MissingXcr0,
     #[error("Xsave size mismatch: expected {expected} bytes, got {actual}")]
     XsaveSizeMismatch {
         /// Expected size in bytes
@@ -446,6 +459,11 @@ pub(crate) trait VirtualMachine: Debug + Send {
     #[cfg(test)]
     #[cfg(not(target_arch = "aarch64"))]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError>;
+
+    #[cfg(all(test, target_arch = "x86_64"))]
+    fn xcr0(&self) -> std::result::Result<u64, RegisterError>;
+    #[cfg(target_arch = "x86_64")]
+    fn set_xcr0(&self, value: u64) -> std::result::Result<(), RegisterError>;
 
     /// Single-operation vCPU reset
     #[cfg(target_arch = "aarch64")]

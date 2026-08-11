@@ -26,7 +26,7 @@ use mshv_bindings::LapicState;
 #[cfg(gdb)]
 use mshv_bindings::{DebugRegisters, hv_message_type_HVMSG_X64_EXCEPTION_INTERCEPT};
 use mshv_bindings::{
-    FloatingPointUnit, HV_X64_REGISTER_CLASS_IP, SpecialRegisters, StandardRegisters, XSave,
+    FloatingPointUnit, HV_X64_REGISTER_CLASS_IP, SpecialRegisters, StandardRegisters, XSave, Xcrs,
     hv_message_type, hv_message_type_HVMSG_GPA_INTERCEPT, hv_message_type_HVMSG_UNMAPPED_GPA,
     hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT,
     hv_partition_property_code_HV_PARTITION_PROPERTY_SYNTHETIC_PROC_FEATURES,
@@ -610,6 +610,20 @@ impl VirtualMachine for MshvVm {
             .set_xsave(&buf)
             .map_err(|e| RegisterError::SetXsave(e.into()))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn xcr0(&self) -> std::result::Result<u64, RegisterError> {
+        self.vcpu_fd
+            .get_xcrs()
+            .map(|xcrs| xcrs.xcr0)
+            .map_err(|e| RegisterError::GetXcrs(e.into()))
+    }
+
+    fn set_xcr0(&self, value: u64) -> std::result::Result<(), RegisterError> {
+        self.vcpu_fd
+            .set_xcrs(&Xcrs { xcr0: value })
+            .map_err(|e| RegisterError::SetXcrs(e.into()))
     }
 
     #[cfg(test)]

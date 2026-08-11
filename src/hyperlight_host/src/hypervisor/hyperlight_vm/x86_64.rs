@@ -48,7 +48,7 @@ use crate::hypervisor::virtual_machine::mshv::MshvVm;
 #[cfg(target_os = "windows")]
 use crate::hypervisor::virtual_machine::whp::WhpVm;
 use crate::hypervisor::virtual_machine::{
-    HypervisorType, RegisterError, VmError, get_available_hypervisor,
+    HypervisorType, RegisterError, VmError, XCR0_RESET, get_available_hypervisor,
 };
 #[cfg(target_os = "windows")]
 use crate::hypervisor::{PartitionState, WindowsInterruptHandle};
@@ -371,6 +371,7 @@ impl HyperlightVm {
     /// - General purpose registers
     /// - Debug registers
     /// - XSAVE (includes FPU/SSE state with proper FCW and MXCSR defaults)
+    /// - XCR0
     /// - Special registers (restored from snapshot, with CR3 updated to new page table location)
     // TODO: check if other state needs to be reset
     pub(crate) fn reset_vcpu(
@@ -384,6 +385,7 @@ impl HyperlightVm {
         })?;
         self.vm.set_debug_regs(&CommonDebugRegs::default())?;
         self.vm.reset_xsave()?;
+        self.vm.set_xcr0(XCR0_RESET)?;
 
         self.apply_sregs(cr3, sregs)?;
 
@@ -1625,6 +1627,7 @@ mod tests {
         let xsave = dirty_xsave(&current_xsave);
         let debug_regs = dirty_debug_regs();
 
+        hyperlight_vm.vm.set_xcr0(3).unwrap();
         hyperlight_vm.vm.set_xsave(&xsave).unwrap();
         hyperlight_vm.vm.set_regs(&regs).unwrap();
         hyperlight_vm.vm.set_fpu(&fpu).unwrap();
@@ -1675,6 +1678,7 @@ mod tests {
         let mut expected_sregs = sregs;
         normalize_sregs_hidden_cache(&mut expected_sregs, &got_sregs);
         assert_eq!(got_sregs, expected_sregs);
+        assert_eq!(hyperlight_vm.vm.xcr0().unwrap(), 3);
 
         // Reset the vCPU
         hyperlight_vm.reset_vcpu(0, &default_sregs()).unwrap();
@@ -1687,6 +1691,8 @@ mod tests {
 
         // Verify debug registers are reset to defaults
         assert_debug_regs_reset(hyperlight_vm.vm.as_ref());
+
+        assert_eq!(hyperlight_vm.vm.xcr0().unwrap(), XCR0_RESET);
 
         // Verify xsave is reset - should be zeroed except for hypervisor-specific fields
         let reset_xsave = hyperlight_vm.vm.xsave().unwrap();

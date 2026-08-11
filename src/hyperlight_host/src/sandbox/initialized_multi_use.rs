@@ -1944,6 +1944,30 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn snapshot_restore_resets_xcr0() {
+        let mut sandbox: MultiUseSandbox = {
+            let path = simple_guest_as_pathbuf();
+            let u_sbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
+            u_sbox.evolve().unwrap()
+        };
+
+        assert_eq!(sandbox.call::<u64>("ReadXcr0", ()).unwrap(), 1);
+        let snapshot = sandbox.snapshot().unwrap();
+
+        sandbox.call::<()>("WriteXcr0", 3u64).unwrap();
+        assert_eq!(sandbox.call::<u64>("ReadXcr0", ()).unwrap(), 3);
+
+        sandbox.restore(snapshot).unwrap();
+
+        assert_eq!(
+            sandbox.call::<u64>("ReadXcr0", ()).unwrap(),
+            1,
+            "restore must reset XCR0"
+        );
+    }
+
     /// Test that stale abort buffer bytes from a previous call don't
     /// leak into the next call.
     #[test]
