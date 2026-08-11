@@ -77,7 +77,7 @@ pub fn host_bindgen(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             rtypes::emit_toplevel(s, &kebab_name, ct);
             host::emit_toplevel(s, &kebab_name, ct);
         });
-        util::emit_decls(decls).into()
+        util::emit_decls(decls, &kebab_name).into()
     })
 }
 
@@ -106,7 +106,7 @@ pub fn guest_bindgen(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
         // stream directly and emitting an include!() pointing at a
         // temporary file, depending on whether the user has requested
         // a debug temporary file be created.
-        util::emit_decls(decls).into()
+        util::emit_decls(decls, &kebab_name).into()
     })
 }
 
