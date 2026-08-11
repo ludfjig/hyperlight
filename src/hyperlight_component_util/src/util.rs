@@ -21,6 +21,7 @@ use crate::etypes;
 #[derive(Debug)]
 pub enum WitSource {
     Wasm(std::path::PathBuf),
+    Wat(std::path::PathBuf),
     Wit(std::path::PathBuf),
     Inline(String),
 }
@@ -44,6 +45,16 @@ impl WitSource {
                 }
                 bytes
             }
+            Self::Wat(path) => {
+                let path = manifest_path(&path);
+                let bytes = wat::parse_file(&path).unwrap_or_else(|err| {
+                    panic!("failed to read wat input '{}': {err:#}", path.display());
+                });
+                if !wasmparser::Parser::is_component(&bytes) {
+                    panic!("wat input '{}' is not a wasm component", path.display());
+                }
+                bytes
+            }
             Self::Wit(path) => {
                 let path = manifest_path(&path);
                 let mut resolve = wit_parser::Resolve::default();
@@ -59,14 +70,33 @@ impl WitSource {
                 })
             }
             Self::Inline(contents) => {
-                let mut resolve = wit_parser::Resolve::default();
-                let package = resolve
-                    .push_str("inline.wit", &contents)
-                    .unwrap_or_else(|err| panic!("failed to parse inline WIT input: {err:#}"));
-
-                wit_component::encode(&resolve, package).unwrap_or_else(|err| {
-                    panic!("failed to encode inline WIT input as a wasm component type: {err:#}")
-                })
+                match wat::Detect::from_bytes(&contents) {
+                    wat::Detect::WasmBinary => {
+                        panic!("inline component type looks like a binary!")
+                    }
+                    wat::Detect::WasmText => {
+                        let bytes = wat::parse_str(&contents).unwrap_or_else(|err| {
+                            panic!("failed to read inline wat input: {err:#}")
+                        });
+                        if !wasmparser::Parser::is_component(&bytes) {
+                            panic!("inline wat input is not a wasm component");
+                        }
+                        bytes
+                    }
+                    wat::Detect::Unknown => {
+                        // It's probably WIT
+                        let mut resolve = wit_parser::Resolve::default();
+                        let package =
+                            resolve
+                                .push_str("inline.wit", &contents)
+                                .unwrap_or_else(|err| {
+                                    panic!("failed to parse inline WIT input: {err:#}")
+                                });
+                        wit_component::encode(&resolve, package).unwrap_or_else(|err| {
+                            panic!("failed to encode inline WIT input as a wasm component type: {err:#}")
+                        })
+                    }
+                }
             }
         }
     }

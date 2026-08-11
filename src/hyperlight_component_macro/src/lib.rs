@@ -129,7 +129,7 @@ fn unknown_key_error(key: &Ident) -> syn::Error {
     syn::Error::new(
         key.span(),
         format!(
-            "unknown parameter '{}'; expected 'path', 'wit', 'wasm', 'inline', 'world', or 'world_name'",
+            "unknown parameter '{}'; expected 'path', 'wit', 'wasm', 'wat', 'inline', 'world', or 'world_name'",
             key
         ),
     )
@@ -144,6 +144,9 @@ fn source_from_key(key: &Ident, value: LitStr) -> Result<util::WitSource> {
             value.value(),
         ))),
         "wasm" => Ok(util::WitSource::Wasm(std::path::PathBuf::from(
+            value.value(),
+        ))),
+        "wat" => Ok(util::WitSource::Wat(std::path::PathBuf::from(
             value.value(),
         ))),
         "inline" => Ok(util::WitSource::Inline(value.value())),
@@ -170,7 +173,7 @@ impl Parse for BindgenInputParams {
                         let value: LitStr = content.parse()?;
                         world_name = Some(value.value());
                     }
-                    "path" | "wit" | "wasm" | "inline" => {
+                    "path" | "wit" | "wasm" | "wat" | "inline" => {
                         let value: LitStr = content.parse()?;
                         if source.is_some() {
                             return Err(syn::Error::new(
@@ -193,7 +196,7 @@ impl Parse for BindgenInputParams {
             let value: LitStr = input.parse()?;
             match key.to_string().as_str() {
                 "world" | "world_name" => world_name = Some(value.value()),
-                "path" | "wit" | "wasm" | "inline" => {
+                "path" | "wit" | "wasm" | "wat" | "inline" => {
                     source = Some(source_from_key(&key, value)?);
                 }
                 _ => return Err(unknown_key_error(&key)),
