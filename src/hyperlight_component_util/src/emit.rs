@@ -375,8 +375,35 @@ pub struct State<'a, 'b> {
     /// implements the imports of a component
     pub import_param_var: Option<Ident>,
     /// The Rust type parameter used to represent the current Rust
-    /// state type
-    pub self_param_var: Option<Ident>,
+    /// state type. In particular, this should let one find a `Self`
+    /// which Rust understands to be an impl of the instance trait
+    /// that `s.origin` refers to.
+    ///
+    /// # Note \[Origin paths and self parameters in impl codegen for higher-order components\]
+    ///
+    /// When extending impl (host.rs/guest.rs, as opposed to
+    /// rtypes.rs) codegen to higher-order components, it's not
+    /// entirely clear whether we should have this/the origin path
+    /// always refer to the true root component, or just to the
+    /// nearest component in which we are currently working.  At first
+    /// glance, updating the origin path at all during impl codegen
+    /// seems like a bad idea, since the impl should be instantiating
+    /// the Rust tyvars and can't generate new ones for
+    /// non-locally-defined types the way that rtypes codegen
+    /// can. However, it may be the case that referring to a tyvar
+    /// that does not follow our local definedness rules at the
+    /// granularity of components will be impossible due to the
+    /// `outer_boundary` rules! If this does turn out to be the case,
+    /// then updating `origin` on every instance the way that rtypes
+    /// does will still be a bad idea, but we might want to consider
+    /// updating it once per /component/.
+    ///
+    /// Whether or not `origin` gets updated, the trait bounds in
+    /// `self_param_var` need to match this. Currently, code in
+    /// host.rs/guest.rs does not update `origin`, but does update
+    /// `self_param_var`, which will need to be fixed when extending
+    /// higher-order component bindings generation to impls.
+    pub self_param_var: Option<TokenStream>,
     /// Whether we are emitting an implementation of the component
     /// interfaces, or just the types of the interface
     pub is_impl: bool,

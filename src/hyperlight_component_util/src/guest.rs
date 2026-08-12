@@ -146,21 +146,15 @@ fn emit_import_instance<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, it: &
         .map(|ed| emit_import_extern_decl(&mut s, ed))
         .collect::<Vec<_>>();
 
-    let ns = wn.namespace_path();
-    let nsi = wn.namespace_idents();
-    let trait_name = kebab_to_type(wn.name);
-    let r#trait = s.r#trait(&nsi, trait_name.clone());
-    let tvs = r#trait
-        .tvs
+    let trait_path = wn
+        .namespace_idents()
         .iter()
-        .map(|(_, (tv, _))| tv.unwrap())
+        .chain(&[kebab_to_type(wn.name)])
+        .cloned()
         .collect::<Vec<_>>();
-    let tvs = tvs
-        .iter()
-        .map(|tv| rtypes::emit_var_ref(&mut s, &Tyvar::Bound(*tv)))
-        .collect::<Vec<_>>();
+    let trait_ref = rtypes::trait_ref(&mut s, true, &trait_path);
     s.root_mod.items.extend(quote! {
-        impl #ns::#trait_name <#(#tvs),*> for Host {
+        impl #trait_ref for Host {
             #(#imports)*
         }
     });
@@ -285,8 +279,13 @@ fn emit_component<'a, 'b, 'c>(
     let r#trait = kebab_to_type(wn.name);
     let import_trait = kebab_to_imports_name(wn.name);
     let export_trait = kebab_to_exports_name(wn.name);
-    s.import_param_var = Some(format_ident!("I"));
-    s.self_param_var = Some(format_ident!("S"));
+    // We don't set s.self_param_var or s.import_param_var at all
+    // here, because they are currently obviated by the (s.is_guest &&
+    // s.is_impl) hack in rtypes::emit_resource_ref. For when we
+    // eventually do:
+    //
+    // See Note [Origin paths and self parameters in impl codegen for higher-order components]
+    // in emit.rs
     s.colliding_import_names = find_colliding_import_names(&ct.imports);
 
     let rtsid = format_ident!("{}Resources", r#trait);
@@ -313,8 +312,14 @@ fn emit_component<'a, 'b, 'c>(
         .iter()
         .map(|ed| emit_import_extern_decl(&mut s, ed))
         .collect::<Vec<_>>();
-
     s.var_offset = 0;
+    // We don't set s.self_param_var or s.import_param_var at all
+    // here, because it is currently obviated by the (s.is_guest &&
+    // s.is_impl) hack in rtypes::emit_resource_ref. For when we
+    // eventually do:
+    //
+    // See Note [Origin paths and self parameters in impl codegen for higher-order components]
+    // in emit.rs
 
     s.is_export = true;
     s.cur_trait = Some(export_trait.clone());

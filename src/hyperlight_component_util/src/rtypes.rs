@@ -39,13 +39,21 @@ use crate::etypes::{
 fn emit_tvis(s: &mut State, tvs: Vec<u32>) -> TokenStream {
     let tvs = tvs
         .iter()
-        .map(|tv| emit_var_ref(s, &Tyvar::Bound(*tv)))
+        .map(|tv| emit_var_ref_noff(s, *tv, false))
         .collect::<Vec<_>>();
     if !tvs.is_empty() {
         quote! { <#(#tvs),*> }
     } else {
         TokenStream::new()
     }
+}
+
+/// Construct a token stream referencing a trait at a given trait path
+pub(crate) fn trait_ref(s: &mut State, absolute: bool, path: &[Ident]) -> TokenStream {
+    let rp = s.root_path();
+    let t = s.resolve_trait_immut(absolute, path);
+    let tvis = emit_tvis(s, t.tv_idxs());
+    quote! { #rp #(#path)::* #tvis }
 }
 
 /// Emit a token stream that references the type of a particular resource
@@ -90,55 +98,47 @@ fn emit_resource_ref(s: &mut State, n: u32, path: Vec<ImportExport>) -> TokenStr
 
     // Generally speaking, the structure that we expect to see in
     // `path` ends in an instance that exports the resource type,
-    // followed by the resource type itself. We locate the resource
-    // trait by using that final instance name directly; any other
-    // names are just used to get to the type that implements it
-    let instance = &path[path.len() - 2];
-    let iwn = split_wit_name(instance.name());
-    let extras = path[0..path.len() - 2]
-        .iter()
-        .map(|p| {
-            let wn = split_wit_name(p.name());
-            if p.imported() && s.colliding_import_names.contains(wn.name) {
-                let (tn, _) = import_member_names(&wn, &s.colliding_import_names);
-                tn
-            } else {
-                kebab_to_type(wn.name)
-            }
-        })
-        .collect::<Vec<_>>();
-    let extras = quote! { #(#extras::)* };
-    let rp = s.root_path();
-    let tns = iwn.namespace_path();
-    let instance_mod = kebab_to_namespace(iwn.name);
-    // Use the disambiguated trait member only for imported instances. Exported
-    // instances must keep their public WIT member names.
-    let instance_type = if instance.imported() {
-        let (tn, _) = import_member_names(&iwn, &s.colliding_import_names);
-        tn
-    } else {
-        kebab_to_type(iwn.name)
-    };
-    let mut sv = quote! { Self };
-    if instance.imported() {
+    // followed by the resource type itself.
+
+    let mut toks = quote! { Self };
+    if path[0].imported() {
         if let Some(iv) = &s.import_param_var {
-            sv = quote! { #iv }
-        };
+            toks = quote! { #iv }
+        }
     } else if let Some(s) = &s.self_param_var {
-        sv = quote! { #s }
-    };
-    let mut trait_path = Vec::new();
-    trait_path.extend(iwn.namespace_idents());
-    trait_path.push(instance_mod.clone());
-    trait_path.push(rtrait.clone());
-    let t = s.resolve_trait_immut(true, &trait_path);
-    let tvis = emit_tvis(s, t.tv_idxs());
-    let trait_ref = if tns.is_empty() {
-        quote! { #rp #instance_mod::#rtrait }
-    } else {
-        quote! { #rp #tns::#instance_mod::#rtrait }
-    };
-    quote! { <#sv::#extras #instance_type as #trait_ref #tvis>::T }
+        toks = quote! { #s }
+    }
+    // todo:this will need a bit of adjustment to work well with
+    // plainname externs, which may require keeping track of the last
+    // interfacename we saw
+    for (i, p) in path[0..path.len() - 1].iter().enumerate() {
+        let iwn = split_wit_name(p.name());
+        let export_name = if p.imported() {
+            import_member_names(&iwn, &s.colliding_import_names).0
+        } else {
+            kebab_to_type(iwn.name)
+        };
+
+        // The final item in the path will be referring to the
+        // relevant resource trait, while the others will be referring
+        // instance traits on the way there. So, we need to treat them
+        // separately.
+        let namespace_suffix = if i == path.len() - 2 {
+            &[kebab_to_namespace(iwn.name), rtrait.clone()] as &[Ident]
+        } else {
+            &[kebab_to_type(iwn.name)] as &[Ident]
+        };
+        let trait_path = iwn
+            .namespace_idents()
+            .iter()
+            .chain(namespace_suffix.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let trait_ref = trait_ref(s, true, &trait_path);
+
+        toks = quote! { <#toks::#export_name as #trait_ref> };
+    }
+    quote! { #toks::T }
 }
 
 /// Try to find a way to refer to the given type variable from the

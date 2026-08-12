@@ -243,3 +243,26 @@ pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
         function_call.function_name.clone(),
     ))
 }
+
+// Tests that bindgen at least compiles for some interesting cases
+// that may not yet be expressible in the WIT syntax
+mod deeply_nested {
+    hyperlight_component_macro::guest_bindgen!({
+        inline: r#"
+            (component
+              (type (export "world") (component
+                (export "test:deeply-nested/world" (component
+                  (import "test:deeply-nested/int1" (instance $I1
+                    (export "test:deeply-nested/int2" (instance
+                      (export "r" (type $R (sub resource)))
+                      (export "f" (func (param "r" (own $R))))))))
+                  (alias export $I1 "test:deeply-nested/int2" (instance $I2))
+                  (alias export $I2 "r" (type $R))
+                  (import "test:deeply-nested/int3" (instance
+                    (export "test:deeply-nested/int4" (instance
+                      (export "r4" (type $R4 (eq $R)))
+                      (export "g" (func (param "r4" (own $R4))))))))
+                  (export "h" (func (param "r" (own $R)))))))))
+        "#,
+    });
+}
