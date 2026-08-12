@@ -18,9 +18,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::emit::{
-    FnName, ResolvedBoundVar, ResourceItemName, State, WitName, find_colliding_import_names,
-    import_member_names, kebab_to_exports_name, kebab_to_fn, kebab_to_getter,
-    kebab_to_imports_name, kebab_to_namespace, kebab_to_type, kebab_to_var, split_wit_name,
+    FnName, ResourceItemName, State, WitName, find_colliding_import_names, import_member_names,
+    kebab_to_exports_name, kebab_to_fn, kebab_to_getter, kebab_to_imports_name, kebab_to_namespace,
+    kebab_to_type, kebab_to_var, split_wit_name,
 };
 use crate::etypes::{Component, Defined, ExternDecl, ExternDesc, Handleable, Instance, Tyvar};
 use crate::hl::{
@@ -99,10 +99,11 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
         ExternDesc::Type(t) => match t {
             Defined::Handleable(Handleable::Var(Tyvar::Bound(b))) => {
                 // only resources need something emitted
-                let ResolvedBoundVar::Resource { rtidx } = s.resolve_bound_var(*b) else {
+                let noff = (s.var_offset as u32 + b) as usize;
+                let crate::etypes::TypeBound::SubResource = &s.bound_vars[noff].bound else {
                     return quote! {};
                 };
-                let rtid = format_ident!("HostResource{}", rtidx as usize);
+                let rtid = format_ident!("HostResource{}", noff);
                 let path = s.resource_trait_path(kebab_to_type(ed.kebab_name));
                 s.root_mod
                     .r#impl(path, format_ident!("Host"))
