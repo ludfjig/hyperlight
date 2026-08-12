@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::{Arc, Mutex};
 
+use hyperlight_common::component::{Negative, Positive};
 use hyperlight_common::resource::BorrowedResourceGuard;
 use hyperlight_host::{GuestBinary, MultiUseSandbox, UninitializedSandbox};
 use hyperlight_testing::wit_guest_as_pathbuf;
@@ -66,7 +67,7 @@ impl Clone for Testvariant {
 
 struct Host {}
 
-impl test::wit::Roundtrip for Host {
+impl test::wit::Roundtrip<Negative> for Host {
     fn roundtrip_bool(&mut self, x: bool) -> bool {
         x
     }
@@ -230,7 +231,7 @@ impl Drop for TestResource {
     }
 }
 
-impl test::wit::host_resource::Testresource for Host {
+impl test::wit::host_resource::Testresource<Negative> for Host {
     type T = Arc<Mutex<TestResource>>;
     fn new(&mut self, x: String, last: char) -> Self::T {
         TestResource::new(x, last)
@@ -262,7 +263,7 @@ impl test::wit::host_resource::Testresource for Host {
     }
 }
 
-impl test::wit::HostResource for Host {
+impl test::wit::HostResource<Negative> for Host {
     fn roundtrip_own(&mut self, owned: Arc<Mutex<TestResource>>) -> Arc<Mutex<TestResource>> {
         owned
     }
@@ -273,7 +274,7 @@ impl test::wit::HostResource for Host {
 }
 
 #[allow(refining_impl_trait)]
-impl test::wit::TestImports for Host {
+impl test::wit::TestImports<Negative> for Host {
     type Roundtrip = Self;
     fn roundtrip(&mut self) -> &mut Self {
         self
@@ -482,6 +483,7 @@ mod bindgen_test_case_bindings {
     hyperlight_component_macro::host_bindgen!(wit: "../tests/rust_guests/witguest/bindgen-test-cases");
 }
 mod bindgen_test_cases {
+    use super::{Negative, Positive};
     use crate::bindgen_test_case_bindings::*;
 
     #[test]
@@ -495,7 +497,7 @@ mod bindgen_test_cases {
     #[allow(dead_code)]
     struct ExportHost;
 
-    impl test::bindgen_test_cases::Executor for ExportHost {
+    impl test::bindgen_test_cases::Executor<Positive> for ExportHost {
         fn execute(&mut self) -> test::bindgen_test_cases::executor::ExecutionResult {
             test::bindgen_test_cases::executor::ExecutionResult {
                 message: String::from("executed"),
@@ -503,7 +505,7 @@ mod bindgen_test_cases {
         }
     }
 
-    impl test::bindgen_test_cases::Types for ExportHost {
+    impl test::bindgen_test_cases::Types<Positive> for ExportHost {
         fn get_status(&mut self) -> test::bindgen_test_cases::types::Status {
             test::bindgen_test_cases::types::Status {
                 message: String::from("ok"),
@@ -511,8 +513,11 @@ mod bindgen_test_cases {
         }
     }
 
-    impl test::bindgen_test_cases::UsesExportedTypes<test::bindgen_test_cases::types::Status>
-        for ExportHost
+    impl
+        test::bindgen_test_cases::UsesExportedTypes<
+            Positive,
+            test::bindgen_test_cases::types::Status,
+        > for ExportHost
     {
         fn get_status(&mut self) -> test::bindgen_test_cases::types::Status {
             test::bindgen_test_cases::types::Status {
@@ -522,8 +527,8 @@ mod bindgen_test_cases {
     }
 
     #[allow(refining_impl_trait)]
-    impl<I: test::bindgen_test_cases::BindgenTestCasesImports + Send>
-        test::bindgen_test_cases::BindgenTestCasesExports<I> for ExportHost
+    impl<I: test::bindgen_test_cases::BindgenTestCasesImports<Negative> + Send>
+        test::bindgen_test_cases::BindgenTestCasesExports<Positive, I> for ExportHost
     {
         type Executor = Self;
         fn executor(&mut self) -> &mut Self {
@@ -589,6 +594,26 @@ mod deeply_nested {
                       (export "r4" (type $R4 (eq $R)))
                       (export "g" (func (param "r4" (own $R4))))))))
                   (export "h" (func (param "r" (own $R)))))))))
+        "#,
+    });
+}
+
+mod imports_exports_same_interface_with_host_resource {
+    hyperlight_component_macro::host_bindgen!({
+        inline: r#"
+          (component
+            (type (export "world") (component
+              (export "test:rie/world" (component
+                (import "test:rie/definer" (instance $DI
+                  (export "r" (type $R (sub resource)))
+                  (export "f" (func (param "r" (own $R))))))
+                (alias export $DI "r" (type $R))
+                (import "test:rie/user" (instance
+                  (export "r2" (type $R2 (eq $R)))
+                  (export "g" (func (param "r" (borrow $R2))))))
+                (export "test:rie/user" (instance
+                  (export "r2" (type $R2 (eq $R)))
+                  (export "g" (func (param "r" (borrow $R2)))))))))))
         "#,
     });
 }

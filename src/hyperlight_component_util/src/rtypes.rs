@@ -33,26 +33,51 @@ use crate::etypes::{
     Param, TypeBound, Tyvar, Value,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EmitPositivity {
+    Same,
+    Opposite,
+}
+impl EmitPositivity {
+    fn invert(self) -> Self {
+        match self {
+            EmitPositivity::Same => EmitPositivity::Opposite,
+            EmitPositivity::Opposite => EmitPositivity::Same,
+        }
+    }
+}
+
 /// When referring to an instance or resource trait, emit a token
 /// stream that instantiates any types it is parametrized by with our
 /// own best understanding of how to name the relevant type variables
-fn emit_tvis(s: &mut State, tvs: Vec<u32>) -> TokenStream {
+fn emit_tvis(s: &mut State, ep: EmitPositivity, tvs: Vec<u32>) -> TokenStream {
     let tvs = tvs
         .iter()
         .map(|tv| emit_var_ref_noff(s, *tv, false))
         .collect::<Vec<_>>();
-    if !tvs.is_empty() {
-        quote! { <#(#tvs),*> }
-    } else {
-        TokenStream::new()
+    let p = s.positivity_param.clone().unwrap_or(quote! { P });
+    match ep {
+        EmitPositivity::Same => quote! { <#p #(,#tvs)*> },
+        EmitPositivity::Opposite => {
+            quote! { <<#p as ::hyperlight_common::component::Positivity>::NegativeOfThis #(,#tvs)*> }
+        }
     }
 }
 
 /// Construct a token stream referencing a trait at a given trait path
-pub(crate) fn trait_ref(s: &mut State, absolute: bool, path: &[Ident]) -> TokenStream {
-    let rp = s.root_path();
+pub(crate) fn trait_ref(
+    s: &mut State,
+    ep: EmitPositivity,
+    absolute: bool,
+    path: &[Ident],
+) -> TokenStream {
+    let rp = if absolute {
+        s.root_path()
+    } else {
+        TokenStream::new()
+    };
     let t = s.resolve_trait_immut(absolute, path);
-    let tvis = emit_tvis(s, t.tv_idxs());
+    let tvis = emit_tvis(s, ep, t.tv_idxs());
     quote! { #rp #(#path)::* #tvis }
 }
 
@@ -87,13 +112,17 @@ fn emit_resource_ref(s: &mut State, n: u32, path: Vec<ImportExport>) -> TokenStr
     if path.len() == 1 {
         let helper = s.cur_helper_mod.clone().unwrap();
         let rtrait = kebab_to_type(path[0].name());
-        let t = s.resolve_trait_immut(false, &[helper.clone(), rtrait.clone()]);
-        let tvis = emit_tvis(s, t.tv_idxs());
+        let trait_ref = trait_ref(
+            s,
+            EmitPositivity::Same,
+            false,
+            &[helper.clone(), rtrait.clone()],
+        );
         let mut sv = quote! { Self };
         if let Some(s) = &s.self_param_var {
             sv = quote! { #s };
         };
-        return quote! { <#sv as #helper::#rtrait #tvis>::T };
+        return quote! { <#sv as #trait_ref>::T };
     };
 
     // Generally speaking, the structure that we expect to see in
@@ -108,10 +137,18 @@ fn emit_resource_ref(s: &mut State, n: u32, path: Vec<ImportExport>) -> TokenStr
     } else if let Some(s) = &s.self_param_var {
         toks = quote! { #s }
     }
-    // todo:this will need a bit of adjustment to work well with
+    // todo: this will need a bit of adjustment to work well with
     // plainname externs, which may require keeping track of the last
     // interfacename we saw
+    let mut ep = EmitPositivity::Same;
     for (i, p) in path[0..path.len() - 1].iter().enumerate() {
+        // Don't update ep if the import is the first item on the path
+        // and we don't have a var pointing at a different imports
+        // trait instance, since that means we are in an `Imports`
+        // trait, and our `P` has already been negative'd.
+        if p.imported() && (i != 0 || s.import_param_var.is_some()) {
+            ep = ep.invert();
+        }
         let iwn = split_wit_name(p.name());
         let export_name = if p.imported() {
             import_member_names(&iwn, &s.colliding_import_names).0
@@ -134,7 +171,7 @@ fn emit_resource_ref(s: &mut State, n: u32, path: Vec<ImportExport>) -> TokenStr
             .chain(namespace_suffix.iter())
             .cloned()
             .collect::<Vec<_>>();
-        let trait_ref = trait_ref(s, true, &trait_path);
+        let trait_ref = trait_ref(s, ep, true, &trait_path);
 
         toks = quote! { <#toks::#export_name as #trait_ref> };
     }
@@ -367,11 +404,8 @@ pub fn emit_value(s: &mut State, vt: &Value) -> TokenStream {
                     }
                 } else {
                     let vr = emit_var_ref(s, tv);
-                    if s.is_export {
-                        quote! { &#vr }
-                    } else {
-                        quote! { ::hyperlight_common::resource::BorrowedResourceGuard<#vr> }
-                    }
+                    let p = s.positivity_param.clone().unwrap_or(quote! { P });
+                    quote! { <#p as ::hyperlight_common::component::Positivity>::Borrow<'_, #vr> }
                 }
             }
         },
@@ -653,9 +687,6 @@ fn emit_type_alias<F: Fn(&mut State) -> TokenStream>(
 
 /// Emit (via returning) a Rust trait item corresponding to this
 /// extern decl
-///
-/// See note on emit.rs push_origin for the difference between
-/// origin_was_export and s.is_export.
 fn emit_extern_decl<'a, 'b, 'c>(
     origin_was_export: bool,
     s: &'c mut State<'a, 'b>,
@@ -761,33 +792,20 @@ fn emit_extern_decl<'a, 'b, 'c>(
             let wn = split_wit_name(ed.kebab_name);
             emit_instance(&mut s, wn.clone(), it);
 
-            let nsids = wn.namespace_idents();
-            let repr = s.r#trait(&nsids, kebab_to_type(wn.name));
-            let vs = if !repr.tvs.is_empty() {
-                let vs = repr.tvs.clone();
-                let tvs = vs
-                    .iter()
-                    .map(|(_, (tv, _))| emit_var_ref(&mut s, &Tyvar::Bound(tv.unwrap())));
-                quote! { <#(#tvs),*> }
-            } else {
-                TokenStream::new()
-            };
-
             let (member_tn, member_getter) = if origin_was_export {
                 (kebab_to_type(wn.name), kebab_to_getter(wn.name))
             } else {
                 import_member_names(&wn, &s.colliding_import_names)
             };
-            let rp = s.root_path();
-            let tns = wn.namespace_path();
-            let trait_tn = kebab_to_type(wn.name);
-            let trait_bound = if tns.is_empty() {
-                quote! { #rp #trait_tn }
-            } else {
-                quote! { #rp #tns::#trait_tn }
-            };
+            let trait_path = wn
+                .namespace_idents()
+                .iter()
+                .chain(&[kebab_to_type(wn.name)])
+                .cloned()
+                .collect::<Vec<_>>();
+            let trait_ref = trait_ref(&mut s, EmitPositivity::Same, true, &trait_path);
             quote! {
-                type #member_tn: #trait_bound #vs;
+                type #member_tn: #trait_ref;
                 fn #member_getter(&mut self) -> impl ::core::borrow::BorrowMut<Self::#member_tn>;
             }
         }
@@ -807,58 +825,80 @@ fn emit_instance<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, it: &'c Inst
 
     s.cur_helper_mod = Some(kebab_to_namespace(wn.name));
     s.cur_trait = Some(name.clone());
-    if !s.cur_trait().items.is_empty() {
-        // Temporary hack: we have visited this wit:package/instance
-        // before, so bail out instead of adding duplicates of
-        // everything. Since we don't really have strong semantic
-        // guarantees that the exact same contents will be in each
-        // occurrence of a wit:package/instance (and indeed they may
-        // well be stripped down to the essentials in each
-        // occurrence), this is NOT sound, and will need to be
-        // revisited.  The correct approach here is to change
-        // emit_extern_decl to create function/resource items in a
-        // Trait that can be merged properly, instead of directly
-        // emitting tokens.
-        return;
+
+    // Temporary hack: if some items have already been generated for
+    // this wit:package/instance, implying that we have visited it
+    // before, we use [`State::for_var_effects_only`] to avoid adding
+    // duplicates of everything. We still bother running it, instead
+    // of bailing out entirely, to, as the name implies, get the
+    // effects on the variable tracking---otherwise the "second copy"
+    // of some Eq-bounded type variables will not properly acquire
+    // dependency tracking information.
+    //
+    // Since we don't really have strong semantic guarantees that the
+    // exact same contents will be in each occurrence of a
+    // wit:package/instance (and indeed they may well be stripped down
+    // to the essentials in each occurrence), this is NOT sound, and
+    // will need to be revisited. The really proper approach here is
+    // probably to properly spec some unification/principle type at
+    // the component level and preemptively run it on everything with
+    // the same extern name.
+    fn run_normally<'a, 'b, 'c>(
+        s: &'c mut State<'a, 'b>,
+        f: impl for<'d> FnOnce(&mut State<'d, 'b>),
+    ) {
+        f(s)
     }
-
-    let mut needs_vars = BTreeSet::new();
-    let mut sv = s.with_needs_vars(&mut needs_vars);
-
-    let exports = it
-        .exports
-        .iter()
-        .map(|ed| emit_extern_decl(true, &mut sv, ed))
-        .collect::<Vec<_>>();
-
-    // instantiations for the supertraits
-
-    let mut stvs = BTreeMap::new();
-    let _ = sv.cur_trait(); // make sure it exists
-    let t = sv.cur_trait_immut();
-    for (ti, _) in t.supertraits.iter() {
-        let t = sv.resolve_trait_immut(false, ti);
-        stvs.insert(ti.clone(), t.tv_idxs());
+    fn run_for_var_effects_only<'a, 'b, 'c>(
+        s: &'c mut State<'a, 'b>,
+        f: impl for<'d> FnOnce(&mut State<'d, 'b>),
+    ) {
+        s.for_var_effects_only(f)
     }
-    // hack to make the local-definedness check work properly, since
-    // it usually should ignore the last origin component
-    sv.origin.push(ImportExport::Export("self"));
-    let mut stis = BTreeMap::new();
-    for (id, tvs) in stvs.into_iter() {
-        stis.insert(id, emit_tvis(&mut sv, tvs));
-    }
-    for (id, ts) in stis.into_iter() {
-        sv.cur_trait().supertraits.get_mut(&id).unwrap().extend(ts);
-    }
+    let run = if s.cur_trait().items.is_empty() {
+        run_normally
+    } else {
+        run_for_var_effects_only
+    };
+    run(&mut s, &mut |s: &mut State<'_, 'b>| {
+        let mut needs_vars = BTreeSet::new();
+        let mut sv = s.with_needs_vars(&mut needs_vars);
 
-    drop(sv);
-    tracing::debug!("after exports, ncur_needs_vars is {:?}", needs_vars);
-    for v in needs_vars {
-        let id = s.noff_var_id(v);
-        s.cur_trait().tvs.insert(id, (Some(v), TokenStream::new()));
-    }
+        let exports = it
+            .exports
+            .iter()
+            .map(|ed| emit_extern_decl(true, &mut sv, ed))
+            .collect::<Vec<_>>();
 
-    s.cur_trait().items.extend(quote! { #(#exports)* });
+        // instantiations for the supertraits
+
+        let mut stvs = BTreeMap::new();
+        let _ = sv.cur_trait(); // make sure it exists
+        let t = sv.cur_trait_immut();
+        for (ti, _) in t.supertraits.iter() {
+            let t = sv.resolve_trait_immut(false, ti);
+            stvs.insert(ti.clone(), t.tv_idxs());
+        }
+        // hack to make the local-definedness check work properly, since
+        // it usually should ignore the last origin component
+        sv.origin.push(ImportExport::Export("self"));
+        let mut stis = BTreeMap::new();
+        for (id, tvs) in stvs.into_iter() {
+            stis.insert(id, emit_tvis(&mut sv, EmitPositivity::Same, tvs));
+        }
+        for (id, ts) in stis.into_iter() {
+            sv.cur_trait().supertraits.get_mut(&id).unwrap().extend(ts);
+        }
+
+        drop(sv);
+        tracing::debug!("after exports, ncur_needs_vars is {:?}", needs_vars);
+        for v in needs_vars {
+            let id = s.noff_var_id(v);
+            s.cur_trait().tvs.insert(id, (Some(v), TokenStream::new()));
+        }
+
+        s.cur_trait().items.extend(quote! { #(#exports)* });
+    });
 }
 
 /// Emit (via mutating `s`) a set of Rust trait declarations
@@ -891,7 +931,6 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
 
     s.adjust_vars(ct.instance.evars.len() as u32);
     s.import_param_var = Some(format_ident!("I"));
-    s.is_export = true;
 
     let export_name = kebab_to_exports_name(wn.name);
     *s.bound_vars = ct
@@ -912,7 +951,10 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
         .collect::<Vec<_>>();
     s.cur_trait().tvs.insert(
         format_ident!("I"),
-        (None, quote! { #import_name + ::core::marker::Send }),
+        (
+            None,
+            quote! { #import_name<P::NegativeOfThis> + ::core::marker::Send },
+        ),
     );
     s.cur_trait().items.extend(quote! { #(#exports)* });
 
@@ -920,11 +962,11 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
     s.cur_trait = None;
 
     s.cur_mod().items.extend(quote! {
-        pub trait #base_name {
-            type Exports<I: #import_name + ::core::marker::Send>: #export_name<I>;
+        pub trait #base_name<P: ::hyperlight_common::component::Positivity> {
+            type Exports<I: #import_name<P::NegativeOfThis> + ::core::marker::Send>: #export_name<P, I>;
             // todo: can/should this 'static bound be avoided?
             // it is important right now because this is closed over in host functions
-            fn instantiate<I: #import_name + ::core::marker::Send + 'static>(self, imports: I) -> Self::Exports<I>;
+            fn instantiate<I: #import_name<P::NegativeOfThis> + ::core::marker::Send + 'static>(self, imports: I) -> Self::Exports<I>;
         }
     });
 }

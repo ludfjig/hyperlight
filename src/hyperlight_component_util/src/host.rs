@@ -142,7 +142,7 @@ fn emit_export_instance<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, it: &
         quote! { #ns::#trait_name }
     };
     s.root_mod.items.extend(quote! {
-        impl<I: #root_ns::#imports_name, S: ::hyperlight_host::sandbox::Callable> #trait_path <#(#tvs),*> for #wrapper_name<I, S> {
+        impl<I: #root_ns::#imports_name<::hyperlight_common::component::Negative>, S: ::hyperlight_host::sandbox::Callable> #trait_path <::hyperlight_common::component::Positive #(,#tvs)*> for #wrapper_name<I, S> {
             #(#exports)*
         }
     });
@@ -296,7 +296,8 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                 .chain(&[kebab_to_type(wn.name)])
                 .cloned()
                 .collect::<Vec<_>>();
-            let trait_ref = rtypes::trait_ref(&mut s, true, &trait_path);
+            let trait_ref =
+                rtypes::trait_ref(&mut s, rtypes::EmitPositivity::Opposite, true, &trait_path);
             let get_self = get_self.with_getter(tp, type_name, trait_ref, getter);
             emit_import_instance(&mut s, get_self, wn.clone(), it)
         }
@@ -356,11 +357,12 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
 
     let rtsid = format_ident!("{}Resources", r#trait);
     s.import_param_var = Some(format_ident!("I"));
+    s.positivity_param = Some(quote! { ::hyperlight_common::component::Positive });
     s.colliding_import_names = find_colliding_import_names(&ct.imports);
     resource::emit_tables(
         &mut s,
         rtsid.clone(),
-        quote! { #ns::#import_trait },
+        quote! { #ns::#import_trait<::hyperlight_common::component::Negative> },
         None,
         false,
     );
@@ -373,7 +375,10 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
         .map(|ed| {
             emit_import_extern_decl(
                 &mut s,
-                SelfInfo::new(import_id.clone(), quote! { #ns::#import_trait }),
+                SelfInfo::new(
+                    import_id.clone(),
+                    quote! { #ns::#import_trait<::hyperlight_common::component::Negative> },
+                ),
                 ed,
             )
         })
@@ -383,10 +388,11 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
     s.root_component_name = Some((ns.clone(), wn.name));
     s.cur_trait = Some(export_trait.clone());
     s.import_param_var = Some(format_ident!("I"));
+    s.positivity_param = Some(quote! { ::hyperlight_common::component::Positive });
     // See Note [Origin paths and self parameters in impl codegen for higher-order components]
     // in emit.rs
-    s.self_param_var = Some(quote! { <Self as #ns::#export_trait<I>> });
-    s.is_export = true;
+    s.self_param_var =
+        Some(quote! { <Self as #ns::#export_trait<I, ::hyperlight_common::component::Negative>> });
 
     let exports = ct
         .instance
@@ -397,22 +403,22 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
         .collect::<Vec<_>>();
 
     s.root_mod.items.extend(quote! {
-        pub struct #wrapper_name<T: #ns::#import_trait, S: ::hyperlight_host::sandbox::Callable> {
+        pub struct #wrapper_name<T: #ns::#import_trait<::hyperlight_common::component::Negative>, S: ::hyperlight_host::sandbox::Callable> {
             pub(crate) sb: S,
             pub(crate) rt: ::std::sync::Arc<::std::sync::Mutex<#rtsid<T>>>,
         }
-        pub(crate) fn register_host_functions<I: #ns::#import_trait + ::std::marker::Send + 'static, S: ::hyperlight_host::func::Registerable>(sb: &mut S, i: I) -> ::std::sync::Arc<::std::sync::Mutex<#rtsid<I>>> {
+        pub(crate) fn register_host_functions<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send + 'static, S: ::hyperlight_host::func::Registerable>(sb: &mut S, i: I) -> ::std::sync::Arc<::std::sync::Mutex<#rtsid<I>>> {
             let rts = ::std::sync::Arc::new(::std::sync::Mutex::new(#rtsid::new()));
             let #import_id = ::std::sync::Arc::new(::std::sync::Mutex::new(i));
             #(#imports)*
             rts
         }
-        impl<I: #ns::#import_trait + ::std::marker::Send, S: ::hyperlight_host::sandbox::Callable> #ns::#export_trait<I> for #wrapper_name<I, S> {
+        impl<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send, S: ::hyperlight_host::sandbox::Callable> #ns::#export_trait<::hyperlight_common::component::Positive, I> for #wrapper_name<I, S> {
             #(#exports)*
         }
-        impl #ns::#r#trait for ::hyperlight_host::sandbox::UninitializedSandbox {
-            type Exports<I: #ns::#import_trait + ::std::marker::Send> = #wrapper_name<I, ::hyperlight_host::sandbox::initialized_multi_use::MultiUseSandbox>;
-            fn instantiate<I: #ns::#import_trait + ::std::marker::Send + 'static>(mut self, i: I) -> Self::Exports<I> {
+        impl #ns::#r#trait<::hyperlight_common::component::Positive> for ::hyperlight_host::sandbox::UninitializedSandbox {
+            type Exports<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send> = #wrapper_name<I, ::hyperlight_host::sandbox::initialized_multi_use::MultiUseSandbox>;
+            fn instantiate<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send + 'static>(mut self, i: I) -> Self::Exports<I> {
                 let rts = register_host_functions(&mut self, i);
                 let sb = self.evolve().unwrap();
                 #wrapper_name {

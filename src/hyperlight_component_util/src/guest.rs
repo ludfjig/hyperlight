@@ -91,7 +91,10 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                     // here, but that is not the case at the
                     // moment.
                     let path = s.resource_trait_path(r);
-                    s.root_mod.r#impl(path, format_ident!("Host")).extend(decl);
+                    s.root_mod
+                        .r#impl(path, format_ident!("Host"))
+                        .1
+                        .extend(decl);
                     TokenStream::new()
                 }
             }
@@ -105,11 +108,11 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                 };
                 let rtid = format_ident!("HostResource{}", noff);
                 let path = s.resource_trait_path(kebab_to_type(ed.kebab_name));
-                s.root_mod
-                    .r#impl(path, format_ident!("Host"))
-                    .extend(quote! {
-                        type T = #rtid;
-                    });
+                let r#impl = s.root_mod.r#impl(path, format_ident!("Host"));
+                r#impl.0 = quote! { <::hyperlight_common::component::Negative> };
+                r#impl.1.extend(quote! {
+                    type T = #rtid;
+                });
                 TokenStream::new()
             }
             _ => quote! {},
@@ -152,7 +155,7 @@ fn emit_import_instance<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, it: &
         .chain(&[kebab_to_type(wn.name)])
         .cloned()
         .collect::<Vec<_>>();
-    let trait_ref = rtypes::trait_ref(&mut s, true, &trait_path);
+    let trait_ref = rtypes::trait_ref(&mut s, rtypes::EmitPositivity::Opposite, true, &trait_path);
     s.root_mod.items.extend(quote! {
         impl #trait_ref for Host {
             #(#imports)*
@@ -279,6 +282,7 @@ fn emit_component<'a, 'b, 'c>(
     let r#trait = kebab_to_type(wn.name);
     let import_trait = kebab_to_imports_name(wn.name);
     let export_trait = kebab_to_exports_name(wn.name);
+    s.positivity_param = Some(quote! { ::hyperlight_common::component::Positive });
     // We don't set s.self_param_var or s.import_param_var at all
     // here, because they are currently obviated by the (s.is_guest &&
     // s.is_impl) hack in rtypes::emit_resource_ref. For when we
@@ -292,8 +296,8 @@ fn emit_component<'a, 'b, 'c>(
     resource::emit_tables(
         &mut s,
         rtsid.clone(),
-        quote! { #ns::#import_trait + ::core::marker::Send + 'static },
-        Some(quote! { #ns::#export_trait<I> }),
+        quote! { #ns::#import_trait<::hyperlight_common::component::Negative> + ::core::marker::Send + 'static },
+        Some(quote! { #ns::#export_trait<::hyperlight_common::component::Positive, I> }),
         true,
     );
     s.root_mod
@@ -313,6 +317,7 @@ fn emit_component<'a, 'b, 'c>(
         .map(|ed| emit_import_extern_decl(&mut s, ed))
         .collect::<Vec<_>>();
     s.var_offset = 0;
+    s.positivity_param = Some(quote! { ::hyperlight_common::component::Positive });
     // We don't set s.self_param_var or s.import_param_var at all
     // here, because it is currently obviated by the (s.is_guest &&
     // s.is_impl) hack in rtypes::emit_resource_ref. For when we
@@ -320,10 +325,7 @@ fn emit_component<'a, 'b, 'c>(
     //
     // See Note [Origin paths and self parameters in impl codegen for higher-order components]
     // in emit.rs
-
-    s.is_export = true;
     s.cur_trait = Some(export_trait.clone());
-
     let exports = ct
         .instance
         .unqualified
@@ -333,7 +335,7 @@ fn emit_component<'a, 'b, 'c>(
         .collect::<Vec<_>>();
 
     s.root_mod.items.extend(quote! {
-        impl #ns::#import_trait for Host {
+        impl #ns::#import_trait<::hyperlight_common::component::Negative> for Host {
             #(#imports)*
         }
     });
@@ -365,7 +367,7 @@ pub fn emit_toplevel<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, n: &str, ct: &'c Comp
         /// Because Hyperlight guest functions can't close over any
         /// state, this function is used on each guest call to acquire
         /// any state that the guest functions might need.
-        pub trait Guest: #ns::#export_trait<Host> {
+        pub trait Guest: #ns::#export_trait<::hyperlight_common::component::Positive, Host> {
             fn with_guest_state<R, F: FnOnce(&mut Self) -> R>(f: F) -> R;
         }
         /// Register all guest functions.

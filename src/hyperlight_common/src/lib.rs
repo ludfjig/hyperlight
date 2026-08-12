@@ -22,6 +22,10 @@ limitations under the License.
 
 extern crate alloc;
 
+/// cbindgen:ignore
+/// Support types for the bindings that `{host,guest}_bindgen!` generates
+pub mod component;
+
 pub mod flatbuffer_wrappers;
 /// cbindgen:ignore
 /// FlatBuffers-related utilities and (mostly) generated code

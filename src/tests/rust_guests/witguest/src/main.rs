@@ -18,6 +18,7 @@ limitations under the License.
 #![no_main]
 
 extern crate alloc;
+extern crate hyperlight_common;
 extern crate hyperlight_guest;
 
 use alloc::string::String;
@@ -26,12 +27,13 @@ use spin::Mutex;
 
 mod bindings;
 use bindings::*;
+use hyperlight_common::component::{Negative, Positive};
 
 struct Guest {
-    host_resource: Option<<Host as Testresource>::T>,
+    host_resource: Option<<Host as Testresource<Negative>>::T>,
 }
 
-impl test::wit::Roundtrip for Guest {
+impl test::wit::Roundtrip<Positive> for Guest {
     fn roundtrip_bool(&mut self, x: bool) -> bool {
         (Host {}).roundtrip_bool(x)
     }
@@ -169,43 +171,43 @@ impl test::wit::Roundtrip for Guest {
 use alloc::string::ToString;
 
 use test::wit::host_resource::Testresource;
-impl test::wit::TestHostResource<<Host as Testresource>::T> for Guest {
+impl test::wit::TestHostResource<Positive, <Host as Testresource<Negative>>::T> for Guest {
     fn test_uses_locally(&mut self) -> bool {
         let mut host = Host {};
-        let r = <Host as Testresource>::new(&mut host, "str".to_string(), 'z');
-        <Host as Testresource>::append_char(&mut host, &r, 'a');
-        <Host as Testresource>::append_char(&mut host, &r, 'b');
-        let r = <Host as test::wit::HostResource>::roundtrip_own(&mut host, r);
-        let r = <Host as test::wit::HostResource>::roundtrip_own(&mut host, r);
-        <Host as Testresource>::append_char(&mut host, &r, 'c');
-        <Host as test::wit::HostResource>::return_own(&mut host, r);
+        let r = <Host as Testresource<Negative>>::new(&mut host, "str".to_string(), 'z');
+        <Host as Testresource<Negative>>::append_char(&mut host, &r, 'a');
+        <Host as Testresource<Negative>>::append_char(&mut host, &r, 'b');
+        let r = <Host as test::wit::HostResource<Negative>>::roundtrip_own(&mut host, r);
+        let r = <Host as test::wit::HostResource<Negative>>::roundtrip_own(&mut host, r);
+        <Host as Testresource<Negative>>::append_char(&mut host, &r, 'c');
+        <Host as test::wit::HostResource<Negative>>::return_own(&mut host, r);
         true
     }
-    fn test_makes(&mut self) -> <Host as Testresource>::T {
+    fn test_makes(&mut self) -> <Host as Testresource<Negative>>::T {
         let mut host = Host {};
-        <Host as Testresource>::new(&mut host, "str".to_string(), 'z')
+        <Host as Testresource<Negative>>::new(&mut host, "str".to_string(), 'z')
     }
-    fn test_accepts_borrow(&mut self, r: &<Host as Testresource>::T) {
+    fn test_accepts_borrow(&mut self, r: &<Host as Testresource<Negative>>::T) {
         let mut host = Host {};
-        <Host as Testresource>::append_char(&mut host, r, 'a');
+        <Host as Testresource<Negative>>::append_char(&mut host, r, 'a');
     }
-    fn test_accepts_own(&mut self, r: <Host as Testresource>::T) {
+    fn test_accepts_own(&mut self, r: <Host as Testresource<Negative>>::T) {
         let mut host = Host {};
         // TODO: add test about the old contents of this being
         // dropped, when #810 is fixed.
-        <Host as Testresource>::append_char(&mut host, &r, 'b');
+        <Host as Testresource<Negative>>::append_char(&mut host, &r, 'b');
         self.host_resource = Some(r);
     }
-    fn test_returns(&mut self) -> <Host as Testresource>::T {
+    fn test_returns(&mut self) -> <Host as Testresource<Negative>>::T {
         let mut host = Host {};
         let r = self.host_resource.take().unwrap();
-        <Host as Testresource>::append_char(&mut host, &r, 'c');
+        <Host as Testresource<Negative>>::append_char(&mut host, &r, 'c');
         r
     }
 }
 
 #[allow(refining_impl_trait)]
-impl test::wit::TestExports<Host> for Guest {
+impl test::wit::TestExports<Positive, Host> for Guest {
     type Roundtrip = Self;
     fn roundtrip(&mut self) -> &mut Self {
         self
@@ -263,6 +265,26 @@ mod deeply_nested {
                       (export "r4" (type $R4 (eq $R)))
                       (export "g" (func (param "r4" (own $R4))))))))
                   (export "h" (func (param "r" (own $R)))))))))
+        "#,
+    });
+}
+
+mod imports_exports_same_interface_with_host_resource {
+    hyperlight_component_macro::guest_bindgen!({
+        inline: r#"
+          (component
+            (type (export "world") (component
+              (export "test:rie/world" (component
+                (import "test:rie/definer" (instance $DI
+                  (export "r" (type $R (sub resource)))
+                  (export "f" (func (param "r" (own $R))))))
+                (alias export $DI "r" (type $R))
+                (import "test:rie/user" (instance
+                  (export "r2" (type $R2 (eq $R)))
+                  (export "g" (func (param "r" (borrow $R2))))))
+                (export "test:rie/user" (instance
+                  (export "r2" (type $R2 (eq $R)))
+                  (export "g" (func (param "r" (borrow $R2)))))))))))
         "#,
     });
 }
