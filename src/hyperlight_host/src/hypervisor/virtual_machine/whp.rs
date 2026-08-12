@@ -1003,6 +1003,23 @@ impl VirtualMachine for WhpVm {
     }
 
     #[cfg(test)]
+    fn xcr0(&self) -> std::result::Result<u64, RegisterError> {
+        let mut values = [Align16(WHV_REGISTER_VALUE::default())];
+        self.get_registers(&[WHvX64RegisterXCr0], &mut values)
+            .map_err(|e| RegisterError::GetXcrs(e.into()))?;
+        // SAFETY: WHP populated the value for the requested 64-bit register.
+        Ok(unsafe { values[0].0.Reg64 })
+    }
+
+    fn set_xcr0(&self, value: u64) -> std::result::Result<(), RegisterError> {
+        self.set_registers(&[(
+            WHvX64RegisterXCr0,
+            Align16(WHV_REGISTER_VALUE { Reg64: value }),
+        )])
+        .map_err(|e| RegisterError::SetXcrs(e.into()))
+    }
+
+    #[cfg(test)]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError> {
         // Get the required buffer size by calling with NULL buffer.
         // If the buffer is not large enough (0 won't be), WHvGetVirtualProcessorXsaveState returns

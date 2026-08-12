@@ -628,6 +628,37 @@ impl VirtualMachine for KvmVm {
     }
 
     #[cfg(test)]
+    fn xcr0(&self) -> std::result::Result<u64, RegisterError> {
+        let xcrs = self
+            .vcpu_fd
+            .get_xcrs()
+            .map_err(|e| RegisterError::GetXcrs(e.into()))?;
+        xcrs.xcrs
+            .iter()
+            .take(xcrs.nr_xcrs as usize)
+            .find(|xcr| xcr.xcr == 0)
+            .map(|xcr| xcr.value)
+            .ok_or(RegisterError::MissingXcr0)
+    }
+
+    fn set_xcr0(&self, value: u64) -> std::result::Result<(), RegisterError> {
+        let mut xcrs = self
+            .vcpu_fd
+            .get_xcrs()
+            .map_err(|e| RegisterError::GetXcrs(e.into()))?;
+        let xcr0 = xcrs
+            .xcrs
+            .iter_mut()
+            .take(xcrs.nr_xcrs as usize)
+            .find(|xcr| xcr.xcr == 0)
+            .ok_or(RegisterError::MissingXcr0)?;
+        xcr0.value = value;
+        self.vcpu_fd
+            .set_xcrs(&xcrs)
+            .map_err(|e| RegisterError::SetXcrs(e.into()))
+    }
+
+    #[cfg(test)]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError> {
         if std::mem::size_of_val(xsave) != XSAVE_BUFFER_SIZE {
             return Err(RegisterError::XsaveSizeMismatch {

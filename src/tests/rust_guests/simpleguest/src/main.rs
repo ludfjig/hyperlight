@@ -900,6 +900,56 @@ fn get_dr0() -> u64 {
     value
 }
 
+#[guest_function("ReadXcr0")]
+#[cfg(target_arch = "x86_64")]
+fn read_xcr0() -> u64 {
+    let value_low: u32;
+    let value_high: u32;
+    // SAFETY: The test guest runs at CPL0. CR4 is restored before returning.
+    unsafe {
+        core::arch::asm!(
+            "mov {original_cr4}, cr4",
+            "mov {enabled_cr4}, {original_cr4}",
+            "or {enabled_cr4}, {osxsave}",
+            "mov cr4, {enabled_cr4}",
+            "xgetbv",
+            "mov cr4, {original_cr4}",
+            original_cr4 = out(reg) _,
+            enabled_cr4 = out(reg) _,
+            osxsave = const 1u64 << 18,
+            in("ecx") 0u32,
+            out("eax") value_low,
+            out("edx") value_high,
+            options(nostack, nomem)
+        );
+    }
+    ((value_high as u64) << 32) | value_low as u64
+}
+
+#[guest_function("WriteXcr0")]
+#[cfg(target_arch = "x86_64")]
+fn write_xcr0(value: u64) {
+    // SAFETY: The test guest runs at CPL0. The caller supplies a valid XCR0
+    // value, and CR4 is restored before returning.
+    unsafe {
+        core::arch::asm!(
+            "mov {original_cr4}, cr4",
+            "mov {enabled_cr4}, {original_cr4}",
+            "or {enabled_cr4}, {osxsave}",
+            "mov cr4, {enabled_cr4}",
+            "xsetbv",
+            "mov cr4, {original_cr4}",
+            original_cr4 = out(reg) _,
+            enabled_cr4 = out(reg) _,
+            osxsave = const 1u64 << 18,
+            in("ecx") 0u32,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, nomem)
+        );
+    }
+}
+
 #[guest_function("Add")]
 fn add(a: i32, b: i32) -> Result<i32> {
     #[host_function("HostAdd")]
