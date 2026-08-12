@@ -317,6 +317,7 @@ fn emit_component<'a, 'b, 'c>(
     s.var_offset = 0;
 
     s.is_export = true;
+    s.cur_trait = Some(export_trait.clone());
 
     let exports = ct
         .instance
