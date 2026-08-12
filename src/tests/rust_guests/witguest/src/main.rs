@@ -206,6 +206,12 @@ impl test::wit::TestHostResource<Positive, <Host as Testresource<Negative>>::T> 
     }
 }
 
+impl test::wit::Failable<Positive> for Guest {
+    fn will_trap(&mut self) -> String {
+        panic!("deliberate guest crash")
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl test::wit::TestExports<Positive, Host> for Guest {
     type Roundtrip = Self;
@@ -214,6 +220,10 @@ impl test::wit::TestExports<Positive, Host> for Guest {
     }
     type TestHostResource = Self;
     fn test_host_resource(&mut self) -> &mut Self {
+        self
+    }
+    type Failable = Self;
+    fn failable(&mut self) -> &mut Self {
         self
     }
 }

@@ -289,14 +289,15 @@ fn sb() -> TestSandbox<Host, MultiUseSandbox> {
     let path = wit_guest_as_pathbuf();
     let guest_path = GuestBinary::FilePath(path);
     let uninit = UninitializedSandbox::new(guest_path, None).unwrap();
-    test::wit::Test::instantiate(uninit, Host {})
+    test::wit::Test::instantiate(uninit, Host {}).unwrap()
 }
 
 mod wit_test {
-
     use proptest::prelude::*;
 
-    use crate::bindings::test::wit::{Roundtrip, TestExports, TestHostResource, roundtrip};
+    use crate::bindings::test::wit::{
+        Failable, Roundtrip, TestExports, TestHostResource, roundtrip,
+    };
     use crate::sb;
 
     prop_compose! {
@@ -348,7 +349,7 @@ mod wit_test {
             proptest! {
                 #[test]
                 fn $fn(x $($ty)*) {
-                    assert_eq!(x, sb().roundtrip().$fn(x.clone()))
+                    assert_eq!(x, sb().roundtrip().$fn(x.clone()).unwrap())
                 }
             }
         }
@@ -395,7 +396,16 @@ mod wit_test {
 
     #[test]
     fn test_roundtrip_no_result() {
-        sb().roundtrip().roundtrip_no_result(42);
+        sb().roundtrip().roundtrip_no_result(42).unwrap();
+    }
+
+    #[test]
+    fn test_guest_trap_returns_error() {
+        let err = sb().failable().will_trap().unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Guest aborted"),
+            "unexpected error: {err:?}"
+        );
     }
 
     use std::sync::atomic::Ordering::Relaxed;
@@ -405,7 +415,7 @@ mod wit_test {
         let guard = crate::SERIALIZE_TEST_RESOURCE_TESTS.lock();
         crate::HAS_BEEN_DROPPED.store(false, Relaxed);
         {
-            sb().test_host_resource().test_uses_locally();
+            sb().test_host_resource().test_uses_locally().unwrap();
         }
         assert!(crate::HAS_BEEN_DROPPED.load(Relaxed));
         drop(guard);
@@ -417,10 +427,10 @@ mod wit_test {
         {
             let mut sb = sb();
             let inst = sb.test_host_resource();
-            let r = inst.test_makes();
-            inst.test_accepts_borrow(&r);
-            inst.test_accepts_own(r);
-            inst.test_returns();
+            let r = inst.test_makes().unwrap();
+            inst.test_accepts_borrow(&r).unwrap();
+            inst.test_accepts_own(r).unwrap();
+            inst.test_returns().unwrap();
         }
         assert!(crate::HAS_BEEN_DROPPED.load(Relaxed));
         drop(guard);
@@ -498,18 +508,20 @@ mod bindgen_test_cases {
     struct ExportHost;
 
     impl test::bindgen_test_cases::Executor<Positive> for ExportHost {
-        fn execute(&mut self) -> test::bindgen_test_cases::executor::ExecutionResult {
-            test::bindgen_test_cases::executor::ExecutionResult {
+        fn execute(
+            &mut self,
+        ) -> anyhow::Result<test::bindgen_test_cases::executor::ExecutionResult> {
+            Ok(test::bindgen_test_cases::executor::ExecutionResult {
                 message: String::from("executed"),
-            }
+            })
         }
     }
 
     impl test::bindgen_test_cases::Types<Positive> for ExportHost {
-        fn get_status(&mut self) -> test::bindgen_test_cases::types::Status {
-            test::bindgen_test_cases::types::Status {
+        fn get_status(&mut self) -> anyhow::Result<test::bindgen_test_cases::types::Status> {
+            Ok(test::bindgen_test_cases::types::Status {
                 message: String::from("ok"),
-            }
+            })
         }
     }
 
@@ -519,10 +531,10 @@ mod bindgen_test_cases {
             test::bindgen_test_cases::types::Status,
         > for ExportHost
     {
-        fn get_status(&mut self) -> test::bindgen_test_cases::types::Status {
-            test::bindgen_test_cases::types::Status {
+        fn get_status(&mut self) -> anyhow::Result<test::bindgen_test_cases::types::Status> {
+            Ok(test::bindgen_test_cases::types::Status {
                 message: String::from("ok"),
-            }
+            })
         }
     }
 

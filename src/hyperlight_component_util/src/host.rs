@@ -59,19 +59,22 @@ fn emit_export_extern_decl<'a, 'b, 'c>(
                         fn #n(&mut self, #(#param_decls),*) -> #result_decl {
                             let mut to_cleanup = Vec::<Box<dyn Drop>>::new();
                             let marshalled = {
-                                let mut rts = self.rt.lock().unwrap();
+                                let mut rts = self.rt
+                                    .lock()
+                                    .map_err(<::hyperlight_host::error::HyperlightError as From<_>>::from)?;
                                 #[allow(clippy::unused_unit)]
                                 (#(#marshal,)*)
                             };
                             let #ret = ::hyperlight_host::sandbox::Callable::call::<::std::vec::Vec::<u8>>(&mut self.sb,
                                 #hln,
                                 marshalled,
-                            );
-                            let ::std::result::Result::Ok(#ret) = #ret else { panic!("bad return from guest {:?}", #ret) };
+                            )?;
                             #[allow(clippy::unused_unit)]
-                            let mut rts = self.rt.lock().unwrap();
+                            let mut rts = self.rt
+                                .lock()
+                                .map_err(<::hyperlight_host::error::HyperlightError as From<_>>::from)?;
                             #[allow(clippy::unused_unit)]
-                            #unmarshal
+                            ::std::result::Result::Ok(#unmarshal)
                         }
                     }
                 }
@@ -167,7 +170,8 @@ impl SelfInfo {
             orig_id,
             type_id: vec![(format_ident!("I"), imports_trait_bound)],
             inner_preamble: quote! {
-                let mut #inner_id = #outer_id.lock().unwrap();
+                let mut #inner_id = #outer_id.lock()
+                .map_err(<::hyperlight_host::error::HyperlightError as From<_>>::from)?;
                 let mut #inner_id = ::std::ops::DerefMut::deref_mut(&mut #inner_id);
             },
             outer_id,
@@ -268,7 +272,8 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                 let #outer_id = #orig_id.clone();
                 let captured_rts = rts.clone();
                 sb.register_host_function(#hln, move |#(#pds),*| {
-                    let mut rts = captured_rts.lock().unwrap();
+                    let mut rts = captured_rts.lock()
+                        .map_err(<::hyperlight_host::error::HyperlightError as From<_>>::from)?;
                     #inner_preamble
                     let #ret = #callname(
                         ::std::borrow::BorrowMut::<#type_inst>::borrow_mut(
@@ -277,8 +282,7 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                         #(#pus),*
                     );
                     Ok(#marshal_result)
-                })
-                .unwrap();
+                })?;
             }
         }
         ExternDesc::Type(_) => {
@@ -407,24 +411,24 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
             pub(crate) sb: S,
             pub(crate) rt: ::std::sync::Arc<::std::sync::Mutex<#rtsid<T>>>,
         }
-        pub(crate) fn register_host_functions<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send + 'static, S: ::hyperlight_host::func::Registerable>(sb: &mut S, i: I) -> ::std::sync::Arc<::std::sync::Mutex<#rtsid<I>>> {
+        pub(crate) fn register_host_functions<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send + 'static, S: ::hyperlight_host::func::Registerable>(sb: &mut S, i: I) -> <::hyperlight_common::component::Positive as ::hyperlight_common::component::Positivity>::CallResult<::std::sync::Arc<::std::sync::Mutex<#rtsid<I>>>> {
             let rts = ::std::sync::Arc::new(::std::sync::Mutex::new(#rtsid::new()));
             let #import_id = ::std::sync::Arc::new(::std::sync::Mutex::new(i));
             #(#imports)*
-            rts
+            Ok(rts)
         }
         impl<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send, S: ::hyperlight_host::sandbox::Callable> #ns::#export_trait<::hyperlight_common::component::Positive, I> for #wrapper_name<I, S> {
             #(#exports)*
         }
         impl #ns::#r#trait<::hyperlight_common::component::Positive> for ::hyperlight_host::sandbox::UninitializedSandbox {
             type Exports<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send> = #wrapper_name<I, ::hyperlight_host::sandbox::initialized_multi_use::MultiUseSandbox>;
-            fn instantiate<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send + 'static>(mut self, i: I) -> Self::Exports<I> {
-                let rts = register_host_functions(&mut self, i);
-                let sb = self.evolve().unwrap();
-                #wrapper_name {
+            fn instantiate<I: #ns::#import_trait<::hyperlight_common::component::Negative> + ::std::marker::Send + 'static>(mut self, i: I) -> <::hyperlight_common::component::Positive as ::hyperlight_common::component::Positivity>::CallResult<Self::Exports<I>> {
+                let rts = register_host_functions(&mut self, i)?;
+                let sb = self.evolve()?;
+                Ok(#wrapper_name {
                     sb,
                     rt: rts,
-                }
+                })
             }
         }
     });

@@ -607,10 +607,12 @@ pub fn emit_func_param(s: &mut State, p: &Param) -> TokenStream {
 /// Precondition: the result type must only be a named result if there
 /// are no names in it (i.e. a unit type)
 pub fn emit_func_result(s: &mut State, r: &etypes::Result<'_>) -> TokenStream {
-    match r {
+    let inner = match r {
         Some(vt) => emit_value(s, vt),
         None => quote! { () },
-    }
+    };
+    let p = s.positivity_param.clone().unwrap_or(quote! { P });
+    quote! { <#p as ::hyperlight_common::component::Positivity>::CallResult<#inner> }
 }
 
 /// Emit a Rust typeversion of a component function type. This is only
@@ -966,7 +968,7 @@ fn emit_component<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, wn: WitName, ct: &'c Com
             type Exports<I: #import_name<P::NegativeOfThis> + ::core::marker::Send>: #export_name<P, I>;
             // todo: can/should this 'static bound be avoided?
             // it is important right now because this is closed over in host functions
-            fn instantiate<I: #import_name<P::NegativeOfThis> + ::core::marker::Send + 'static>(self, imports: I) -> Self::Exports<I>;
+            fn instantiate<I: #import_name<P::NegativeOfThis> + ::core::marker::Send + 'static>(self, imports: I) -> <P as ::hyperlight_common::component::Positivity>::CallResult<Self::Exports<I>>;
         }
     });
 }

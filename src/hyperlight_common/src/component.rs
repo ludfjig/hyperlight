@@ -41,6 +41,8 @@ mod private {
 /// imports.
 pub trait Positivity: private::Sealed {
     type NegativeOfThis: Positivity<NegativeOfThis = Self>;
+    /// How a call to one of the interface's functions returns.
+    type CallResult<T>;
     /// How a borrowed resource handle reaches the implementation.
     type Borrow<'a, T: 'a>;
 }
@@ -58,6 +60,8 @@ impl private::Sealed for Positive {}
 
 impl Positivity for Negative {
     type NegativeOfThis = Positive;
+    /// A host implementation is called directly, so it cannot fail.
+    type CallResult<T> = T;
     /// A handle arrives as an index into the resource table, held borrowed
     /// for the duration of the call.
     type Borrow<'a, T: 'a> = BorrowedResourceGuard<'a, T>;
@@ -65,6 +69,14 @@ impl Positivity for Negative {
 
 impl Positivity for Positive {
     type NegativeOfThis = Negative;
+    /// Every call from the host crosses into the VM, where the guest can trap.
+    #[cfg(feature = "std")]
+    type CallResult<T> = anyhow::Result<T>;
+    /// The guest is not permitted to semantically enlarge its
+    /// functions to include kinds of failures other than the usual
+    /// trap/VM issue
+    #[cfg(not(feature = "std"))]
+    type CallResult<T> = T;
     /// The host owns the value, so it hands out a plain reference.
     type Borrow<'a, T: 'a> = &'a T;
 }
