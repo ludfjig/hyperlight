@@ -33,7 +33,7 @@ use super::host_funcs::FunctionRegistry;
 use super::snapshot::Snapshot;
 use crate::func::{ParameterTuple, SupportedReturnType};
 use crate::hypervisor::InterruptHandle;
-use crate::hypervisor::hyperlight_vm::{BaseMappingUpdateError, HyperlightVm, HyperlightVmError};
+use crate::hypervisor::hyperlight_vm::{HyperlightVm, HyperlightVmError};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 use crate::mem::mgr::SandboxMemoryManager;
 use crate::mem::shared_mem::{HostSharedMemory, SharedMemory as _};
@@ -151,6 +151,21 @@ impl MultiUseSandbox {
         if self.status.is_ready() {
             self.status = SandboxStatus::Poisoned;
         }
+    }
+
+    fn restore_memory_and_mappings(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let (snapshot_mem, scratch_mem) = self.mem_mgr.restore_snapshot(snapshot)?;
+        if let Some(snapshot_mem) = snapshot_mem {
+            self.vm
+                .update_snapshot_mapping(snapshot_mem)
+                .map_err(HyperlightVmError::UpdateRegion)?;
+        }
+        if let Some(scratch_mem) = scratch_mem {
+            self.vm
+                .update_scratch_mapping(scratch_mem)
+                .map_err(HyperlightVmError::UpdateRegion)?;
+        }
+        Ok(())
     }
 
     /// Move an `UninitializedSandbox` into a new `MultiUseSandbox` instance.
@@ -491,9 +506,8 @@ impl MultiUseSandbox {
     /// declare every MSR the snapshot saved, or the restore poisons with an MSR
     /// mismatch.
     ///
-    /// A restore that cannot recover a usable VM mapping state returns
-    /// [`RestoreFailedUnrecoverably`](crate::HyperlightError::RestoreFailedUnrecoverably).
-    /// The sandbox then rejects further operations and must be discarded.
+    /// A failure while updating the sandbox's base VM mappings leaves the sandbox
+    /// [`Unrecoverable`](SandboxStatus::Unrecoverable). It must be discarded.
     ///
     /// ## Poison State Recovery
     ///
@@ -605,8 +619,6 @@ impl MultiUseSandbox {
             HyperlightError::Error("snapshot from running sandbox should have sregs".to_string())
         })?;
 
-        let mut prepared_restore = self.mem_mgr.prepare_restore(&snapshot)?;
-
         #[cfg(gdb)]
         let dbg_mem_access_fn = self.dbg_mem_access_fn.clone();
         #[cfg(gdb)]
@@ -614,67 +626,30 @@ impl MultiUseSandbox {
             .lock()
             .map_err(|err| crate::new_error!("failed to lock debug memory manager: {err}"))?;
 
-        let restore_result = (|| -> Result<()> {
-            #[cfg(gdb)]
-            self.vm
-                .clear_guest_debug_state()
-                .map_err(|err| crate::new_error!("failed to clear guest debug state: {err}"))?;
-
-            let current_regions: Vec<MemoryRegion> =
-                self.vm.get_mapped_regions().cloned().collect();
-            for region in &current_regions {
-                self.vm
-                    .unmap_region(region)
-                    .map_err(HyperlightVmError::UnmapRegion)?;
-            }
-
-            prepared_restore.reset_reused_scratch()?;
-            let (candidate_mem_mgr, mapping_update) = prepared_restore.into_parts();
-            if let Err(error) = self.vm.update_base_mappings(mapping_update) {
-                return match error {
-                    BaseMappingUpdateError::Recoverable(error) => {
-                        Err(HyperlightVmError::UpdateRegion(error).into())
-                    }
-                    BaseMappingUpdateError::Unrecoverable { update, recovery } => {
-                        Err(HyperlightError::RestoreFailedUnrecoverably {
-                            update: Box::new(HyperlightVmError::UpdateRegion(update).into()),
-                            recovery: Box::new(HyperlightVmError::UpdateRegion(recovery).into()),
-                        })
-                    }
-                };
-            }
-
-            #[cfg(gdb)]
-            {
-                *dbg_mem_access_fn = candidate_mem_mgr.clone();
-            }
-            self.mem_mgr = candidate_mem_mgr;
-            #[cfg(gdb)]
-            drop(dbg_mem_access_fn);
-
-            self.vm
-                .reset_vcpu(snapshot.root_pt_gpa(), sregs)
-                .map_err(HyperlightVmError::Restore)?;
-
-            Ok(())
-        })();
-
-        if let Err(err) = restore_result {
-            self.status = if matches!(err, HyperlightError::RestoreFailedUnrecoverably { .. }) {
-                SandboxStatus::Unrecoverable
-            } else {
-                SandboxStatus::Poisoned
-            };
+        if let Err(error) = self.restore_memory_and_mappings(&snapshot) {
+            self.status = SandboxStatus::Unrecoverable;
             self.snapshot = None;
-            return Err(err);
+            return Err(error);
         }
+
+        #[cfg(gdb)]
+        {
+            *dbg_mem_access_fn = self.mem_mgr.clone();
+            drop(dbg_mem_access_fn);
+        }
+
+        self.status = SandboxStatus::Poisoned;
+        self.snapshot = None;
+
+        self.vm
+            .reset_vcpu(snapshot.root_pt_gpa(), sregs)
+            .map_err(HyperlightVmError::Restore)?;
 
         // Restore captured MSR state.
         #[cfg(target_arch = "x86_64")]
-        self.vm.restore_msrs(snapshot.msrs()).map_err(|e| {
-            self.status = SandboxStatus::Poisoned;
-            HyperlightVmError::Restore(e)
-        })?;
+        self.vm
+            .restore_msrs(snapshot.msrs())
+            .map_err(HyperlightVmError::Restore)?;
 
         self.vm.set_stack_top(snapshot.stack_top_gva());
         self.vm.set_next_action(snapshot.next_action());
@@ -683,6 +658,13 @@ impl MultiUseSandbox {
         #[cfg(crashdump)]
         self.vm
             .set_crashdump_entry_point(snapshot.original_entrypoint());
+
+        let current_regions: Vec<MemoryRegion> = self.vm.get_mapped_regions().cloned().collect();
+        for region in &current_regions {
+            self.vm
+                .unmap_region(region)
+                .map_err(HyperlightVmError::UnmapRegion)?;
+        }
 
         // The restored snapshot is now our most current snapshot
         self.snapshot = Some(snapshot.clone());
@@ -1257,7 +1239,7 @@ mod tests {
     use hyperlight_testing::simple_guest_as_pathbuf;
 
     #[cfg(not(gdb))]
-    use crate::hypervisor::hyperlight_vm::{HyperlightVmError, test_support::VmOperation};
+    use crate::hypervisor::hyperlight_vm::test_support::VmOperation;
     use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
     use crate::mem::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, SharedMemory as _};
     use crate::sandbox::SandboxConfiguration;
@@ -1863,7 +1845,7 @@ mod tests {
 
     #[test]
     #[cfg(not(gdb))]
-    fn snapshot_restore_mapping_failure_is_recoverable() {
+    fn snapshot_restore_mapping_failure_is_unrecoverable() {
         let path = simple_guest_as_pathbuf();
         let mut source = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
             .unwrap()
@@ -1883,42 +1865,7 @@ mod tests {
 
         let error = target.restore(snapshot.clone()).unwrap_err();
         assert!(matches!(error, HyperlightError::HyperlightVmError(_)));
-        assert!(target.status().is_poisoned());
-        assert!(fault_plan.is_consumed());
-
-        target.restore(snapshot).unwrap();
-        assert_eq!(target.status(), SandboxStatus::Ready);
-        assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 42);
-    }
-
-    #[test]
-    #[cfg(not(gdb))]
-    fn snapshot_restore_mapping_recovery_failure_is_unrecoverable() {
-        let path = simple_guest_as_pathbuf();
-        let mut source = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-            .unwrap()
-            .evolve()
-            .unwrap();
-        source.call::<i32>("AddToStatic", 42i32).unwrap();
-        let snapshot = source.snapshot().unwrap();
-
-        let path = simple_guest_as_pathbuf();
-        let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-            .unwrap()
-            .evolve()
-            .unwrap();
-        let fault_plan = target.vm.inject_vm_faults([
-            VmOperation::Map(MemoryRegionType::Snapshot),
-            VmOperation::Map(MemoryRegionType::Snapshot),
-        ]);
-
-        let error = target.restore(snapshot.clone()).unwrap_err();
-        assert!(matches!(
-            error,
-            HyperlightError::RestoreFailedUnrecoverably { .. }
-        ));
         assert_eq!(target.status(), SandboxStatus::Unrecoverable);
-        assert!(!target.status().is_poisoned());
         assert!(fault_plan.is_consumed());
 
         assert!(matches!(
@@ -1944,7 +1891,7 @@ mod tests {
 
     #[test]
     #[cfg(not(gdb))]
-    fn snapshot_restore_unmapping_failure_is_recoverable() {
+    fn snapshot_restore_unmapping_failure_is_unrecoverable() {
         let path = simple_guest_as_pathbuf();
         let mut source = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
             .unwrap()
@@ -1958,20 +1905,14 @@ mod tests {
             .unwrap()
             .evolve()
             .unwrap();
-        let old_mappings = target.vm.base_mapping_state();
         let fault_plan = target
             .vm
             .inject_vm_faults([VmOperation::Unmap(MemoryRegionType::Snapshot)]);
 
-        let error = target.restore(snapshot.clone()).unwrap_err();
+        let error = target.restore(snapshot).unwrap_err();
         assert!(matches!(error, HyperlightError::HyperlightVmError(_)));
-        assert!(target.status().is_poisoned());
-        assert_eq!(target.vm.base_mapping_state(), old_mappings);
+        assert_eq!(target.status(), SandboxStatus::Unrecoverable);
         assert!(fault_plan.is_consumed());
-
-        target.restore(snapshot).unwrap();
-        assert_eq!(target.status(), SandboxStatus::Ready);
-        assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 42);
     }
 
     #[test]
@@ -2150,221 +2091,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(gdb))]
-    fn replace_all_mapping_transaction_covers_success_and_failures() {
-        #[derive(Clone, Copy)]
-        enum Expected {
-            Success,
-            Recoverable,
-            Unrecoverable,
-        }
-
-        struct Case {
-            name: &'static str,
-            operations: &'static [VmOperation],
-            expected: Expected,
-        }
-
-        let cases = [
-            Case {
-                name: "success",
-                operations: &[],
-                expected: Expected::Success,
-            },
-            Case {
-                name: "snapshot unmap failure",
-                operations: &[VmOperation::Unmap(MemoryRegionType::Snapshot)],
-                expected: Expected::Recoverable,
-            },
-            Case {
-                name: "snapshot map failure",
-                operations: &[VmOperation::Map(MemoryRegionType::Snapshot)],
-                expected: Expected::Recoverable,
-            },
-            Case {
-                name: "snapshot recovery failure",
-                operations: &[
-                    VmOperation::Map(MemoryRegionType::Snapshot),
-                    VmOperation::Map(MemoryRegionType::Snapshot),
-                ],
-                expected: Expected::Unrecoverable,
-            },
-            Case {
-                name: "scratch unmap failure",
-                operations: &[VmOperation::Unmap(MemoryRegionType::Scratch)],
-                expected: Expected::Recoverable,
-            },
-            Case {
-                name: "scratch map failure",
-                operations: &[VmOperation::Map(MemoryRegionType::Scratch)],
-                expected: Expected::Recoverable,
-            },
-            Case {
-                name: "scratch rollback failure",
-                operations: &[
-                    VmOperation::Map(MemoryRegionType::Scratch),
-                    VmOperation::Map(MemoryRegionType::Scratch),
-                ],
-                expected: Expected::Unrecoverable,
-            },
-            Case {
-                name: "snapshot rollback unmap failure",
-                operations: &[
-                    VmOperation::Unmap(MemoryRegionType::Scratch),
-                    VmOperation::Unmap(MemoryRegionType::Snapshot),
-                ],
-                expected: Expected::Unrecoverable,
-            },
-            Case {
-                name: "snapshot rollback map failure",
-                operations: &[
-                    VmOperation::Unmap(MemoryRegionType::Scratch),
-                    VmOperation::Map(MemoryRegionType::Snapshot),
-                ],
-                expected: Expected::Unrecoverable,
-            },
-            Case {
-                name: "snapshot rollback recovery failure",
-                operations: &[
-                    VmOperation::Unmap(MemoryRegionType::Scratch),
-                    VmOperation::Map(MemoryRegionType::Snapshot),
-                    VmOperation::Map(MemoryRegionType::Snapshot),
-                ],
-                expected: Expected::Unrecoverable,
-            },
-        ];
-
-        let path = simple_guest_as_pathbuf();
-        let mut source_config = SandboxConfiguration::default();
-        source_config.set_scratch_size(0x100000);
-        let mut source =
-            UninitializedSandbox::new(GuestBinary::FilePath(path), Some(source_config))
-                .unwrap()
-                .evolve()
-                .unwrap();
-        source.call::<i32>("AddToStatic", 42i32).unwrap();
-        let snapshot = source.snapshot().unwrap();
-
-        for case in cases {
-            let path = simple_guest_as_pathbuf();
-            let mut target = UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-                .unwrap()
-                .evolve()
-                .unwrap();
-            target.mem_mgr.layout = *snapshot.layout();
-            let old_mappings = target.vm.base_mapping_state();
-            let old_manager_mappings = (
-                Some((
-                    target.mem_mgr.shared_mem.base_addr(),
-                    target.mem_mgr.shared_mem.mem_size(),
-                )),
-                Some((
-                    target.mem_mgr.scratch_mem.base_addr(),
-                    target.mem_mgr.scratch_mem.mem_size(),
-                )),
-            );
-            assert_eq!(old_mappings, old_manager_mappings);
-            let fault_plan = target.vm.inject_vm_faults(case.operations.iter().copied());
-
-            let result = target.restore(snapshot.clone());
-            match (case.expected, result) {
-                (Expected::Success, Ok(())) => {
-                    assert_eq!(
-                        target.vm.base_mapping_state(),
-                        (
-                            Some((
-                                target.mem_mgr.shared_mem.base_addr(),
-                                target.mem_mgr.shared_mem.mem_size(),
-                            )),
-                            Some((
-                                target.mem_mgr.scratch_mem.base_addr(),
-                                target.mem_mgr.scratch_mem.mem_size(),
-                            )),
-                        ),
-                        "{}",
-                        case.name
-                    );
-                    assert_eq!(target.status(), SandboxStatus::Ready, "{}", case.name);
-                    assert_eq!(
-                        target.call::<i32>("GetStatic", ()).unwrap(),
-                        42,
-                        "{}",
-                        case.name
-                    );
-                }
-                (
-                    Expected::Recoverable,
-                    Err(HyperlightError::HyperlightVmError(HyperlightVmError::UpdateRegion(_))),
-                ) => {
-                    assert_eq!(
-                        target.vm.base_mapping_state(),
-                        old_mappings,
-                        "{}",
-                        case.name
-                    );
-                    assert_eq!(
-                        (
-                            Some((
-                                target.mem_mgr.shared_mem.base_addr(),
-                                target.mem_mgr.shared_mem.mem_size(),
-                            )),
-                            Some((
-                                target.mem_mgr.scratch_mem.base_addr(),
-                                target.mem_mgr.scratch_mem.mem_size(),
-                            )),
-                        ),
-                        old_manager_mappings,
-                        "{}",
-                        case.name
-                    );
-                    assert!(target.status().is_poisoned(), "{}", case.name);
-                    target.restore(snapshot.clone()).unwrap();
-                    assert_eq!(target.status(), SandboxStatus::Ready, "{}", case.name);
-                    assert_eq!(
-                        target.call::<i32>("GetStatic", ()).unwrap(),
-                        42,
-                        "{}",
-                        case.name
-                    );
-                }
-                (
-                    Expected::Unrecoverable,
-                    Err(HyperlightError::RestoreFailedUnrecoverably { update, recovery }),
-                ) => {
-                    assert!(
-                        matches!(
-                            update.as_ref(),
-                            HyperlightError::HyperlightVmError(HyperlightVmError::UpdateRegion(_))
-                        ),
-                        "{}",
-                        case.name
-                    );
-                    assert!(
-                        matches!(
-                            recovery.as_ref(),
-                            HyperlightError::HyperlightVmError(HyperlightVmError::UpdateRegion(_))
-                        ),
-                        "{}",
-                        case.name
-                    );
-                    assert_eq!(
-                        target.status(),
-                        SandboxStatus::Unrecoverable,
-                        "{}",
-                        case.name
-                    );
-                    assert!(matches!(
-                        target.restore(snapshot.clone()),
-                        Err(HyperlightError::UnrecoverableSandbox)
-                    ));
-                }
-                (_, result) => panic!("{} returned {result:?}", case.name),
-            }
-            assert!(fault_plan.is_consumed(), "{}", case.name);
-        }
-    }
-
-    #[test]
     fn snapshot_restore_rejects_incompatible_layout() {
         let mut sandbox = {
             let path = simple_guest_as_pathbuf();
@@ -2533,86 +2259,6 @@ mod tests {
 
         target.restore(snapshot).unwrap();
         assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 7);
-    }
-
-    #[test]
-    fn prepare_restore_replaces_snapshot_mapping_for_different_snapshot() {
-        let mut source = {
-            let path = simple_guest_as_pathbuf();
-            UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-                .unwrap()
-                .evolve()
-                .unwrap()
-        };
-        let target = {
-            let path = simple_guest_as_pathbuf();
-            UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-                .unwrap()
-                .evolve()
-                .unwrap()
-        };
-
-        let snapshot = source.snapshot().unwrap();
-
-        assert!(
-            target
-                .mem_mgr
-                .prepare_restore(&snapshot)
-                .unwrap()
-                .replaces_snapshot()
-        );
-    }
-
-    #[cfg(not(unshared_snapshot_mem))]
-    #[test]
-    fn prepare_restore_keeps_mappings_for_current_snapshot() {
-        let mut sandbox = {
-            let path = simple_guest_as_pathbuf();
-            UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-                .unwrap()
-                .evolve()
-                .unwrap()
-        };
-
-        let snapshot = sandbox.snapshot().unwrap();
-        let (candidate, _) = sandbox
-            .mem_mgr
-            .prepare_restore(&snapshot)
-            .unwrap()
-            .into_parts();
-
-        assert!(
-            candidate
-                .prepare_restore(&snapshot)
-                .unwrap()
-                .keeps_mappings()
-        );
-    }
-
-    #[cfg(unshared_snapshot_mem)]
-    #[test]
-    fn prepare_restore_replaces_writable_mapping_for_current_snapshot() {
-        let mut sandbox = {
-            let path = simple_guest_as_pathbuf();
-            UninitializedSandbox::new(GuestBinary::FilePath(path), None)
-                .unwrap()
-                .evolve()
-                .unwrap()
-        };
-
-        let snapshot = sandbox.snapshot().unwrap();
-        let (candidate, _) = sandbox
-            .mem_mgr
-            .prepare_restore(&snapshot)
-            .unwrap()
-            .into_parts();
-
-        assert!(
-            candidate
-                .prepare_restore(&snapshot)
-                .unwrap()
-                .replaces_snapshot()
-        );
     }
 
     /// Test that snapshot restore properly resets vCPU debug registers. This test verifies

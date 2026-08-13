@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 
 ### Fixed
-* Mark a sandbox unrecoverable when snapshot restore cannot recover its VM mappings.
+* Mark a sandbox unrecoverable when snapshot restore fails while updating its VM mappings.
 * Fix symbol resolution in guest core dumps for sandboxes created from snapshots by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/1618
 * Reject malformed OCI snapshot metadata and non-regular artifact files during load.
 * Reset XCR0 during x86 snapshot restore.

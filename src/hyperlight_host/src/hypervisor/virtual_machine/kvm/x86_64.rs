@@ -769,18 +769,15 @@ impl DebuggableVm for KvmVm {
             .position(|&a| a == addr)
             .ok_or(DebugError::HwBreakpointNotFound(addr))?;
 
-        let mut updated_debug_regs = self.debug_regs;
-
         // Clear the address
-        updated_debug_regs.arch.debugreg[index] = 0;
+        self.debug_regs.arch.debugreg[index] = 0;
 
         // Disable LOCAL bit
-        updated_debug_regs.arch.debugreg[7] &= !(1 << (index * 2));
+        self.debug_regs.arch.debugreg[7] &= !(1 << (index * 2));
 
         self.vcpu_fd
-            .set_guest_debug(&updated_debug_regs)
+            .set_guest_debug(&self.debug_regs)
             .map_err(|e| RegisterError::SetDebugRegs(e.into()))?;
-        self.debug_regs = updated_debug_regs;
         Ok(())
     }
 }

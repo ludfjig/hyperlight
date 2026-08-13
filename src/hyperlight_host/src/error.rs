@@ -224,18 +224,6 @@ pub enum HyperlightError {
     #[error("The sandbox was poisoned")]
     PoisonedSandbox,
 
-    /// Snapshot restore could not establish a recoverable VM state.
-    #[error(
-        "Snapshot restore failed and the sandbox must be discarded. Mapping update failed: {update}. Mapping recovery failed: {recovery}"
-    )]
-    RestoreFailedUnrecoverably {
-        /// The mapping update failure.
-        #[source]
-        update: Box<HyperlightError>,
-        /// The failure encountered while recovering the prior mapping.
-        recovery: Box<HyperlightError>,
-    },
-
     /// The sandbox cannot safely perform further operations.
     #[error("The sandbox is unrecoverable and must be discarded")]
     UnrecoverableSandbox,
@@ -417,7 +405,6 @@ impl HyperlightError {
             | HyperlightError::RefCellBorrowFailed(_)
             | HyperlightError::RefCellMutBorrowFailed(_)
             | HyperlightError::ReturnValueConversionFailure(_, _)
-            | HyperlightError::RestoreFailedUnrecoverably { .. }
             | HyperlightError::SnapshotLayoutMismatch
             | HyperlightError::SnapshotHostFunctionMismatch { .. }
             | HyperlightError::SystemTimeError(_)
