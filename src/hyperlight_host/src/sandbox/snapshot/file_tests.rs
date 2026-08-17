@@ -20,12 +20,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use hyperlight_testing::simple_guest_as_pathbuf;
+use hyperlight_testing::{c_simple_guest_as_pathbuf, simple_guest_as_pathbuf};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::func::Registerable;
 use crate::mem::layout::SandboxMemoryLayout;
+use crate::mem::shared_mem::SharedMemory as _;
 use crate::sandbox::snapshot::{OciDigest, OciReference, OciTag, Snapshot};
 use crate::{GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox};
 
@@ -34,6 +35,33 @@ fn create_test_sandbox() -> MultiUseSandbox {
     UninitializedSandbox::new(GuestBinary::FilePath(path), None)
         .unwrap()
         .evolve()
+        .unwrap()
+}
+
+fn create_c_test_sandbox() -> MultiUseSandbox {
+    let path = c_simple_guest_as_pathbuf();
+    UninitializedSandbox::new(GuestBinary::FilePath(path), None)
+        .unwrap()
+        .evolve()
+        .unwrap()
+}
+
+fn random_sequence(sandbox: &mut MultiUseSandbox) -> [i32; 4] {
+    std::array::from_fn(|_| sandbox.call("NextRandom", ()).unwrap())
+}
+
+fn random_long_sequence(sandbox: &mut MultiUseSandbox) -> [i64; 4] {
+    std::array::from_fn(|_| sandbox.call("NextRandomLong", ()).unwrap())
+}
+
+fn libc_rng_reseed_request(sandbox: &MultiUseSandbox) -> u64 {
+    let scratch_size = sandbox.mem_mgr.scratch_mem.mem_size();
+    sandbox
+        .mem_mgr
+        .scratch_mem
+        .read::<u64>(
+            scratch_size - hyperlight_common::layout::SCRATCH_TOP_LIBC_RNG_SEED_OFFSET as usize,
+        )
         .unwrap()
 }
 
@@ -111,6 +139,7 @@ fn from_snapshot_in_memory_pre_init() {
     .unwrap();
     let mut sbox =
         MultiUseSandbox::from_snapshot(Arc::new(snap), HostFunctions::default(), None).unwrap();
+    assert_eq!(libc_rng_reseed_request(&sbox), 0);
     let result: i32 = sbox.call("GetStatic", ()).unwrap();
     assert_eq!(result, 0);
 }
@@ -3173,6 +3202,99 @@ fn from_snapshot_silently_ignores_layout_overrides() {
     assert_eq!(new_snap.layout().output_data_size(), original_output);
     assert_eq!(new_snap.layout().heap_size(), original_heap);
     assert_eq!(new_snap.layout().get_scratch_size(), original_scratch);
+}
+
+#[test]
+fn random_guest_libc_rng_reseeds_from_snapshot() {
+    let mut sandbox = create_c_test_sandbox();
+    let snapshot = sandbox.snapshot().unwrap();
+
+    let mut first =
+        MultiUseSandbox::from_snapshot(snapshot.clone(), HostFunctions::default(), None).unwrap();
+    let mut second =
+        MultiUseSandbox::from_snapshot(snapshot, HostFunctions::default(), None).unwrap();
+
+    assert_ne!(random_sequence(&mut first), random_sequence(&mut second));
+}
+
+#[test]
+fn guest_libc_rng_random_reseeds_from_snapshot() {
+    let mut sandbox = create_c_test_sandbox();
+    let snapshot = sandbox.snapshot().unwrap();
+
+    let mut first =
+        MultiUseSandbox::from_snapshot(snapshot.clone(), HostFunctions::default(), None).unwrap();
+    let mut second =
+        MultiUseSandbox::from_snapshot(snapshot, HostFunctions::default(), None).unwrap();
+
+    assert_ne!(
+        random_long_sequence(&mut first),
+        random_long_sequence(&mut second)
+    );
+}
+
+#[test]
+fn fresh_random_guest_libc_rng_sequences_differ() {
+    let mut first = create_c_test_sandbox();
+    let mut second = create_c_test_sandbox();
+
+    assert_ne!(random_sequence(&mut first), random_sequence(&mut second));
+}
+
+#[test]
+fn libc_rng_reseed_request_encodes_all_u32_seeds() {
+    let mut sandbox = create_c_test_sandbox();
+    for seed in [0, u32::MAX] {
+        sandbox.mem_mgr.request_libc_rng_reseed(seed).unwrap();
+        assert_eq!(
+            libc_rng_reseed_request(&sandbox),
+            (1_u64 << 32) | u64::from(seed)
+        );
+    }
+}
+
+#[test]
+fn guest_consumes_libc_rng_reseed_request_once() {
+    let mut sandbox = create_c_test_sandbox();
+    let snapshot = sandbox.snapshot().unwrap();
+    sandbox.restore(snapshot).unwrap();
+    assert_ne!(libc_rng_reseed_request(&sandbox), 0);
+
+    sandbox.call::<i32>("NextRandom", ()).unwrap();
+    assert_eq!(libc_rng_reseed_request(&sandbox), 0);
+    sandbox.call::<i32>("NextRandom", ()).unwrap();
+    assert_eq!(libc_rng_reseed_request(&sandbox), 0);
+}
+
+#[test]
+fn guest_libc_rng_reseeds_on_every_restore() {
+    let mut sandbox = create_c_test_sandbox();
+    let snapshot = sandbox.snapshot().unwrap();
+    sandbox.restore(snapshot.clone()).unwrap();
+    let first = random_sequence(&mut sandbox);
+    sandbox.restore(snapshot).unwrap();
+    let second = random_sequence(&mut sandbox);
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn persisted_guest_libc_rng_snapshot_reseeds_each_instance() {
+    let mut sandbox = create_c_test_sandbox();
+    let snapshot = sandbox.snapshot().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+
+    let loaded = Arc::new(Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap());
+    let mut first =
+        MultiUseSandbox::from_snapshot(loaded.clone(), HostFunctions::default(), None).unwrap();
+    let mut second =
+        MultiUseSandbox::from_snapshot(loaded, HostFunctions::default(), None).unwrap();
+
+    assert_ne!(random_sequence(&mut first), random_sequence(&mut second));
 }
 
 /// `from_snapshot` honors `guest_core_dump=true` so that
