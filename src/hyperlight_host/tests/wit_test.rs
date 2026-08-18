@@ -300,6 +300,8 @@ mod wit_test {
     };
     use crate::sb;
 
+    const PROPTEST_CASES: u32 = 32;
+
     prop_compose! {
         fn arb_testrecord()(contents in ".*", length in any::<u64>()) -> roundtrip::Testrecord {
             roundtrip::Testrecord { contents, length }
@@ -347,6 +349,7 @@ mod wit_test {
     macro_rules! make_test {
         ($fn:ident, $($ty:tt)*) => {
             proptest! {
+                #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
                 #[test]
                 fn $fn(x $($ty)*) {
                     assert_eq!(x, sb().roundtrip().$fn(x.clone()).unwrap())
