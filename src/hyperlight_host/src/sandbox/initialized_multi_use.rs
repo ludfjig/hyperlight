@@ -280,6 +280,10 @@ impl MultiUseSandbox {
         vm.initialise(peb_addr, seed, &mut hshm, &host_funcs, None)
             .map_err(crate::hypervisor::hyperlight_vm::HyperlightVmError::Initialize)?;
 
+        if matches!(snapshot.next_action(), super::snapshot::NextAction::Call(_)) {
+            hshm.request_libc_rng_reseed(seed as u32)?;
+        }
+
         // If the snapshot was taken from an already-initialized guest
         // (NextAction::Call), apply the captured special registers so
         // the guest resumes in the correct CPU state.
@@ -572,6 +576,9 @@ impl MultiUseSandbox {
                 .unmap_region(region)
                 .map_err(HyperlightVmError::UnmapRegion)?;
         }
+
+        self.mem_mgr
+            .request_libc_rng_reseed(rand::random::<u32>())?;
 
         // The restored snapshot is now our most current snapshot
         self.snapshot = Some(snapshot.clone());

@@ -104,6 +104,10 @@ pub(crate) fn internal_dispatch_function() {
         .try_pop_shared_input_data_into::<FunctionCall>()
         .expect("Function call deserialization failed");
 
+    // Reseed the libc PRNG if requested by the host.
+    #[cfg(feature = "libc")]
+    crate::refresh_libc_rng();
+
     let res = call_guest_function(function_call);
 
     match res {

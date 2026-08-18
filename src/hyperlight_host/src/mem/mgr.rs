@@ -540,6 +540,15 @@ impl SandboxMemoryManager<HostSharedMemory> {
             .map_err(From::from)
     }
 
+    pub(crate) fn request_libc_rng_reseed(&mut self, seed: u32) -> Result<()> {
+        // Zero means no request. The upper half marks a pending request, and
+        // the lower half contains the complete u32 seed.
+        self.update_scratch_bookkeeping_item(
+            hyperlight_common::layout::SCRATCH_TOP_LIBC_RNG_SEED_OFFSET,
+            (1_u64 << 32) | u64::from(seed),
+        )
+    }
+
     fn update_scratch_bookkeeping(&mut self) -> Result<()> {
         use hyperlight_common::layout::*;
         let scratch_size = self.scratch_mem.mem_size();

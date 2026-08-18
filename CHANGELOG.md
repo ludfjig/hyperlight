@@ -25,6 +25,7 @@ hyperlight versions.
 * Fix symbol resolution in guest core dumps for sandboxes created from snapshots by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/1618
 * Reject malformed OCI snapshot metadata and non-regular artifact files during load.
 * Reset XCR0 during x86 snapshot restore.
+* Reseed guest libc `rand()` and `random()` after restoring a snapshot to avoid multiple sandboxes sharing PRNG state.
 
 ## [v0.16.0] - 2026-06-26
 

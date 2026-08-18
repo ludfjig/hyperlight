@@ -210,6 +210,23 @@ unsafe extern "C" {
     fn srand(seed: u32);
 }
 
+#[cfg(feature = "libc")]
+pub(crate) fn refresh_libc_rng() {
+    let seed_ptr = hyperlight_guest::layout::libc_rng_seed_gva();
+    // SAFETY: The host maps this aligned u64 scratch slot for the guest's
+    // lifetime and writes it only while the guest is stopped.
+    let request = unsafe { seed_ptr.read_volatile() };
+    if request >> 32 != 0 {
+        // SAFETY: The scratch slot has the validity and exclusivity described
+        // above. The libc feature provides srand with a u32 seed.
+        unsafe {
+            srand(request as u32);
+            // clear request u32 and zero u32 seed
+            seed_ptr.write_volatile(0u64);
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, parent = tracing::Span::current(), level= "Trace")]
 extern "C" fn hyperlight_main_default() {
     // no-op
