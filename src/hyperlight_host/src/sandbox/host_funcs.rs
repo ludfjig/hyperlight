@@ -74,6 +74,10 @@ impl HostFunctions {
         Self(FunctionRegistry::default())
     }
 
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = (String, FunctionEntry)> {
+        self.0.functions_map.into_iter()
+    }
+
     /// Consume this `HostFunctions` and return the inner registry.
     pub(crate) fn into_inner(self) -> FunctionRegistry {
         self.0
