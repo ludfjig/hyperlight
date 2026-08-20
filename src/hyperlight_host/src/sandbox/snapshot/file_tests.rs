@@ -243,10 +243,10 @@ fn msrs_round_trip_via_disk() {
     assert_eq!(loaded.msrs(), original.as_ref());
 }
 
-/// A config with no `msrs` key loads and uses the destination reset set.
+/// A config with no `msrs` key is rejected.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn snapshot_without_msrs_key_loads_and_runs() {
+fn snapshot_without_msrs_key_is_rejected() {
     let (_dir, path) = save_for_mutation();
     rewrite_config(&path, |cfg| {
         let obj = cfg.as_object_mut().unwrap();
@@ -256,12 +256,11 @@ fn snapshot_without_msrs_key_loads_and_runs() {
         );
     });
 
-    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
-    assert_eq!(loaded.msrs(), Some(&Vec::new()));
-
-    let mut sbox =
-        MultiUseSandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
-    assert_eq!(sbox.call::<i32>("GetStatic", ()).unwrap(), 0);
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "missing field `msrs`");
 }
 
 /// A snapshot whose reset set includes a declared guest MSR carries that
@@ -2042,12 +2041,16 @@ fn original_entrypoint_addr_outside_snapshot_region_rejected() {
 }
 
 #[test]
-fn original_entrypoint_addr_zero_accepted() {
+fn original_entrypoint_addr_zero_rejected() {
     let (_dir, path) = save_for_mutation();
     rewrite_config(&path, |cfg| {
         cfg["original_entrypoint_addr"] = Value::from(0u64);
     });
-    Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "original entrypoint addr");
 }
 
 #[test]

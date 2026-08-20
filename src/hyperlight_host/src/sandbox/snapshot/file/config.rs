@@ -178,18 +178,14 @@ pub(super) struct OciSnapshotConfig {
     /// Guest virtual address of the ELF entry point
     /// (`load_addr + e_entry - base_va`), preserved across the
     /// Initialise->Call transition. Fills `AT_ENTRY` in core dumps so
-    /// gdb resolves PIE symbols. Optional: snapshots written before
-    /// this field existed deserialize to `0`, which core-dump code
-    /// treats as unknown.
-    #[serde(default)]
+    /// gdb resolves PIE symbols.
     pub(super) original_entrypoint_addr: u64,
     /// Special registers captured from the paused vCPU, restored
     /// verbatim when resuming the call.
     pub(super) sregs: CommonSpecialRegisters,
-    /// The MSRs saved in this snapshot. A missing or empty field restores the
-    /// destination baseline.
+    /// The MSRs saved in this snapshot. An empty field restores the destination
+    /// baseline.
     #[cfg(target_arch = "x86_64")]
-    #[serde(default)]
     pub(super) msrs: Vec<MsrEntry>,
     pub(super) layout: MemoryLayout,
     /// Total size of the memory blob in bytes (including the guest
@@ -507,9 +503,8 @@ impl OciSnapshotConfig {
             ));
         }
 
-        // ELF entry point GVA for `AT_ENTRY` in core dumps. 0 means
-        // unknown. Any other value must point inside the snapshot
-        // region, like `entrypoint_addr`.
+        // ELF entry point GVA for `AT_ENTRY` in core dumps. It must point
+        // inside the snapshot region, like `entrypoint_addr`.
         let snapshot_hi = code_lo
             .checked_add(self.layout.snapshot_size as u64)
             .ok_or_else(|| {
@@ -518,10 +513,7 @@ impl OciSnapshotConfig {
                     self.layout.snapshot_size
                 )
             })?;
-        if self.original_entrypoint_addr != 0
-            && (self.original_entrypoint_addr < code_lo
-                || self.original_entrypoint_addr >= snapshot_hi)
-        {
+        if self.original_entrypoint_addr < code_lo || self.original_entrypoint_addr >= snapshot_hi {
             return Err(crate::new_error!(
                 "snapshot original entrypoint addr {:#x} is outside the snapshot region [{:#x}, {:#x})",
                 self.original_entrypoint_addr,
@@ -666,10 +658,10 @@ mod tests {
         assert_eq!(restored.msrs, original.msrs);
     }
 
-    /// A config JSON with no MSR state deserializes to an empty set.
+    /// A config JSON with no MSR state is rejected.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn config_without_msrs_deserializes_to_empty_set() {
+    fn config_without_msrs_is_rejected() {
         let with = gating_config_with_msrs(Some(vec![MsrEntry {
             index: 0x10,
             value: 1,
@@ -678,8 +670,11 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&with).unwrap()).unwrap();
         assert!(json.as_object_mut().unwrap().remove("msrs").is_some());
 
-        let restored: OciSnapshotConfig = serde_json::from_value(json).unwrap();
-        assert!(restored.msrs.is_empty());
+        let err = serde_json::from_value::<OciSnapshotConfig>(json)
+            .err()
+            .expect("config without msrs should fail to deserialize")
+            .to_string();
+        assert!(err.contains("missing field `msrs`"), "got: {err}");
     }
 
     /// Every `ParameterType` survives the round-trip through its serde
@@ -767,7 +762,7 @@ mod tests {
             cpu_vendor: CpuVendor::current(),
             stack_top_gva: 0x2000,
             entrypoint_addr: SandboxMemoryLayout::BASE_ADDRESS as u64,
-            original_entrypoint_addr: 0,
+            original_entrypoint_addr: SandboxMemoryLayout::BASE_ADDRESS as u64,
             sregs: distinct_sregs(),
             #[cfg(target_arch = "x86_64")]
             msrs: Vec::new(),
@@ -850,7 +845,7 @@ mod schema_pin {
   "cpu_vendor": "intel",
   "stack_top_gva": 3735928559,
   "entrypoint_addr": 8192,
-  "original_entrypoint_addr": 0,
+  "original_entrypoint_addr": 4096,
   "sregs": {
     "cs": {
       "base": 1,
@@ -1036,7 +1031,7 @@ mod schema_pin {
   "cpu_vendor": "intel",
   "stack_top_gva": 3735928559,
   "entrypoint_addr": 8192,
-  "original_entrypoint_addr": 0,
+  "original_entrypoint_addr": 4096,
   "sregs": {
     "tcr_el1": 1,
     "mair_el1": 2,
