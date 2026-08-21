@@ -2594,16 +2594,45 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn test_map_file_cow_cleanup_no_handle_leak() {
+        use windows::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+
+        assert_eq!(
+            std::env::var("HYPERLIGHT_MAX_SURROGATES").as_deref(),
+            Ok("0"),
+            "run this test with HYPERLIGHT_MAX_SURROGATES=0"
+        );
+
         let (path, _) = create_test_file("hyperlight_test_map_file_cow_cleanup.bin", &[0xDD; 4096]);
 
-        {
+        let view_base = {
             let mut sbox = SandboxBuilder::new()
                 .build_from_file(simple_guest_as_pathbuf())
                 .unwrap();
 
-            sbox.map_file_cow(&path, 0x1_0000_0000).unwrap();
-            // sandbox dropped here
-        }
+            let guest_base = 0x1_0000_0000;
+            sbox.map_file_cow(&path, guest_base).unwrap();
+            let _: Vec<u8> = sbox
+                .call("ReadMappedBuffer", (guest_base, 1_u64, true))
+                .unwrap();
+
+            let views = sbox.vm.mapped_file_views();
+            assert_eq!(views.len(), 1);
+            views[0]
+        };
+
+        let mut memory_info = MEMORY_BASIC_INFORMATION::default();
+        let result = unsafe {
+            VirtualQuery(
+                Some(view_base.cast_const()),
+                &mut memory_info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        assert_ne!(result, 0, "VirtualQuery failed for {view_base:?}");
+        assert_eq!(
+            memory_info.State, MEM_FREE,
+            "mapped file view at {view_base:?} remains allocated after sandbox drop"
+        );
 
         std::fs::remove_file(&path)
             .expect("File should be deletable after sandbox with map_file_cow is dropped");

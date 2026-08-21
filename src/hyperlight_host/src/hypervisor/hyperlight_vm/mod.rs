@@ -406,6 +406,11 @@ pub(crate) struct HyperlightVm {
 }
 
 impl HyperlightVm {
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn mapped_file_views(&self) -> Vec<*mut std::ffi::c_void> {
+        self.vm.mapped_file_views()
+    }
+
     /// Map a region of host memory into the sandbox.
     ///
     /// Safety: The caller must ensure that the region points to valid memory and

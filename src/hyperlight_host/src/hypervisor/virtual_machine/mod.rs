@@ -423,6 +423,11 @@ pub enum HvfSyncError {
 /// Trait for single-vCPU VMs. Provides a common interface for basic VM operations.
 /// Abstracts over differences between KVM, MSHV and WHP implementations.
 pub(crate) trait VirtualMachine: Debug + Send {
+    #[cfg(all(test, target_os = "windows"))]
+    fn mapped_file_views(&self) -> Vec<*mut std::ffi::c_void> {
+        Vec::new()
+    }
+
     /// Map memory region into this VM
     ///
     /// # Safety

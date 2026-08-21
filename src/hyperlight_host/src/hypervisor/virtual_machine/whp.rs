@@ -377,6 +377,11 @@ impl WhpVm {
 }
 
 impl VirtualMachine for WhpVm {
+    #[cfg(test)]
+    fn mapped_file_views(&self) -> Vec<*mut c_void> {
+        self.file_mappings.iter().map(|(_, view)| *view).collect()
+    }
+
     unsafe fn map_memory(
         &mut self,
         (_slot, region): (u32, &MemoryRegion),
