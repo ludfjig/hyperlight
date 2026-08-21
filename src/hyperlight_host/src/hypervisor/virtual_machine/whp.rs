@@ -1360,11 +1360,6 @@ impl WhpVm {
 
 impl Drop for WhpVm {
     fn drop(&mut self) {
-        // Clean up any remaining file mappings that weren't explicitly unmapped.
-        for (handle, view) in self.file_mappings.drain(..) {
-            release_file_mapping(view, handle);
-        }
-
         // Stop the software timer thread before tearing down the partition.
         #[cfg(feature = "hw-interrupts")]
         if let Some(mut t) = self.timer.take() {
@@ -1378,6 +1373,11 @@ impl Drop for WhpVm {
         // set_dropped() completes before this Drop impl runs.)
         if let Err(e) = unsafe { WHvDeletePartition(self.partition) } {
             tracing::error!("Failed to delete partition: {}", e);
+        }
+
+        // Clean up any remaining file mappings that weren't explicitly unmapped.
+        for (handle, view) in self.file_mappings.drain(..) {
+            release_file_mapping(view, handle);
         }
     }
 }
