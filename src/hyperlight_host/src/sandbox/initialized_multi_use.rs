@@ -1081,7 +1081,7 @@ impl MultiUseSandbox {
     /// # Ok(())
     /// # }
     /// ```
-    #[deprecated(since = "0.16.0", note = "use status().is_poisoned()")]
+    #[deprecated(since = "0.17.0", note = "use status().is_poisoned()")]
     pub fn poisoned(&self) -> bool {
         self.status.is_poisoned()
     }
