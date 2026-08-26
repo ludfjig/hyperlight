@@ -583,6 +583,17 @@ pub(crate) fn hyperv_msr_reset_indices(
     vm: &dyn VirtualMachine,
     guest_msrs: &[u32],
 ) -> std::result::Result<Vec<u32>, CreateVmError> {
+    // MSR probing is expensive. Cache the common case with no additional guest MSRs.
+    // Default VMs in a process use the same partition configuration and MSR set.
+    static DEFAULT: OnceLock<Vec<u32>> = OnceLock::new();
+
+    // Cache hit: no guest MSRs, so the reset set is always the same.
+    if guest_msrs.is_empty()
+        && let Some(indices) = DEFAULT.get()
+    {
+        return Ok(indices.clone());
+    }
+
     validate_guest_msrs(vm, guest_msrs)?;
     let mut indices = filterless_core_reset_candidates()
         .filter_map(|index| match probe_resettable(vm, index) {
@@ -602,6 +613,11 @@ pub(crate) fn hyperv_msr_reset_indices(
     indices.extend(guest_msrs.iter().copied());
     indices.sort_unstable();
     indices.dedup();
+    // Populate the cache for future default VMs.
+    if guest_msrs.is_empty() {
+        // An error means another thread populated the same cache (harmless).
+        let _ = DEFAULT.set(indices.clone());
+    }
     Ok(indices)
 }
 
