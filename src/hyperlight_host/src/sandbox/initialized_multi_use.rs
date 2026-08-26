@@ -572,14 +572,14 @@ impl MultiUseSandbox {
             return Err(error);
         }
 
+        // Restore captured MSR state as part of the x86_64 vCPU reset.
         self.vm
-            .reset_vcpu(snapshot.root_pt_gpa(), sregs)
-            .map_err(HyperlightVmError::Restore)?;
-
-        // Restore captured MSR state.
-        #[cfg(target_arch = "x86_64")]
-        self.vm
-            .restore_msrs(snapshot.msrs())
+            .reset_vcpu(
+                snapshot.root_pt_gpa(),
+                sregs,
+                #[cfg(target_arch = "x86_64")]
+                snapshot.msrs(),
+            )
             .map_err(HyperlightVmError::Restore)?;
 
         self.vm.set_stack_top(snapshot.stack_top_gva());

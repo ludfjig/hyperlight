@@ -1009,6 +1009,55 @@ impl VirtualMachine for WhpVm {
         .map_err(|e| RegisterError::SetXcrs(e.into()))
     }
 
+    fn can_batch_registers(&self) -> bool {
+        true
+    }
+
+    fn set_batched_registers(
+        &mut self,
+        regs: &CommonRegisters,
+        debug_regs: &CommonDebugRegs,
+        sregs: &CommonSpecialRegisters,
+        xcr0: u64,
+        msrs: &[MsrEntry],
+    ) -> std::result::Result<(), RegisterError> {
+        let regs: [(WHV_REGISTER_NAME, Align16<WHV_REGISTER_VALUE>); WHP_REGS_NAMES_LEN] =
+            regs.into();
+        let debug_regs: [(WHV_REGISTER_NAME, Align16<WHV_REGISTER_VALUE>);
+            WHP_DEBUG_REGS_NAMES_LEN] = debug_regs.into();
+        let sregs: [(WHV_REGISTER_NAME, Align16<WHV_REGISTER_VALUE>); WHP_SREGS_NAMES_LEN] =
+            sregs.into();
+        let msrs: Vec<_> = msrs
+            .iter()
+            .map(|entry| {
+                msr_to_whv_register_name(entry.index)
+                    .map(|name| (name, Align16(WHV_REGISTER_VALUE { Reg64: entry.value })))
+                    .ok_or(RegisterError::MsrsUnsupported)
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
+        let mut registers =
+            Vec::with_capacity(regs.len() + debug_regs.len() + sregs.len() + 1 + msrs.len());
+        registers.extend(regs);
+        registers.extend(debug_regs);
+        #[cfg(feature = "hw-interrupts")]
+        registers.extend(
+            sregs
+                .into_iter()
+                .filter(|(name, _)| *name != WHvX64RegisterApicBase),
+        );
+        #[cfg(not(feature = "hw-interrupts"))]
+        registers.extend(sregs);
+        registers.push((
+            WHvX64RegisterXCr0,
+            Align16(WHV_REGISTER_VALUE { Reg64: xcr0 }),
+        ));
+        registers.extend(msrs);
+
+        self.set_registers(&registers)
+            .map_err(|error| RegisterError::SetBatchedRegisters(error.into()))
+    }
+
     #[cfg(test)]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError> {
         // Get the required buffer size by calling with NULL buffer.

@@ -648,6 +648,17 @@ impl VirtualMachine for KvmVm {
             .map_err(|e| RegisterError::SetXcrs(e.into()))
     }
 
+    fn set_batched_registers(
+        &mut self,
+        _regs: &CommonRegisters,
+        _debug_regs: &CommonDebugRegs,
+        _sregs: &CommonSpecialRegisters,
+        _xcr0: u64,
+        _msrs: &[MsrEntry],
+    ) -> std::result::Result<(), RegisterError> {
+        Err(RegisterError::BatchedSetRegistersUnsupported)
+    }
+
     #[cfg(test)]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError> {
         if std::mem::size_of_val(xsave) != XSAVE_BUFFER_SIZE {
