@@ -87,6 +87,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
+          # Concurrent macOS runners share ~/.cargo/bin, so cleanup can remove Cargo from another job.
+          cache-bin: ${{ runner.os != 'macOS' }}
           shared-key: "${{ inputs.arch }}-${{ runner.os }}-${{ inputs.hypervisor }}-${{ inputs.config }}"
           cache-on-failure: "true"
           # Only save on main as caches are not shared across branches.
