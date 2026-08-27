@@ -301,6 +301,10 @@ impl MultiUseSandbox {
             let sregs = snapshot.sregs().ok_or_else(|| {
                 crate::new_error!("snapshot with NextAction::Call must have captured sregs")
             })?;
+            #[cfg(target_arch = "x86_64")]
+            let msrs = snapshot.msrs().ok_or_else(|| {
+                crate::new_error!("snapshot with NextAction::Call must have captured MSRs")
+            })?;
             vm.apply_sregs(hshm.layout.get_pt_base_gpa(), sregs)
                 .map_err(|e| {
                     crate::HyperlightError::HyperlightVmError(
@@ -310,7 +314,7 @@ impl MultiUseSandbox {
 
             // Restore captured MSR state.
             #[cfg(target_arch = "x86_64")]
-            vm.restore_msrs(snapshot.msrs()).map_err(|e| {
+            vm.restore_msrs(msrs).map_err(|e| {
                 crate::HyperlightError::HyperlightVmError(
                     crate::hypervisor::hyperlight_vm::HyperlightVmError::Restore(e),
                 )
@@ -555,6 +559,10 @@ impl MultiUseSandbox {
         let sregs = snapshot.sregs().ok_or_else(|| {
             HyperlightError::Error("snapshot from running sandbox should have sregs".to_string())
         })?;
+        #[cfg(target_arch = "x86_64")]
+        let msrs = snapshot.msrs().ok_or_else(|| {
+            HyperlightError::Error("snapshot from running sandbox should have MSRs".to_string())
+        })?;
 
         // Errors below leave the sandbox poisoned unless base mapping updates make it unrecoverable.
         self.status = SandboxStatus::Poisoned;
@@ -578,7 +586,7 @@ impl MultiUseSandbox {
                 snapshot.root_pt_gpa(),
                 sregs,
                 #[cfg(target_arch = "x86_64")]
-                snapshot.msrs(),
+                msrs,
             )
             .map_err(HyperlightVmError::Restore)?;
 

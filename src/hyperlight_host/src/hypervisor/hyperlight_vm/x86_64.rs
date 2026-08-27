@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025 The Hyperlight Authors.
 
-use std::borrow::Cow;
 #[cfg(gdb)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -240,30 +239,14 @@ impl HyperlightVm {
         Ok(self.vm.msrs(&self.msr_reset.persist_indices())?)
     }
 
-    /// Restores snapshot MSRs or the initialization baseline.
+    /// Restores snapshot MSRs and resets all other MSRs to their initialization values.
     pub(crate) fn restore_msrs(
         &mut self,
-        snap_msrs: Option<&Vec<MsrEntry>>,
+        snap_msrs: &[MsrEntry],
     ) -> std::result::Result<(), ResetVcpuError> {
-        let msrs = Self::msr_reset_values(&self.msr_reset, snap_msrs)?;
+        let msrs = self.msr_reset.validate_snapshot(snap_msrs)?;
         self.vm.set_msrs(&msrs)?;
         Ok(())
-    }
-
-    /// Returns the MSR values to restore. Snapshot values are used when provided.
-    /// All other values are reset to their initial values.
-    fn msr_reset_values<'a>(
-        msr_reset: &'a MsrResetState,
-        snapshot_msrs: Option<&Vec<MsrEntry>>,
-    ) -> std::result::Result<Cow<'a, [MsrEntry]>, RegisterError> {
-        match snapshot_msrs {
-            // No captured MSRs. Use this VM's baseline.
-            None => Ok(Cow::Borrowed(msr_reset.baseline())),
-            // Scrub the reset set to the destination baseline and write the
-            // snapshot's captured values on top. Validation rejects any
-            // captured index the destination cannot restore.
-            Some(msrs) => Ok(Cow::Owned(msr_reset.validate_snapshot(msrs)?)),
-        }
     }
 
     /// Dispatch a call from the host to the guest using the given pointer
@@ -328,13 +311,14 @@ impl HyperlightVm {
     /// - XSAVE (includes FPU/SSE state with proper FCW and MXCSR defaults)
     /// - XCR0
     /// - Special registers (restored from snapshot, with CR3 updated to new page table location)
-    /// - Model-specific registers
+    /// - Model-specific registers (restored from snapshot, with omitted values reset to their
+    ///   initialization values)
     // TODO: check if other state needs to be reset
     pub(crate) fn reset_vcpu(
         &mut self,
         cr3: u64,
         sregs: &CommonSpecialRegisters,
-        snapshot_msrs: Option<&Vec<MsrEntry>>,
+        snapshot_msrs: &[MsrEntry],
     ) -> std::result::Result<(), ResetVcpuError> {
         let regs = CommonRegisters {
             rflags: 1 << 1, // Reserved bit always set
@@ -342,7 +326,7 @@ impl HyperlightVm {
         };
         let debug_regs = CommonDebugRegs::default();
         let sregs = Self::sregs_with_cr3(cr3, sregs)?;
-        let msrs = Self::msr_reset_values(&self.msr_reset, snapshot_msrs)?;
+        let msrs = self.msr_reset.validate_snapshot(snapshot_msrs)?;
 
         self.pending_tlb_flush = true;
         // Batch to avoid multiple hvcall overhead if supported
@@ -608,11 +592,7 @@ impl HyperlightVm {
     /// Tests use it to classify each resettable MSR.
     #[cfg(test)]
     pub(crate) fn reset_set_indices(&self) -> Vec<u32> {
-        self.msr_reset
-            .baseline()
-            .iter()
-            .map(|entry| entry.index)
-            .collect()
+        self.msr_reset.reset_indices()
     }
 }
 
@@ -1628,7 +1608,7 @@ mod tests {
         assert_eq!(hyperlight_vm.vm.xcr0().unwrap(), 3);
 
         // Reset the vCPU
-        hyperlight_vm.reset_vcpu(0, &default_sregs(), None).unwrap();
+        hyperlight_vm.reset_vcpu(0, &default_sregs(), &[]).unwrap();
 
         // Verify registers are reset to defaults
         assert_regs_reset(hyperlight_vm.vm.as_ref());
@@ -1792,7 +1772,7 @@ mod tests {
             assert_eq!(regs, expected_dirty);
 
             // Reset vcpu
-            hyperlight_vm.reset_vcpu(0, &default_sregs(), None).unwrap();
+            hyperlight_vm.reset_vcpu(0, &default_sregs(), &[]).unwrap();
 
             // Check registers are reset to defaults
             assert_regs_reset(hyperlight_vm.vm.as_ref());
@@ -1916,7 +1896,7 @@ mod tests {
             }
 
             // Reset vcpu
-            hyperlight_vm.reset_vcpu(0, &default_sregs(), None).unwrap();
+            hyperlight_vm.reset_vcpu(0, &default_sregs(), &[]).unwrap();
 
             // Check FPU is reset to defaults
             assert_fpu_reset(hyperlight_vm.vm.as_ref());
@@ -1967,7 +1947,7 @@ mod tests {
             assert_eq!(debug_regs, expected_dirty);
 
             // Reset vcpu
-            hyperlight_vm.reset_vcpu(0, &default_sregs(), None).unwrap();
+            hyperlight_vm.reset_vcpu(0, &default_sregs(), &[]).unwrap();
 
             // Check debug registers are reset to default values
             assert_debug_regs_reset(hyperlight_vm.vm.as_ref());
@@ -2016,7 +1996,7 @@ mod tests {
             assert_eq!(sregs, expected_dirty);
 
             // Reset vcpu
-            hyperlight_vm.reset_vcpu(0, &default_sregs(), None).unwrap();
+            hyperlight_vm.reset_vcpu(0, &default_sregs(), &[]).unwrap();
 
             // Check registers are reset to defaults (CR3 is 0 as passed to reset_vcpu)
             let sregs = hyperlight_vm.vm.sregs().unwrap();
@@ -2056,7 +2036,7 @@ mod tests {
 
             ctx.ctx
                 .vm
-                .reset_vcpu(root_pt_addr, &segment_state, None)
+                .reset_vcpu(root_pt_addr, &segment_state, &[])
                 .unwrap();
 
             // Re-run from entrypoint (flag=1 means guest skips dirty phase, just does FXSAVE)
