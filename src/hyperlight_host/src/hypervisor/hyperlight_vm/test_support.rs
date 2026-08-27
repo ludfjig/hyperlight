@@ -232,6 +232,36 @@ impl VirtualMachine for FaultInjectingVirtualMachine {
         self.inner().set_xcr0(value)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn can_batch_registers(&self) -> bool {
+        self.inner().can_batch_registers()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_batched_registers(
+        &mut self,
+        regs: &CommonRegisters,
+        debug_regs: &CommonDebugRegs,
+        sregs: &CommonSpecialRegisters,
+        xcr0: u64,
+        msrs: &[MsrEntry],
+    ) -> std::result::Result<(), RegisterError> {
+        if self.should_fail(VmOperation::SetRegs) {
+            return Err(RegisterError::SetRegs(Self::injected_error()));
+        }
+        if self.should_fail(VmOperation::SetDebugRegs) {
+            return Err(RegisterError::SetDebugRegs(Self::injected_error()));
+        }
+        if self.should_fail(VmOperation::SetSregs) {
+            return Err(RegisterError::SetSregs(Self::injected_error()));
+        }
+        if self.should_fail(VmOperation::SetMsrs) {
+            return Err(RegisterError::SetMsrs(Self::injected_error()));
+        }
+        self.inner_mut()
+            .set_batched_registers(regs, debug_regs, sregs, xcr0, msrs)
+    }
+
     #[cfg(target_arch = "aarch64")]
     fn can_reset_vcpu(&self) -> bool {
         self.inner().can_reset_vcpu()

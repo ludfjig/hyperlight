@@ -616,6 +616,157 @@ impl VirtualMachine for MshvVm {
             .map_err(|e| RegisterError::SetXcrs(e.into()))
     }
 
+    fn can_batch_registers(&self) -> bool {
+        true
+    }
+
+    fn set_batched_registers(
+        &mut self,
+        regs: &CommonRegisters,
+        debug_regs: &CommonDebugRegs,
+        sregs: &CommonSpecialRegisters,
+        xcr0: u64,
+        msrs: &[MsrEntry],
+    ) -> std::result::Result<(), RegisterError> {
+        use mshv_bindings::*;
+
+        if sregs.interrupt_bitmap.iter().any(|bits| *bits != 0) {
+            return Err(RegisterError::SetBatchedRegisters(
+                mshv_ioctls::MshvError::Errno(vmm_sys_util::errno::Error::new(libc::EINVAL)).into(),
+            ));
+        }
+
+        macro_rules! reg64 {
+            ($name:expr, $value:expr) => {
+                hv_register_assoc {
+                    name: $name,
+                    value: hv_register_value { reg64: $value },
+                    ..Default::default()
+                }
+            };
+        }
+
+        let mut registers = vec![
+            reg64!(hv_register_name_HV_X64_REGISTER_RAX, regs.rax),
+            reg64!(hv_register_name_HV_X64_REGISTER_RBX, regs.rbx),
+            reg64!(hv_register_name_HV_X64_REGISTER_RCX, regs.rcx),
+            reg64!(hv_register_name_HV_X64_REGISTER_RDX, regs.rdx),
+            reg64!(hv_register_name_HV_X64_REGISTER_RSI, regs.rsi),
+            reg64!(hv_register_name_HV_X64_REGISTER_RDI, regs.rdi),
+            reg64!(hv_register_name_HV_X64_REGISTER_RSP, regs.rsp),
+            reg64!(hv_register_name_HV_X64_REGISTER_RBP, regs.rbp),
+            reg64!(hv_register_name_HV_X64_REGISTER_R8, regs.r8),
+            reg64!(hv_register_name_HV_X64_REGISTER_R9, regs.r9),
+            reg64!(hv_register_name_HV_X64_REGISTER_R10, regs.r10),
+            reg64!(hv_register_name_HV_X64_REGISTER_R11, regs.r11),
+            reg64!(hv_register_name_HV_X64_REGISTER_R12, regs.r12),
+            reg64!(hv_register_name_HV_X64_REGISTER_R13, regs.r13),
+            reg64!(hv_register_name_HV_X64_REGISTER_R14, regs.r14),
+            reg64!(hv_register_name_HV_X64_REGISTER_R15, regs.r15),
+            reg64!(hv_register_name_HV_X64_REGISTER_RIP, regs.rip),
+            reg64!(hv_register_name_HV_X64_REGISTER_RFLAGS, regs.rflags),
+            reg64!(hv_register_name_HV_X64_REGISTER_DR0, debug_regs.dr0),
+            reg64!(hv_register_name_HV_X64_REGISTER_DR1, debug_regs.dr1),
+            reg64!(hv_register_name_HV_X64_REGISTER_DR2, debug_regs.dr2),
+            reg64!(hv_register_name_HV_X64_REGISTER_DR3, debug_regs.dr3),
+            reg64!(hv_register_name_HV_X64_REGISTER_DR6, debug_regs.dr6),
+            reg64!(hv_register_name_HV_X64_REGISTER_DR7, debug_regs.dr7),
+        ];
+
+        let mshv_sregs: SpecialRegisters = sregs.into();
+        registers.extend([
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_CS,
+                value: hv_register_value {
+                    segment: mshv_sregs.cs.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_DS,
+                value: hv_register_value {
+                    segment: mshv_sregs.ds.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_ES,
+                value: hv_register_value {
+                    segment: mshv_sregs.es.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_FS,
+                value: hv_register_value {
+                    segment: mshv_sregs.fs.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_GS,
+                value: hv_register_value {
+                    segment: mshv_sregs.gs.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_SS,
+                value: hv_register_value {
+                    segment: mshv_sregs.ss.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_TR,
+                value: hv_register_value {
+                    segment: mshv_sregs.tr.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_LDTR,
+                value: hv_register_value {
+                    segment: mshv_sregs.ldt.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_GDTR,
+                value: hv_register_value {
+                    table: mshv_sregs.gdt.into(),
+                },
+                ..Default::default()
+            },
+            hv_register_assoc {
+                name: hv_register_name_HV_X64_REGISTER_IDTR,
+                value: hv_register_value {
+                    table: mshv_sregs.idt.into(),
+                },
+                ..Default::default()
+            },
+            reg64!(hv_register_name_HV_X64_REGISTER_INTERMEDIATE_CR0, sregs.cr0),
+            reg64!(hv_register_name_HV_X64_REGISTER_CR2, sregs.cr2),
+            reg64!(hv_register_name_HV_X64_REGISTER_INTERMEDIATE_CR3, sregs.cr3),
+            reg64!(hv_register_name_HV_X64_REGISTER_INTERMEDIATE_CR4, sregs.cr4),
+            reg64!(hv_register_name_HV_X64_REGISTER_CR8, sregs.cr8),
+            reg64!(hv_register_name_HV_X64_REGISTER_EFER, sregs.efer),
+            reg64!(hv_register_name_HV_X64_REGISTER_APIC_BASE, sregs.apic_base),
+            reg64!(hv_register_name_HV_X64_REGISTER_XFEM, xcr0),
+        ]);
+
+        for entry in msrs {
+            registers.push(reg64!(
+                msr_to_hv_register_name(entry.index).map_err(|_| RegisterError::MsrsUnsupported)?,
+                entry.value
+            ));
+        }
+
+        self.vcpu_fd
+            .set_reg(&registers)
+            .map_err(|error| RegisterError::SetBatchedRegisters(error.into()))
+    }
+
     #[cfg(test)]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError> {
         if std::mem::size_of_val(xsave) != XSAVE_BUFFER_SIZE {

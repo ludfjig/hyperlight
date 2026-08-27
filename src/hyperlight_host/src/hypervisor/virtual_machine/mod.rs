@@ -309,6 +309,12 @@ pub enum RegisterError {
     #[error("Failed to set MSRs: {0}")]
     SetMsrs(HypervisorError),
     #[cfg(target_arch = "x86_64")]
+    #[error("Failed to set batched registers: {0}")]
+    SetBatchedRegisters(HypervisorError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Batched register writes are not supported")]
+    BatchedSetRegistersUnsupported,
+    #[cfg(target_arch = "x86_64")]
     #[error("Snapshot MSR index {index:#x} is not in this VM's reset set")]
     InvalidSnapshotMsrIndex {
         /// Architectural MSR index supplied by the snapshot.
@@ -502,6 +508,22 @@ pub(crate) trait VirtualMachine: Debug + Send {
     fn xcr0(&self) -> std::result::Result<u64, RegisterError>;
     #[cfg(target_arch = "x86_64")]
     fn set_xcr0(&self, value: u64) -> std::result::Result<(), RegisterError>;
+
+    #[cfg(target_arch = "x86_64")]
+    fn can_batch_registers(&self) -> bool {
+        false
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn set_batched_registers(
+        &mut self,
+        _regs: &CommonRegisters,
+        _debug_regs: &CommonDebugRegs,
+        _sregs: &CommonSpecialRegisters,
+        _xcr0: u64,
+        _msrs: &[MsrEntry],
+    ) -> std::result::Result<(), RegisterError> {
+        Err(RegisterError::BatchedSetRegistersUnsupported)
+    }
 
     /// Single-operation vCPU reset
     #[cfg(target_arch = "aarch64")]

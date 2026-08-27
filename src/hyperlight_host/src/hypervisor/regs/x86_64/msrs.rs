@@ -60,9 +60,10 @@ impl MsrResetState {
         })
     }
 
-    /// The creation-time baseline entries.
-    pub fn baseline(&self) -> &[MsrEntry] {
-        &self.baseline
+    /// Every MSR index in the reset set.
+    #[cfg(test)]
+    pub fn reset_indices(&self) -> Vec<u32> {
+        self.baseline.iter().map(|entry| entry.index).collect()
     }
 
     /// The MSR indices captured into a snapshot: the declared guest MSRs plus

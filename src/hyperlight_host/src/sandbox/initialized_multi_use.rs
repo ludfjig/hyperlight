@@ -301,6 +301,10 @@ impl MultiUseSandbox {
             let sregs = snapshot.sregs().ok_or_else(|| {
                 crate::new_error!("snapshot with NextAction::Call must have captured sregs")
             })?;
+            #[cfg(target_arch = "x86_64")]
+            let msrs = snapshot.msrs().ok_or_else(|| {
+                crate::new_error!("snapshot with NextAction::Call must have captured MSRs")
+            })?;
             vm.apply_sregs(hshm.layout.get_pt_base_gpa(), sregs)
                 .map_err(|e| {
                     crate::HyperlightError::HyperlightVmError(
@@ -310,7 +314,7 @@ impl MultiUseSandbox {
 
             // Restore captured MSR state.
             #[cfg(target_arch = "x86_64")]
-            vm.restore_msrs(snapshot.msrs()).map_err(|e| {
+            vm.restore_msrs(msrs).map_err(|e| {
                 crate::HyperlightError::HyperlightVmError(
                     crate::hypervisor::hyperlight_vm::HyperlightVmError::Restore(e),
                 )
@@ -555,6 +559,10 @@ impl MultiUseSandbox {
         let sregs = snapshot.sregs().ok_or_else(|| {
             HyperlightError::Error("snapshot from running sandbox should have sregs".to_string())
         })?;
+        #[cfg(target_arch = "x86_64")]
+        let msrs = snapshot.msrs().ok_or_else(|| {
+            HyperlightError::Error("snapshot from running sandbox should have MSRs".to_string())
+        })?;
 
         // Errors below leave the sandbox poisoned unless base mapping updates make it unrecoverable.
         self.status = SandboxStatus::Poisoned;
@@ -572,14 +580,14 @@ impl MultiUseSandbox {
             return Err(error);
         }
 
+        // Restore captured MSR state as part of the x86_64 vCPU reset.
         self.vm
-            .reset_vcpu(snapshot.root_pt_gpa(), sregs)
-            .map_err(HyperlightVmError::Restore)?;
-
-        // Restore captured MSR state.
-        #[cfg(target_arch = "x86_64")]
-        self.vm
-            .restore_msrs(snapshot.msrs())
+            .reset_vcpu(
+                snapshot.root_pt_gpa(),
+                sregs,
+                #[cfg(target_arch = "x86_64")]
+                msrs,
+            )
             .map_err(HyperlightVmError::Restore)?;
 
         self.vm.set_stack_top(snapshot.stack_top_gva());
