@@ -516,12 +516,14 @@ pub(crate) trait VirtualMachine: Debug + Send {
     #[cfg(target_arch = "x86_64")]
     fn set_batched_registers(
         &mut self,
-        regs: &CommonRegisters,
-        debug_regs: &CommonDebugRegs,
-        sregs: &CommonSpecialRegisters,
-        xcr0: u64,
-        msrs: &[MsrEntry],
-    ) -> std::result::Result<(), RegisterError>;
+        _regs: &CommonRegisters,
+        _debug_regs: &CommonDebugRegs,
+        _sregs: &CommonSpecialRegisters,
+        _xcr0: u64,
+        _msrs: &[MsrEntry],
+    ) -> std::result::Result<(), RegisterError> {
+        Err(RegisterError::BatchedSetRegistersUnsupported)
+    }
 
     /// Single-operation vCPU reset
     #[cfg(target_arch = "aarch64")]

@@ -1223,18 +1223,6 @@ impl VirtualMachine for HvfVm {
         todo!()
     }
 
-    #[cfg(target_arch = "x86_64")]
-    fn set_batched_registers(
-        &mut self,
-        _regs: &CommonRegisters,
-        _debug_regs: &CommonDebugRegs,
-        _sregs: &CommonSpecialRegisters,
-        _xcr0: u64,
-        _msrs: &[MsrEntry],
-    ) -> std::result::Result<(), RegisterError> {
-        Err(RegisterError::BatchedSetRegistersUnsupported)
-    }
-
     #[cfg(target_arch = "aarch64")]
     fn can_reset_vcpu(&self) -> bool {
         true
