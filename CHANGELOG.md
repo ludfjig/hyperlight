@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 ### Changed
+* **Breaking:** Related snapshots share immutable memory layers. This reduces
+  capture time, memory use, and storage. Existing snapshot files must be
+  regenerated.
 
 ### Removed
 

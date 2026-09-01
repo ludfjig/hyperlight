@@ -36,7 +36,7 @@ use crate::hypervisor::virtual_machine::{
 };
 #[cfg(crashdump)]
 use crate::mem::memory_region::MemoryRegion;
-use crate::mem::mgr::SandboxMemoryManager;
+use crate::mem::mgr::{SandboxMemoryManager, SnapshotBackings};
 use crate::mem::ptr::RawPtr;
 use crate::mem::shared_mem::{GuestSharedMemory, HostSharedMemory};
 use crate::sandbox::SandboxConfiguration;
@@ -57,7 +57,7 @@ impl HyperlightVm {
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        snapshot_mem: SnapshotSharedMemory<GuestSharedMemory>,
+        snapshot_mem: SnapshotBackings<GuestSharedMemory>,
         scratch_mem: GuestSharedMemory,
         _root_pt_addr: u64,
         next_action: NextAction,
@@ -105,8 +105,6 @@ impl HyperlightVm {
         })
         .map_err(VmError::Register)?;
 
-        let snapshot_slot = 0u32;
-        let scratch_slot = 1u32;
         #[cfg_attr(not(gdb), allow(unused_mut))]
         let mut ret = Self {
             vm,
@@ -115,12 +113,13 @@ impl HyperlightVm {
             interrupt_handle,
             page_size,
 
-            next_slot: scratch_slot + 1,
+            next_slot: SCRATCH_SLOT + 1,
             freed_slots: Vec::new(),
 
-            snapshot_slot,
+            snapshot_mappings: Vec::new(),
             snapshot_memory: None,
-            scratch_slot,
+            #[cfg(unshared_snapshot_mem)]
+            retired_snapshot_memory: Vec::new(),
             scratch_memory: None,
 
             mmap_regions: Vec::new(),
@@ -140,7 +139,7 @@ impl HyperlightVm {
             msr_reset,
         };
 
-        ret.update_snapshot_mapping(snapshot_mem)?;
+        ret.update_snapshot_mappings(snapshot_mem)?;
         ret.update_scratch_mapping(scratch_mem)?;
 
         // Send the interrupt handle to the GDB thread if debugging is enabled
@@ -1431,7 +1430,7 @@ mod tests {
         #[cfg(any(crashdump, gdb))]
         let rt_cfg: SandboxRuntimeConfig = Default::default();
 
-        let mut layout = SandboxMemoryLayout::new(config, code.len(), 4096, None).unwrap();
+        let layout = SandboxMemoryLayout::new(config, code.len(), 4096, None).unwrap();
 
         let pt_base_gpa = layout.get_pt_base_gpa();
         let pt_buf = GuestPageTableBuffer::new(pt_base_gpa as usize);
@@ -1474,22 +1473,30 @@ mod tests {
         unsafe { vmem::map(&pt_buf, scratch_mapping) };
 
         let pt_bytes = pt_buf.into_bytes();
-        layout.set_pt_size(pt_bytes.len()).unwrap();
+        layout.ensure_page_tables_fit(pt_bytes.len()).unwrap();
 
         let mem_size = layout.get_memory_size().unwrap();
         let mut snapshot_contents = vec![0u8; mem_size];
-        let snapshot_pt_start = mem_size - layout.get_pt_size();
+        let snapshot_pt_start = mem_size - pt_bytes.len();
         snapshot_contents[snapshot_pt_start..].copy_from_slice(&pt_bytes);
         snapshot_contents[layout.guest_code_offset()..layout.guest_code_offset() + code.len()]
             .copy_from_slice(code);
         layout.write_peb(&mut snapshot_contents).unwrap();
         let ro_mem =
             ReadonlySharedMemory::from_bytes(&snapshot_contents, snapshot_pt_start).unwrap();
+        let snapshot_memory = crate::sandbox::snapshot::SnapshotMemory::from_flat(
+            ro_mem,
+            SandboxMemoryLayout::BASE_ADDRESS as u64,
+            snapshot_pt_start,
+            snapshot_pt_start..snapshot_contents.len(),
+            hyperlight_common::layout::scratch_base_gpa(config.get_scratch_size()),
+        )
+        .unwrap();
 
         let scratch_mem = ExclusiveSharedMemory::new(config.get_scratch_size()).unwrap();
         let mem_mgr = SandboxMemoryManager::new(
             layout,
-            ro_mem.to_mgr_snapshot_mem().unwrap(),
+            SnapshotBackings::from_snapshot(Arc::new(snapshot_memory)).unwrap(),
             scratch_mem,
             NextAction::Initialise(layout.get_guest_code_address() as u64),
         );

@@ -31,7 +31,7 @@ use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
 use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
 use hyperlight_common::log_level::GuestLogFilter;
-use hyperlight_common::vmem::{BasicMapping, MappingKind};
+use hyperlight_common::vmem::{BasicMapping, MappingKind, PAGE_SIZE};
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest::exit::{abort_with_code, abort_with_code_and_message};
 #[cfg(target_arch = "x86_64")]
@@ -69,6 +69,62 @@ fn set_static() -> i32 {
         *val = 1;
     }
     bigarray.len() as i32
+}
+
+#[guest_function("SetStaticAt")]
+fn set_static_at(index: u64, value: i32) -> i32 {
+    let Ok(index) = usize::try_from(index) else {
+        return -1;
+    };
+    if index >= 1024 * 1024 {
+        return -1;
+    }
+
+    // SAFETY: The index is in bounds and guest functions execute serially.
+    unsafe {
+        let value_ptr = core::ptr::addr_of_mut!(BIGARRAY).cast::<i32>().add(index);
+        value_ptr.write(value);
+        value_ptr.read()
+    }
+}
+
+#[guest_function("MaybeSetStaticAt")]
+fn maybe_set_static_at(index: u64, value: i32, write: bool) -> i32 {
+    let Ok(index) = usize::try_from(index) else {
+        return -1;
+    };
+    if index >= 1024 * 1024 {
+        return -1;
+    }
+
+    if write {
+        // SAFETY: The index is in bounds and guest functions execute serially.
+        unsafe {
+            core::ptr::addr_of_mut!(BIGARRAY)
+                .cast::<i32>()
+                .add(index)
+                .write(value);
+        }
+    }
+    value
+}
+
+#[guest_function("GetStaticAt")]
+fn get_static_at(index: u64) -> i32 {
+    let Ok(index) = usize::try_from(index) else {
+        return -1;
+    };
+    if index >= 1024 * 1024 {
+        return -1;
+    }
+
+    // SAFETY: The index is in bounds and guest functions execute serially.
+    unsafe {
+        core::ptr::addr_of!(BIGARRAY)
+            .cast::<i32>()
+            .add(index)
+            .read()
+    }
 }
 
 #[guest_function("EchoDouble")]
@@ -977,7 +1033,7 @@ fn read_mapped_buffer(base: u64, len: u64, do_map: bool) -> Vec<u8> {
             hyperlight_guest_bin::paging::map_region(
                 base as _,
                 base as _,
-                len as u64 + 4096,
+                len.next_multiple_of(PAGE_SIZE) as u64,
                 MappingKind::Basic(BasicMapping {
                     readable: true,
                     writable: true,
@@ -1009,7 +1065,7 @@ fn write_mapped_buffer(base: u64, len: u64) -> bool {
         hyperlight_guest_bin::paging::map_region(
             base as _,
             base as _,
-            len as u64 + 4096,
+            len.next_multiple_of(PAGE_SIZE) as u64,
             MappingKind::Basic(BasicMapping {
                 readable: true,
                 writable: true,
