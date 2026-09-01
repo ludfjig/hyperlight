@@ -25,7 +25,7 @@ use crate::hypervisor::regs::CommonSpecialRegisters;
 use crate::mem::memory_region::MemoryRegion;
 #[cfg(crashdump)]
 use crate::mem::memory_region::{CrashDumpRegion, MemoryRegionFlags, MemoryRegionType};
-use crate::sandbox::snapshot::{NextAction, Snapshot, SnapshotMemory};
+use crate::sandbox::snapshot::{NextAction, Snapshot, SnapshotLayer, SnapshotMemory};
 use crate::{Result, new_error};
 
 #[cfg(crashdump)]
@@ -185,6 +185,10 @@ impl SnapshotBackings<ExclusiveSharedMemory> {
 }
 
 impl<S: SharedMemory> SnapshotBackings<S> {
+    pub(crate) fn layers(&self) -> &[SnapshotLayer] {
+        self.memory.layers()
+    }
+
     fn is_same_snapshot(&self, memory: &Arc<SnapshotMemory>) -> bool {
         #[cfg(unshared_snapshot_mem)]
         {
@@ -1034,6 +1038,17 @@ impl SandboxMemoryManager<HostSharedMemory> {
         self.layout = *snapshot.layout();
         self.snapshot_count = snapshot.snapshot_generation();
         self.original_entrypoint = snapshot.original_entrypoint();
+    }
+
+    /// Installs memory produced by a capture without restoring runtime state.
+    pub(crate) fn install_captured_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+    ) -> Result<Option<SnapshotBackings<GuestSharedMemory>>> {
+        let gsnapshot = self.replace_snapshot_memory(snapshot)?;
+        self.apply_snapshot_metadata(snapshot);
+        self.update_snapshot_scratch_bookkeeping()?;
+        Ok(gsnapshot)
     }
 
     /// This function restores a memory snapshot from a given snapshot.
