@@ -186,6 +186,7 @@ pub(crate) fn handle_outb(
     data: u32,
     #[cfg(feature = "mem_profile")] regs: &CommonRegisters,
     #[cfg(feature = "mem_profile")] trace_info: &mut MemTraceInfo,
+    #[cfg(feature = "mem_profile")] root_pt: Option<u64>,
 ) -> Result<(), HandleOutbError> {
     match port
         .try_into()
@@ -226,10 +227,18 @@ pub(crate) fn handle_outb(
         }
         #[cfg(feature = "trace_guest")]
         OutBAction::TraceBatch => Ok(()),
+        // Tracing is best-effort. Without a page-table root there is no stack
+        // to unwind, so drop the frame rather than fail the guest call.
         #[cfg(feature = "mem_profile")]
-        OutBAction::TraceMemoryAlloc => trace_info.handle_trace_mem_alloc(regs, mem_mgr),
+        OutBAction::TraceMemoryAlloc => match root_pt {
+            Some(root_pt) => trace_info.handle_trace_mem_alloc(regs, mem_mgr, root_pt),
+            None => Ok(()),
+        },
         #[cfg(feature = "mem_profile")]
-        OutBAction::TraceMemoryFree => trace_info.handle_trace_mem_free(regs, mem_mgr),
+        OutBAction::TraceMemoryFree => match root_pt {
+            Some(root_pt) => trace_info.handle_trace_mem_free(regs, mem_mgr, root_pt),
+            None => Ok(()),
+        },
     }
 }
 #[cfg(test)]
