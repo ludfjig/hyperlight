@@ -12,6 +12,10 @@ use crate::hypervisor::regs::CommonSpecialRegisters;
 use crate::hypervisor::regs::MsrEntry;
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::sandbox::snapshot::SnapshotLayer;
+use crate::sandbox::snapshot::memory::{
+    validate_snapshot_blob_layout, validate_snapshot_layer_count, validate_snapshot_live_data,
+    validate_snapshot_totals, validate_sorted_snapshot_gpa_ranges,
+};
 
 // --- Arch and hypervisor identifiers --------------------------------
 
@@ -291,7 +295,118 @@ impl From<&SnapshotLayer> for OciSnapshotLayer {
     }
 }
 
+impl OciSnapshotLayer {
+    fn validate_for_load(
+        &self,
+        storage_size: usize,
+        host_page_size: usize,
+        scratch_base: u64,
+    ) -> crate::Result<Option<std::ops::Range<u64>>> {
+        let data_len = self.data.as_ref().map_or(0, |data| data.len);
+        let page_tables = self
+            .page_tables
+            .as_ref()
+            .map(|range| range.start..range.end);
+        let data = validate_snapshot_blob_layout(
+            storage_size,
+            self.data.as_ref().map(|data| data.gpa_start),
+            data_len,
+            page_tables.as_ref(),
+            scratch_base,
+            host_page_size,
+        )?;
+        validate_snapshot_live_data(
+            data.as_ref().map(|data| data.len()),
+            self.live_data.iter().map(|range| range.start..range.end),
+            host_page_size,
+        )?;
+        Ok(data.map(|data| data.gpa_range()))
+    }
+}
 
+impl OciSnapshotConfig {
+    pub(super) fn validate_for_load(&self, layer_storage_sizes: &[usize]) -> crate::Result<()> {
+        validate_platform(
+            &self.hyperlight_version,
+            self.arch,
+            self.abi_version,
+            SNAPSHOT_ABI_VERSION,
+            self.hypervisor,
+            &self.cpu_vendor,
+        )?;
+        let current_page_size = page_size::get();
+        if self.host_page_size != current_page_size {
+            return Err(crate::new_error!(
+                "snapshot host page size mismatch: file uses {}, current host uses {}",
+                self.host_page_size,
+                current_page_size
+            ));
+        }
+        validate_memory_layout(&self.layout)?;
+        validate_snapshot_layer_count(self.layers.len())?;
+        if self.layers.len() != layer_storage_sizes.len() {
+            return Err(crate::new_error!(
+                "OCI layer count {} does not match config layer count {}",
+                layer_storage_sizes.len(),
+                self.layers.len()
+            ));
+        }
+        let restore_layer = self
+            .layers
+            .get(self.active_page_table_layer)
+            .ok_or_else(|| {
+                crate::new_error!(
+                    "restore page-table layer {} is out of bounds",
+                    self.active_page_table_layer
+                )
+            })?;
+        let mut retained_bytes = 0usize;
+        let mut mapped_bytes = 0usize;
+        let mut mapping_count = 0usize;
+        let base_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let scratch_base = hyperlight_common::layout::scratch_base_gpa(self.layout.scratch_size);
+        let mut data_end_gpa = base_gpa;
+        let mut data_ranges = Vec::with_capacity(self.layers.len());
+        for (layer, &storage_size) in self.layers.iter().zip(layer_storage_sizes) {
+            if let Some(data_range) =
+                layer.validate_for_load(storage_size, self.host_page_size, scratch_base)?
+            {
+                data_end_gpa = data_end_gpa.max(data_range.end);
+                data_ranges.push(data_range);
+            }
+            retained_bytes = retained_bytes
+                .checked_add(storage_size)
+                .ok_or_else(|| crate::new_error!("snapshot retained byte count overflows"))?;
+            mapping_count = mapping_count
+                .checked_add(layer.live_data.len())
+                .ok_or_else(|| crate::new_error!("snapshot mapping count overflows"))?;
+            for range in &layer.live_data {
+                mapped_bytes = mapped_bytes
+                    .checked_add(range.end - range.start)
+                    .ok_or_else(|| crate::new_error!("snapshot mapped byte count overflows"))?;
+            }
+        }
+        validate_snapshot_totals(mapping_count, mapped_bytes, retained_bytes)?;
+        data_ranges.sort_unstable_by_key(|range| range.start);
+        validate_sorted_snapshot_gpa_ranges(data_ranges)?;
+        restore_layer
+            .page_tables
+            .as_ref()
+            .ok_or_else(|| crate::new_error!("restore page-table layer has no page tables"))?;
+        let address_span = usize::try_from(
+            data_end_gpa
+                .checked_sub(base_gpa)
+                .ok_or_else(|| crate::new_error!("snapshot address span starts below base"))?,
+        )?;
+        validate_snapshot_shape(
+            self.stack_top_gva,
+            self.entrypoint_addr,
+            self.original_entrypoint_addr,
+            &self.layout,
+            address_span,
+        )
+    }
+}
 
 /// Fixed guest memory layout fields needed to rebuild a `SandboxMemoryLayout`.
 /// Snapshot memory metadata is stored in `OciSnapshotConfig::layers`.
@@ -592,8 +707,164 @@ impl From<HostFunction> for HostFunctionDefinition {
     }
 }
 
+fn validate_platform(
+    hyperlight_version: &str,
+    arch: Arch,
+    abi_version: u32,
+    expected_abi_version: u32,
+    hypervisor: Hypervisor,
+    cpu_vendor: &CpuVendor,
+) -> crate::Result<()> {
+    if arch != Arch::current() {
+        return Err(crate::new_error!(
+            "snapshot architecture mismatch: file is {:?}, current host is {:?} \
+             (snapshot produced by hyperlight {})",
+            arch,
+            Arch::current(),
+            hyperlight_version
+        ));
+    }
+    if abi_version != expected_abi_version {
+        return Err(crate::new_error!(
+            "snapshot ABI version mismatch: file has version {}, this build expects {}. \
+             The snapshot must be regenerated from the guest binary \
+             (snapshot produced by hyperlight {}).",
+            abi_version,
+            expected_abi_version,
+            hyperlight_version
+        ));
+    }
+    let current_hv = Hypervisor::current()
+        .ok_or_else(|| crate::new_error!("no hypervisor available to load snapshot"))?;
+    if hypervisor != current_hv {
+        return Err(crate::new_error!(
+            "snapshot hypervisor mismatch: file was created on {} but the current hypervisor is {} \
+             (snapshot produced by hyperlight {})",
+            hypervisor.name(),
+            current_hv.name(),
+            hyperlight_version
+        ));
+    }
+    let current_vendor = CpuVendor::current();
+    if cpu_vendor != &current_vendor {
+        return Err(crate::new_error!(
+            "snapshot CPU vendor mismatch: file was created on {} but the current CPU is {} \
+             (snapshot produced by hyperlight {})",
+            cpu_vendor.as_str(),
+            current_vendor.as_str(),
+            hyperlight_version
+        ));
+    }
+    Ok(())
+}
 
+fn validate_memory_layout(layout: &MemoryLayout) -> crate::Result<()> {
+    // Bound untrusted sizes before rebuilding `SandboxMemoryLayout`.
+    let max_region = SandboxMemoryLayout::MAX_MEMORY_SIZE;
+    for (name, value) in [
+        ("input_data_size", layout.input_data_size),
+        ("output_data_size", layout.output_data_size),
+        ("heap_size", layout.heap_size),
+        ("code_size", layout.code_size),
+        ("init_data_size", layout.init_data_size),
+        ("scratch_size", layout.scratch_size),
+    ] {
+        if value > max_region {
+            return Err(crate::new_error!(
+                "snapshot layout field {} ({}) exceeds maximum allowed {}",
+                name,
+                value,
+                max_region
+            ));
+        }
+    }
+    Ok(())
+}
 
+fn validate_snapshot_shape(
+    stack_top_gva: u64,
+    entrypoint_addr: u64,
+    original_entrypoint_addr: u64,
+    layout: &MemoryLayout,
+    gpa_span_len: usize,
+) -> crate::Result<()> {
+    if gpa_span_len == 0 {
+        return Err(crate::new_error!("snapshot GPA span must be nonzero"));
+    }
+    if !gpa_span_len.is_multiple_of(PAGE_SIZE) {
+        return Err(crate::new_error!(
+            "snapshot GPA span ({}) is not a multiple of PAGE_SIZE",
+            gpa_span_len
+        ));
+    }
+
+    // The dispatch entrypoint must remain in the executable code prefix.
+    let code_lo = SandboxMemoryLayout::BASE_ADDRESS as u64;
+    let code_hi = code_lo
+        .checked_add(layout.code_size.next_multiple_of(PAGE_SIZE) as u64)
+        .ok_or_else(|| {
+            crate::new_error!(
+                "snapshot layout overflow: BASE_ADDRESS + code_size ({}) does not fit in u64",
+                layout.code_size
+            )
+        })?;
+    if entrypoint_addr < code_lo || entrypoint_addr >= code_hi {
+        return Err(crate::new_error!(
+            "snapshot entrypoint addr {:#x} is outside the code region [{:#x}, {:#x})",
+            entrypoint_addr,
+            code_lo,
+            code_hi
+        ));
+    }
+    #[cfg(target_arch = "aarch64")]
+    if !entrypoint_addr.is_multiple_of(4) {
+        return Err(crate::new_error!(
+            "snapshot entrypoint addr {:#x} is not 4-byte aligned",
+            entrypoint_addr
+        ));
+    }
+
+    // `AT_ENTRY` must remain within the captured GPA span.
+    let snapshot_hi = code_lo.checked_add(gpa_span_len as u64).ok_or_else(|| {
+        crate::new_error!(
+            "snapshot layout overflow: BASE_ADDRESS + GPA span ({}) does not fit in u64",
+            gpa_span_len
+        )
+    })?;
+    let scratch_lo = hyperlight_common::layout::scratch_base_gpa(layout.scratch_size);
+    if snapshot_hi > scratch_lo {
+        return Err(crate::new_error!(
+            "snapshot address span ends at {:#x}, above scratch base {:#x}",
+            snapshot_hi,
+            scratch_lo
+        ));
+    }
+    if original_entrypoint_addr < code_lo || original_entrypoint_addr >= snapshot_hi {
+        return Err(crate::new_error!(
+            "snapshot original entrypoint addr {:#x} is outside the snapshot region [{:#x}, {:#x})",
+            original_entrypoint_addr,
+            code_lo,
+            snapshot_hi
+        ));
+    }
+
+    // The saved stack pointer must be aligned and inside guest memory.
+    let max_gva = hyperlight_common::layout::SCRATCH_TOP_GVA as u64;
+    if stack_top_gva == 0 || stack_top_gva > max_gva {
+        return Err(crate::new_error!(
+            "snapshot stack_top_gva {:#x} is outside the valid range (0, {:#x}]",
+            stack_top_gva,
+            max_gva
+        ));
+    }
+    if !stack_top_gva.is_multiple_of(16) {
+        return Err(crate::new_error!(
+            "snapshot stack_top_gva {:#x} is not 16-byte aligned",
+            stack_top_gva
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -850,7 +1121,7 @@ mod tests {
     fn validate_for_load_rejects_arch_mismatch() {
         let mut cfg = gating_config();
         cfg.arch = other_arch();
-        let err = cfg.validate_for_load().unwrap_err().to_string();
+        let err = cfg.validate_for_load(&[]).unwrap_err().to_string();
         assert!(err.contains("architecture mismatch"), "got: {err}");
     }
 
@@ -859,7 +1130,7 @@ mod tests {
     fn validate_for_load_rejects_abi_version_mismatch() {
         let mut cfg = gating_config();
         cfg.abi_version = SNAPSHOT_ABI_VERSION.wrapping_add(1);
-        let err = cfg.validate_for_load().unwrap_err().to_string();
+        let err = cfg.validate_for_load(&[]).unwrap_err().to_string();
         assert!(err.contains("ABI version mismatch"), "got: {err}");
     }
 
@@ -870,7 +1141,7 @@ mod tests {
     fn validate_for_load_rejects_hypervisor_mismatch() {
         let Some(current) = Hypervisor::current() else {
             let cfg = gating_config();
-            let err = cfg.validate_for_load().unwrap_err().to_string();
+            let err = cfg.validate_for_load(&[]).unwrap_err().to_string();
             assert!(err.contains("no hypervisor available"), "got: {err}");
             return;
         };
@@ -880,7 +1151,7 @@ mod tests {
             .expect("three backends, at least one differs from current");
         let mut cfg = gating_config();
         cfg.hypervisor = other;
-        let err = cfg.validate_for_load().unwrap_err().to_string();
+        let err = cfg.validate_for_load(&[]).unwrap_err().to_string();
         assert!(err.contains("hypervisor mismatch"), "got: {err}");
     }
 }
