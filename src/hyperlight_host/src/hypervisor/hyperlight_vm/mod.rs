@@ -18,6 +18,8 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use hyperlight_common::log_level::GuestLogFilter;
+#[cfg(feature = "mem_profile")]
+use hyperlight_common::outb::OutBAction;
 use tracing_core::LevelFilter;
 
 use crate::HyperlightError;
@@ -860,6 +862,17 @@ impl HyperlightVm {
         #[cfg(feature = "mem_profile")]
         {
             let regs = self.vm.regs().map_err(HandleIoError::GetRegs)?;
+            let root_pt = if port == OutBAction::TraceMemoryAlloc as u16
+                || port == OutBAction::TraceMemoryFree as u16
+            {
+                // Enabling a profiling feature must not add a way for a guest
+                // call to fail, so a failed read costs one trace frame.
+                self.get_root_pt()
+                    .inspect_err(|e| log::warn!("mem_profile: dropping trace frame: {e}"))
+                    .ok()
+            } else {
+                None
+            };
             handle_outb(
                 mem_mgr,
                 host_funcs,
@@ -867,6 +880,7 @@ impl HyperlightVm {
                 val,
                 &regs,
                 &mut self.trace_info,
+                root_pt,
             )?;
         }
 

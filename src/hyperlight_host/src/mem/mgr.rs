@@ -237,6 +237,95 @@ impl<'a> GuestPhysicalMemoryView<'a> {
     }
 }
 
+#[cfg(feature = "mem_profile")]
+pub(crate) struct GuestVirtualMemoryReader<'a> {
+    memory: GuestPhysicalMemoryView<'a>,
+    root_pt: u64,
+    cached_page: Option<(u64, u64)>,
+}
+
+#[cfg(feature = "mem_profile")]
+impl<'a> GuestVirtualMemoryReader<'a> {
+    fn new(
+        snapshot: &'a SnapshotMemoryBacking<HostSharedMemory>,
+        scratch: &'a HostSharedMemory,
+        layout: SandboxMemoryLayout,
+        root_pt: u64,
+    ) -> Self {
+        Self {
+            memory: GuestPhysicalMemoryView::new(snapshot, scratch, &[], layout),
+            root_pt,
+            cached_page: None,
+        }
+    }
+
+    fn translate_page(&mut self, page_gva: u64) -> Result<u64> {
+        if let Some((cached_gva, cached_gpa)) = self.cached_page
+            && cached_gva == page_gva
+        {
+            return Ok(cached_gpa);
+        }
+
+        use crate::sandbox::snapshot::PageTableReader;
+
+        let pt_buf = PageTableReader::new(&self.memory, self.root_pt);
+        // SAFETY: The vCPU is stopped for this outb, so its page tables cannot
+        // change during the walk.
+        let mapping = unsafe {
+            hyperlight_common::vmem::virt_to_phys(
+                &pt_buf,
+                page_gva,
+                hyperlight_common::vmem::PAGE_SIZE as u64,
+            )
+        }
+        .next();
+        // A suppressed read leaves a not-present entry behind, so ask before
+        // blaming the guest for an unmapped page.
+        pt_buf.finish()?;
+        let mapping = mapping.ok_or_else(|| new_error!("GVA page is not mapped: {page_gva:#x}"))?;
+        let mapping_offset = page_gva
+            .checked_sub(mapping.virt_base)
+            .ok_or_else(|| new_error!("page-table mapping starts after requested GVA"))?;
+        if mapping
+            .len
+            .checked_sub(mapping_offset)
+            .is_none_or(|len| len < hyperlight_common::vmem::PAGE_SIZE as u64)
+        {
+            return Err(new_error!(
+                "page-table mapping does not cover requested GVA page"
+            ));
+        }
+        let page_gpa = mapping
+            .phys_base
+            .checked_add(mapping_offset)
+            .ok_or_else(|| new_error!("guest physical address overflows"))?;
+        self.cached_page = Some((page_gva, page_gpa));
+        Ok(page_gpa)
+    }
+
+    pub(crate) fn read(&mut self, gva: u64, destination: &mut [u8]) -> Result<()> {
+        let mut copied = 0usize;
+        while copied < destination.len() {
+            let current_gva = gva
+                .checked_add(u64::try_from(copied)?)
+                .ok_or_else(|| new_error!("guest virtual address overflows"))?;
+            let page_gva = current_gva / hyperlight_common::vmem::PAGE_SIZE as u64
+                * hyperlight_common::vmem::PAGE_SIZE as u64;
+            let page_offset = usize::try_from(current_gva - page_gva)?;
+            let chunk_len =
+                (destination.len() - copied).min(hyperlight_common::vmem::PAGE_SIZE - page_offset);
+            let gpa = self
+                .translate_page(page_gva)?
+                .checked_add(u64::try_from(page_offset)?)
+                .ok_or_else(|| new_error!("guest physical address overflows"))?;
+            self.memory
+                .read(gpa, &mut destination[copied..copied + chunk_len])?;
+            copied += chunk_len;
+        }
+        Ok(())
+    }
+}
+
 /// A struct that is responsible for laying out and managing the memory
 /// for a given `Sandbox`.
 pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
@@ -477,6 +566,11 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
 }
 
 impl SandboxMemoryManager<HostSharedMemory> {
+    #[cfg(feature = "mem_profile")]
+    pub(crate) fn guest_virtual_memory_reader(&self, root_pt: u64) -> GuestVirtualMemoryReader<'_> {
+        GuestVirtualMemoryReader::new(&self.shared_mem, &self.scratch_mem, self.layout, root_pt)
+    }
+
     /// Create a snapshot with the given mapped regions
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn snapshot(
@@ -920,15 +1014,23 @@ mod tests {
     use std::sync::Arc;
 
     use hyperlight_common::vmem::PAGE_SIZE;
+    #[cfg(feature = "mem_profile")]
+    use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind};
     use hyperlight_testing::sandbox_sizes::{LARGE_HEAP_SIZE, MEDIUM_HEAP_SIZE, SMALL_HEAP_SIZE};
     use hyperlight_testing::simple_guest_as_pathbuf;
 
     use super::{GuestBacking, GuestPhysicalMemoryView, SnapshotMemoryBacking};
+    #[cfg(feature = "mem_profile")]
+    use super::{GuestPageTableBuffer, SandboxMemoryManager};
     use crate::GuestBinary;
     use crate::mem::layout::SandboxMemoryLayout;
     use crate::mem::memory_region::MemoryRegionType;
     use crate::mem::shared_mem::ExclusiveSharedMemory;
+    #[cfg(feature = "mem_profile")]
+    use crate::mem::shared_mem::ReadonlySharedMemory;
     use crate::sandbox::SandboxConfiguration;
+    #[cfg(feature = "mem_profile")]
+    use crate::sandbox::snapshot::NextAction;
     use crate::sandbox::snapshot::{Snapshot, SnapshotBlob, SnapshotLayer, SnapshotMemory};
 
     /// Build a Snapshot for the given configuration and verify the
@@ -1040,6 +1142,94 @@ mod tests {
                 .read_snapshot_gpa(base + PAGE_SIZE as u64 - 1, &mut bytes)
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "mem_profile")]
+    #[test]
+    fn mem_profile_reader_reads_across_snapshot_layers() {
+        let cfg = SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, PAGE_SIZE, 0, None).unwrap();
+        let host_page_size = page_size::get();
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let second_gpa = base + host_page_size as u64;
+        let scratch_base = hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size());
+        let pt_base = layout.get_pt_base_gpa();
+        let pt_buf = GuestPageTableBuffer::new(pt_base as usize);
+        let kind = MappingKind::Basic(BasicMapping {
+            readable: true,
+            writable: false,
+            executable: false,
+        });
+        unsafe {
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: base,
+                    virt_base: base,
+                    len: PAGE_SIZE as u64,
+                    kind,
+                },
+            );
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: second_gpa,
+                    virt_base: base + PAGE_SIZE as u64,
+                    len: PAGE_SIZE as u64,
+                    kind,
+                },
+            );
+        }
+        let page_tables = pt_buf.into_bytes();
+        layout.ensure_page_tables_fit(page_tables.len()).unwrap();
+
+        let first_storage = ReadonlySharedMemory::from_bytes(&vec![0x11; host_page_size]).unwrap();
+        let first_blob = Arc::new(
+            SnapshotBlob::new(
+                first_storage,
+                Some(base),
+                host_page_size,
+                None,
+                scratch_base,
+            )
+            .unwrap(),
+        );
+        let first =
+            SnapshotLayer::new(first_blob, std::iter::once(0..host_page_size).collect()).unwrap();
+
+        let logical_len = host_page_size + page_tables.len();
+        let mut second_bytes = vec![0u8; logical_len.next_multiple_of(host_page_size)];
+        second_bytes[..host_page_size].fill(0x22);
+        second_bytes[host_page_size..logical_len].copy_from_slice(&page_tables);
+        let second_storage = ReadonlySharedMemory::from_bytes(&second_bytes).unwrap();
+        let second_blob = Arc::new(
+            SnapshotBlob::new(
+                second_storage,
+                Some(second_gpa),
+                host_page_size,
+                Some(host_page_size..logical_len),
+                scratch_base,
+            )
+            .unwrap(),
+        );
+        let second =
+            SnapshotLayer::new(second_blob, std::iter::once(0..host_page_size).collect()).unwrap();
+        let memory = Arc::new(SnapshotMemory::new(Box::new([first, second]), 1).unwrap());
+        let manager = SandboxMemoryManager::new(
+            layout,
+            SnapshotMemoryBacking::from_snapshot(memory).unwrap(),
+            ExclusiveSharedMemory::new(layout.get_scratch_size()).unwrap(),
+            NextAction::None,
+        );
+        let (manager, _) = manager.build().unwrap();
+        let mut reader = manager.guest_virtual_memory_reader(pt_base);
+        let mut bytes = [0u8; 2];
+
+        reader
+            .read(base + PAGE_SIZE as u64 - 1, &mut bytes)
+            .unwrap();
+
+        assert_eq!(bytes, [0x11, 0x22]);
     }
 
     #[test]
