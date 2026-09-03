@@ -15,6 +15,7 @@
 //!     |   `-- ...
 //!     `-- restore_page_table_layer_index: usize
 
+#[cfg(test)]
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -407,6 +408,7 @@ impl SnapshotMemory {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn flat_image(&self) -> Result<Cow<'_, [u8]>> {
         let data_len = self.gpa_span_len();
         let active = self.restore_page_table_layer();
@@ -468,6 +470,7 @@ impl SnapshotMemory {
         Ok(Cow::Owned(image))
     }
 
+    #[cfg(test)]
     pub(crate) fn flat_image_len(&self) -> Result<usize> {
         let data_len = self.gpa_span_len();
         let page_tables = self
