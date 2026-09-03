@@ -749,6 +749,71 @@ impl SandboxMemoryManager<HostSharedMemory> {
         Ok(())
     }
 
+    /// Build the list of guest memory regions for a crash dump.
+    ///
+    /// By default, walks the guest page tables to discover
+    /// GVA→GPA mappings and translates them to host-backed regions.
+    #[cfg(crashdump)]
+    pub(crate) fn get_guest_memory_regions(
+        &mut self,
+        root_pt: u64,
+        mmap_regions: &[MemoryRegion],
+    ) -> Result<Vec<CrashDumpRegion>> {
+        use crate::sandbox::snapshot::PageTableReader;
+
+        let len = hyperlight_common::layout::SCRATCH_TOP_GVA;
+        let memory = GuestPhysicalMemoryView::new(
+            &self.shared_mem,
+            &self.scratch_mem,
+            mmap_regions,
+            self.layout,
+        );
+        let pt_buf = PageTableReader::new(&memory, root_pt);
+        let mut regions: Vec<CrashDumpRegion> = Vec::new();
+        let mut saw_mapping = false;
+        // SAFETY: Crash handling runs with the vCPU stopped, so its page tables
+        // cannot change during the walk.
+        for mapping in unsafe { hyperlight_common::vmem::virt_to_phys(&pt_buf, 0, len as u64) } {
+            saw_mapping = true;
+            let (flags, region_type) = mapping_kind_to_flags(&mapping.kind);
+            let mut mapped = 0usize;
+            let mapping_len = usize::try_from(mapping.len)?;
+            while mapped < mapping_len {
+                let chunk_len = (mapping_len - mapped).min(hyperlight_common::vmem::PAGE_SIZE);
+                let gpa = mapping
+                    .phys_base
+                    .checked_add(u64::try_from(mapped)?)
+                    .ok_or_else(|| new_error!("crash-dump GPA overflows"))?;
+                let Some(host_region) = memory.host_range(gpa, chunk_len).ok() else {
+                    mapped += chunk_len;
+                    continue;
+                };
+                let virt_base = usize::try_from(mapping.virt_base)?
+                    .checked_add(mapped)
+                    .ok_or_else(|| new_error!("crash-dump GVA overflows"))?;
+                let virt_end = virt_base
+                    .checked_add(chunk_len)
+                    .ok_or_else(|| new_error!("crash-dump GVA range overflows"))?;
+
+                if !try_coalesce_region(&mut regions, virt_base, virt_end, host_region.start, flags)
+                {
+                    regions.push(CrashDumpRegion {
+                        guest_region: virt_base..virt_end,
+                        host_region,
+                        flags,
+                        region_type,
+                    });
+                }
+                mapped += chunk_len;
+            }
+        }
+        pt_buf.finish()?;
+        if !saw_mapping {
+            return Err(new_error!("No page table mappings found (len {len})",));
+        }
+
+        Ok(regions)
+    }
 
     /// Read guest memory at a Guest Virtual Address (GVA) by walking the
     /// page tables to translate GVA → GPA, then reading from the correct
@@ -829,6 +894,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
             }
         }
 
+        pt_buf.finish()?;
         if !saw_mapping {
             return Err(new_error!(
                 "No page table mappings found for GVA {:#x} (len {})",
