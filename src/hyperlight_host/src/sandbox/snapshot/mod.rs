@@ -459,6 +459,138 @@ fn move_partial_host_pages(
     Ok(())
 }
 
+struct NewPageRun {
+    source: Range<u64>,
+    destination_start: u64,
+}
+
+struct NewPageCopy {
+    backing: GuestBacking,
+    destination: Range<usize>,
+}
+
+fn backing_is_contiguous(first: GuestBacking, next: GuestBacking, len: usize) -> bool {
+    match (first, next) {
+        (
+            GuestBacking::Snapshot {
+                layer_index: first_layer,
+                offset: first_offset,
+            },
+            GuestBacking::Snapshot {
+                layer_index: next_layer,
+                offset: next_offset,
+            },
+        ) => first_layer == next_layer && first_offset.checked_add(len) == Some(next_offset),
+        (
+            GuestBacking::Scratch {
+                offset: first_offset,
+            },
+            GuestBacking::Scratch {
+                offset: next_offset,
+            },
+        ) => first_offset.checked_add(len) == Some(next_offset),
+        (
+            GuestBacking::Dynamic {
+                region_index: first_region,
+                offset: first_offset,
+            },
+            GuestBacking::Dynamic {
+                region_index: next_region,
+                offset: next_offset,
+            },
+        ) => first_region == next_region && first_offset.checked_add(len) == Some(next_offset),
+        _ => false,
+    }
+}
+
+fn new_page_copies(pages: &[NewPage]) -> Result<Vec<NewPageCopy>> {
+    let mut copies = Vec::<NewPageCopy>::new();
+    for (index, page) in pages.iter().enumerate() {
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| crate::new_error!("snapshot page offset overflows"))?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .ok_or_else(|| crate::new_error!("snapshot page range overflows"))?;
+        if let Some(copy) = copies.last_mut()
+            && backing_is_contiguous(copy.backing, page.backing, copy.destination.len())
+        {
+            copy.destination.end = end;
+        } else {
+            copies.push(NewPageCopy {
+                backing: page.backing,
+                destination: start..end,
+            });
+        }
+    }
+    Ok(copies)
+}
+
+fn new_page_runs(pages: &[NewPage], destination_start: u64) -> Result<Vec<NewPageRun>> {
+    let mut runs = Vec::<NewPageRun>::new();
+    for (index, page) in pages.iter().enumerate() {
+        let source_gpa = page.source_gpa;
+        let destination = destination_start
+            .checked_add(u64::try_from(index.checked_mul(PAGE_SIZE).ok_or_else(
+                || crate::new_error!("snapshot page offset overflows"),
+            )?)?)
+            .ok_or_else(|| crate::new_error!("snapshot page GPA overflows"))?;
+        if let Some(run) = runs.last_mut()
+            && run.source.end == source_gpa
+        {
+            run.source.end = run
+                .source
+                .end
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| crate::new_error!("snapshot source page run overflows"))?;
+        } else {
+            let source_end = source_gpa
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| crate::new_error!("snapshot source page overflows"))?;
+            runs.push(NewPageRun {
+                source: source_gpa..source_end,
+                destination_start: destination,
+            });
+        }
+    }
+    Ok(runs)
+}
+
+fn page_destination(runs: &[NewPageRun], source_gpa: u64) -> Option<u64> {
+    let index = runs.partition_point(|run| run.source.end <= source_gpa);
+    let run = runs.get(index)?;
+    let offset = source_gpa.checked_sub(run.source.start)?;
+    (source_gpa < run.source.end).then(|| run.destination_start.checked_add(offset))?
+}
+
+fn packed_data_len(page_count: usize, host_page_size: usize) -> Result<usize> {
+    let page_bytes = page_count
+        .checked_mul(PAGE_SIZE)
+        .ok_or_else(|| crate::new_error!("snapshot data size overflows"))?;
+    page_bytes
+        .checked_next_multiple_of(host_page_size)
+        .ok_or_else(|| crate::new_error!("snapshot data padding overflows"))
+}
+
+fn first_fit_blob_gpa(data_len: usize, layers: &[SnapshotLayer], scratch_base: u64) -> Option<u64> {
+    if data_len == 0 {
+        return None;
+    }
+    let data_len = u64::try_from(data_len).ok()?;
+    let mut candidate = SandboxMemoryLayout::BASE_ADDRESS as u64;
+    for range in layers
+        .iter()
+        .filter_map(|layer| layer.blob().data_gpa_range().map(|data| data.gpa_range()))
+    {
+        let end = candidate.checked_add(data_len)?;
+        if end <= range.start {
+            return Some(candidate);
+        }
+        candidate = candidate.max(range.end);
+    }
+    (candidate.checked_add(data_len)? <= scratch_base).then_some(candidate)
+}
+
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
     if let Some((phys_base, virt_base)) = io_page() {
         // Map the IO page
@@ -970,6 +1102,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![blob_gpa, blob_gpa + PAGE_SIZE as u64]
         );
+        assert_eq!(
+            super::packed_data_len(copied.len(), host_page_size).unwrap(),
+            host_page_size
+        );
     }
 
     #[test]
@@ -1020,6 +1156,88 @@ mod tests {
         // untouched host pages either side of them.
         assert_eq!(super::coalesce_pages(&reused).len(), 2);
         assert_eq!(copied.len(), 6);
+    }
+
+    fn new_page(source_gpa: u64, offset: usize) -> super::NewPage {
+        super::NewPage {
+            source_gpa,
+            backing: GuestBacking::Snapshot {
+                layer_index: 0,
+                offset,
+            },
+        }
+    }
+
+    #[test]
+    fn page_runs_map_each_source_to_its_destination() {
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let page = PAGE_SIZE as u64;
+        let destination = base + 0x10_0000;
+        // Two contiguous pages, then a gap, then one more.
+        let pages = [
+            new_page(base, 0),
+            new_page(base + page, PAGE_SIZE),
+            new_page(base + 8 * page, 8 * PAGE_SIZE),
+        ];
+
+        let runs = super::new_page_runs(&pages, destination).unwrap();
+        assert_eq!(runs.len(), 2);
+
+        // Destinations are packed in index order regardless of source gaps.
+        assert_eq!(super::page_destination(&runs, base), Some(destination));
+        assert_eq!(
+            super::page_destination(&runs, base + page),
+            Some(destination + page)
+        );
+        assert_eq!(
+            super::page_destination(&runs, base + 8 * page),
+            Some(destination + 2 * page)
+        );
+        // An address in the source gap belongs to no run.
+        assert_eq!(super::page_destination(&runs, base + 2 * page), None);
+        assert_eq!(super::page_destination(&runs, base + 9 * page), None);
+    }
+
+    #[test]
+    fn page_copies_merge_only_contiguous_backings() {
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let page = PAGE_SIZE as u64;
+        // Contiguous source addresses, but the third page comes from a
+        // backing offset that does not follow the second.
+        let pages = [
+            new_page(base, 0),
+            new_page(base + page, PAGE_SIZE),
+            new_page(base + 2 * page, 9 * PAGE_SIZE),
+        ];
+
+        let copies = super::new_page_copies(&pages).unwrap();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].destination, 0..2 * PAGE_SIZE);
+        assert_eq!(copies[1].destination, 2 * PAGE_SIZE..3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn blob_placement_respects_the_scratch_boundary() {
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let scratch_base = base + 2 * PAGE_SIZE as u64;
+
+        // An empty delta needs no address.
+        assert_eq!(super::first_fit_blob_gpa(0, &[], scratch_base), None);
+        // With nothing to reuse the delta lands at the base.
+        assert_eq!(
+            super::first_fit_blob_gpa(PAGE_SIZE, &[], scratch_base),
+            Some(base)
+        );
+        // Exactly filling the space below scratch is allowed.
+        assert_eq!(
+            super::first_fit_blob_gpa(2 * PAGE_SIZE, &[], scratch_base),
+            Some(base)
+        );
+        // One page more is not.
+        assert_eq!(
+            super::first_fit_blob_gpa(3 * PAGE_SIZE, &[], scratch_base),
+            None
+        );
     }
 
     #[test]
