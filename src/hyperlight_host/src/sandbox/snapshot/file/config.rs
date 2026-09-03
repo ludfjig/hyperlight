@@ -6,7 +6,7 @@ use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFuncti
 use hyperlight_common::vmem::PAGE_SIZE;
 use serde::{Deserialize, Serialize};
 
-use super::media_types::SNAPSHOT_ABI_VERSION;
+use super::media_types::{SNAPSHOT_ABI_VERSION, SNAPSHOT_ABI_VERSION_V1};
 use crate::hypervisor::regs::CommonSpecialRegisters;
 #[cfg(target_arch = "x86_64")]
 use crate::hypervisor::regs::MsrEntry;
@@ -206,6 +206,26 @@ pub(super) struct OciSnapshotConfig {
     pub(super) snapshot_generation: u64,
 }
 
+/// OCI v1 loader configuration for one flat memory layer.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OciSnapshotConfigV1 {
+    pub(super) hyperlight_version: String,
+    pub(super) arch: Arch,
+    pub(super) abi_version: u32,
+    pub(super) hypervisor: Hypervisor,
+    pub(super) cpu_vendor: CpuVendor,
+    pub(super) stack_top_gva: u64,
+    pub(super) entrypoint_addr: u64,
+    pub(super) original_entrypoint_addr: u64,
+    pub(super) sregs: CommonSpecialRegisters,
+    #[cfg(target_arch = "x86_64")]
+    pub(super) msrs: Vec<MsrEntry>,
+    pub(super) layout: MemoryLayoutV1,
+    pub(super) memory_size: u64,
+    pub(super) host_functions: Vec<HostFunction>,
+    pub(super) snapshot_generation: u64,
+}
 
 /// Metadata for one snapshot layer in an OCI manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,8 +308,151 @@ pub(super) struct MemoryLayout {
     pub(super) scratch_size: usize,
 }
 
+/// Memory layout for an OCI v1 snapshot with one flat memory layer.
+#[derive(Copy, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MemoryLayoutV1 {
+    pub(super) input_data_size: usize,
+    pub(super) output_data_size: usize,
+    pub(super) heap_size: usize,
+    pub(super) code_size: usize,
+    pub(super) init_data_size: usize,
+    /// `Some` for explicit initial-data permissions. `None` for default permissions.
+    pub(super) init_data_permissions: Option<u32>,
+    pub(super) scratch_size: usize,
+    pub(super) snapshot_size: usize,
+    /// `Some` for a valid OCI v1 snapshot. `None` when required page-table metadata is missing.
+    pub(super) pt_size: Option<usize>,
+}
 
+impl MemoryLayoutV1 {
+    fn current(&self) -> MemoryLayout {
+        MemoryLayout {
+            input_data_size: self.input_data_size,
+            output_data_size: self.output_data_size,
+            heap_size: self.heap_size,
+            code_size: self.code_size,
+            init_data_size: self.init_data_size,
+            init_data_permissions: self.init_data_permissions,
+            scratch_size: self.scratch_size,
+        }
+    }
+}
 
+impl OciSnapshotConfigV1 {
+    pub(super) fn validate_for_load(&self, layer_storage_size: usize) -> crate::Result<()> {
+        validate_platform(
+            &self.hyperlight_version,
+            self.arch,
+            self.abi_version,
+            SNAPSHOT_ABI_VERSION_V1,
+            self.hypervisor,
+            &self.cpu_vendor,
+        )?;
+        if self.memory_size != u64::try_from(layer_storage_size)? {
+            return Err(crate::new_error!(
+                "snapshot memory_size ({}) does not match OCI layer size ({})",
+                self.memory_size,
+                layer_storage_size
+            ));
+        }
+        if self.memory_size == 0
+            || self.memory_size > SandboxMemoryLayout::MAX_MEMORY_SIZE as u64
+            || !self.memory_size.is_multiple_of(PAGE_SIZE as u64)
+        {
+            return Err(crate::new_error!(
+                "snapshot memory_size ({}) is invalid",
+                self.memory_size
+            ));
+        }
+        if self.layout.snapshot_size == 0 || !self.layout.snapshot_size.is_multiple_of(PAGE_SIZE) {
+            return Err(crate::new_error!(
+                "snapshot snapshot_size ({}) is invalid",
+                self.layout.snapshot_size
+            ));
+        }
+        let page_table_len = self
+            .layout
+            .pt_size
+            .ok_or_else(|| crate::new_error!("snapshot pt_size is missing"))?;
+        if page_table_len == 0 || !page_table_len.is_multiple_of(PAGE_SIZE) {
+            return Err(crate::new_error!(
+                "snapshot pt_size ({}) is invalid",
+                page_table_len
+            ));
+        }
+        let memory_size = self
+            .layout
+            .snapshot_size
+            .checked_add(page_table_len)
+            .and_then(|size| size.checked_next_multiple_of(page_size::get()))
+            .ok_or_else(|| crate::new_error!("snapshot memory size overflows"))?;
+        if u64::try_from(memory_size)? != self.memory_size {
+            return Err(crate::new_error!(
+                "snapshot snapshot_size ({}) and pt_size ({}) do not match memory_size ({})",
+                self.layout.snapshot_size,
+                page_table_len,
+                self.memory_size
+            ));
+        }
+        let layout = self.layout.current();
+        validate_memory_layout(&layout)?;
+        validate_snapshot_shape(
+            self.stack_top_gva,
+            self.entrypoint_addr,
+            self.original_entrypoint_addr,
+            &layout,
+            self.layout.snapshot_size,
+        )
+    }
+
+    pub(super) fn into_current(self) -> crate::Result<OciSnapshotConfig> {
+        let data_len = self.layout.snapshot_size;
+        let page_table_len = self
+            .layout
+            .pt_size
+            .ok_or_else(|| crate::new_error!("snapshot pt_size is missing"))?;
+        let page_table_end = data_len
+            .checked_add(page_table_len)
+            .ok_or_else(|| crate::new_error!("snapshot memory size overflows"))?;
+        let layout = self.layout.current();
+        Ok(OciSnapshotConfig {
+            hyperlight_version: self.hyperlight_version,
+            arch: self.arch,
+            abi_version: SNAPSHOT_ABI_VERSION,
+            hypervisor: self.hypervisor,
+            cpu_vendor: self.cpu_vendor,
+            // v1 never recorded the writing host's page size, and its loader
+            // rounded with the reading host's. Naming the reader here keeps
+            // that binding rather than inventing one the file cannot support.
+            host_page_size: page_size::get(),
+            stack_top_gva: self.stack_top_gva,
+            entrypoint_addr: self.entrypoint_addr,
+            original_entrypoint_addr: self.original_entrypoint_addr,
+            sregs: self.sregs,
+            #[cfg(target_arch = "x86_64")]
+            msrs: self.msrs,
+            layout,
+            layers: vec![OciSnapshotLayer {
+                data: Some(OciSnapshotDataRange {
+                    gpa_start: SandboxMemoryLayout::BASE_ADDRESS as u64,
+                    len: data_len,
+                }),
+                live_data: vec![OciMemoryRange {
+                    start: 0,
+                    end: data_len,
+                }],
+                page_tables: Some(OciMemoryRange {
+                    start: data_len,
+                    end: page_table_end,
+                }),
+            }],
+            active_page_table_layer: 0,
+            host_functions: self.host_functions,
+            snapshot_generation: self.snapshot_generation,
+        })
+    }
+}
 
 /// Name and signature of one host function registered when the
 /// snapshot was taken. The loader validates these against the
