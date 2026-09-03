@@ -157,9 +157,10 @@ fn main() -> Result<()> {
         crashdump: { all(feature = "crashdump", target_arch = "x86_64") },
         // print_debug feature is aliased with debug_assertions to make it only available in debug-builds.
         print_debug: { all(feature = "print_debug", debug_assertions) },
-        // the gdb feature (only temporarily!) needs to use
-        // writable/un-shared snapshot memories.
-        unshared_snapshot_mem: { feature = "gdb" },
+        // the gdb debug path (only temporarily!) needs to use
+        // writable/un-shared snapshot memories. Tracks the `gdb` alias so
+        // builds without a working debugger keep sharing snapshot memory.
+        unshared_snapshot_mem: { gdb },
         // The `ReadableSharedMemory` trait in `mem::layout` is only
         // needed in two situations:
         //   1. The `gdb` debug path reads guest memory through it
