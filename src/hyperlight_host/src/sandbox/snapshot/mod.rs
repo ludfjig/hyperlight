@@ -319,6 +319,101 @@ fn snapshot_mapping_kind(kind: MappingKind) -> Option<MappingKind> {
     }
 }
 
+fn coalesce_pages(pages: &[bool]) -> Box<[Range<usize>]> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (page_index, reused) in pages.iter().enumerate() {
+        if !reused {
+            continue;
+        }
+        let page = page_index * PAGE_SIZE;
+        let end = page + PAGE_SIZE;
+        if let Some(previous) = ranges.last_mut()
+            && previous.end == page
+        {
+            previous.end = end;
+        } else {
+            ranges.push(page..end);
+        }
+    }
+    ranges.into_boxed_slice()
+}
+
+#[derive(Clone, Copy)]
+struct NewPage {
+    source_gpa: u64,
+    backing: GuestBacking,
+}
+
+fn backing_with_offset(backing: GuestBacking, offset: usize) -> Option<GuestBacking> {
+    match backing {
+        GuestBacking::Snapshot {
+            layer_index,
+            offset: backing_offset,
+        } => Some(GuestBacking::Snapshot {
+            layer_index,
+            offset: backing_offset.checked_add(offset)?,
+        }),
+        GuestBacking::Scratch {
+            offset: backing_offset,
+        } => Some(GuestBacking::Scratch {
+            offset: backing_offset.checked_add(offset)?,
+        }),
+        GuestBacking::Dynamic {
+            region_index,
+            offset: backing_offset,
+        } => Some(GuestBacking::Dynamic {
+            region_index,
+            offset: backing_offset.checked_add(offset)?,
+        }),
+    }
+}
+
+fn record_backed_pages(
+    backing: GuestBacking,
+    source_gpa: u64,
+    len: usize,
+    reused_pages: Option<&mut [Vec<bool>]>,
+    new_pages: &mut Vec<NewPage>,
+) -> Result<()> {
+    if let GuestBacking::Snapshot { offset, .. } = backing
+        && (!offset.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE))
+    {
+        return Err(crate::new_error!(
+            "snapshot backing range is not page aligned"
+        ));
+    }
+
+    if let GuestBacking::Snapshot {
+        layer_index,
+        offset,
+    } = backing
+        && let Some(pages) = reused_pages
+    {
+        let start = offset / PAGE_SIZE;
+        let end = offset
+            .checked_add(len)
+            .map(|end| end / PAGE_SIZE)
+            .ok_or_else(|| crate::new_error!("snapshot backing range overflows"))?;
+        pages
+            .get_mut(layer_index)
+            .and_then(|pages| pages.get_mut(start..end))
+            .ok_or_else(|| crate::new_error!("snapshot backing range is out of bounds"))?
+            .fill(true);
+        return Ok(());
+    }
+
+    for offset in (0..len).step_by(PAGE_SIZE) {
+        new_pages.push(NewPage {
+            source_gpa: source_gpa
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| crate::new_error!("snapshot source GPA overflows"))?,
+            backing: backing_with_offset(backing, offset)
+                .ok_or_else(|| crate::new_error!("snapshot source backing offset overflows"))?,
+        });
+    }
+    Ok(())
+}
+
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
     if let Some((phys_base, virt_base)) = io_page() {
         // Map the IO page
@@ -807,6 +902,43 @@ mod tests {
 
     fn default_sregs() -> CommonSpecialRegisters {
         CommonSpecialRegisters::default()
+    }
+
+    #[test]
+    fn snapshot_page_policy_reuses_shared_and_copies_private_backings() {
+        let source_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let backing = GuestBacking::Snapshot {
+            layer_index: 0,
+            offset: 0,
+        };
+        let mut reused = vec![vec![false; 2]];
+        let mut copied = Vec::new();
+
+        super::record_backed_pages(
+            backing,
+            source_gpa,
+            2 * PAGE_SIZE,
+            Some(reused.as_mut_slice()),
+            &mut copied,
+        )
+        .unwrap();
+        assert_eq!(reused, [vec![true; 2]]);
+        assert!(copied.is_empty());
+
+        reused[0].fill(false);
+        super::record_backed_pages(backing, source_gpa, 2 * PAGE_SIZE, None, &mut copied).unwrap();
+        assert_eq!(reused, [vec![false; 2]]);
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].source_gpa, source_gpa);
+        assert_eq!(copied[0].backing, backing);
+        assert_eq!(copied[1].source_gpa, source_gpa + PAGE_SIZE as u64);
+        assert_eq!(
+            copied[1].backing,
+            GuestBacking::Snapshot {
+                layer_index: 0,
+                offset: PAGE_SIZE,
+            }
+        );
     }
 
     fn make_simple_pt_memory(contents: &[u8], pt_base: u64) -> super::SnapshotMemory {
