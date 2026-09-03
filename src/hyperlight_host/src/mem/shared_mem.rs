@@ -146,6 +146,10 @@ pub enum SharedMemoryError {
     #[error("Cannot take exclusive access to a ReadonlySharedMemory")]
     ReadonlySharedMemoryExclusiveRequest,
 
+    /// Calling code attempted to freeze memory that still has writable aliases.
+    #[error("Cannot freeze shared memory that still has other owners")]
+    SharedMemoryNotExclusive,
+
     /// The stack discipline of guest I/O was violated in some way
     #[error("{0}")]
     Stack(#[from] StackError),
@@ -989,6 +993,17 @@ impl ExclusiveSharedMemory {
         )
     }
 
+    /// Convert this allocation to immutable memory without copying it.
+    pub(crate) fn freeze(mut self) -> Result<ReadonlySharedMemory> {
+        if Arc::get_mut(&mut self.region).is_none() {
+            return Err(SharedMemoryError::SharedMemoryNotExclusive);
+        }
+
+        Ok(ReadonlySharedMemory {
+            region: self.region,
+        })
+    }
+
     /// Gets the file handle of the shared memory region for this Sandbox
     #[cfg(target_os = "windows")]
     pub fn get_mmap_file_handle(&self) -> HANDLE {
@@ -1620,9 +1635,7 @@ impl ReadonlySharedMemory {
         let mut anon =
             ExclusiveSharedMemory::new(contents.len().next_multiple_of(page_size::get()))?;
         anon.copy_from_slice(contents, 0)?;
-        Ok(ReadonlySharedMemory {
-            region: anon.region,
-        })
+        anon.freeze()
     }
 
     /// Create a `ReadonlySharedMemory` backed by a file on disk.
@@ -1925,6 +1938,33 @@ mod tests {
 
         assert!(hshm.fill(0, usize::MAX, 1).is_err());
         assert!(hshm.fill(0, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn freeze_transfers_mapping_without_copying() {
+        let page_size = page_size::get();
+        let mut memory = ExclusiveSharedMemory::new(2 * page_size).unwrap();
+        memory.copy_from_slice(&[1, 2, 3, 4], page_size).unwrap();
+        let base_addr = memory.base_addr();
+
+        let frozen = memory.freeze().unwrap();
+
+        assert_eq!(frozen.base_addr(), base_addr);
+        assert_eq!(&frozen.as_slice()[page_size..page_size + 4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn freeze_rejects_writable_aliases() {
+        let memory = ExclusiveSharedMemory::new(page_size::get()).unwrap();
+        let alias = ExclusiveSharedMemory {
+            region: memory.region.clone(),
+        };
+
+        assert!(matches!(
+            memory.freeze(),
+            Err(SharedMemoryError::SharedMemoryNotExclusive)
+        ));
+        drop(alias);
     }
 
     #[test]
