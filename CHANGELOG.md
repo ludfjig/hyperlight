@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and return roots with `Ok(roots)`.
 * Related snapshots share immutable memory layers. This reduces capture time
   and memory use.
+* New snapshots use OCI v2. Existing OCI v1 snapshots remain loadable.
 
 ### Removed
 
