@@ -11,6 +11,7 @@ use crate::hypervisor::regs::CommonSpecialRegisters;
 #[cfg(target_arch = "x86_64")]
 use crate::hypervisor::regs::MsrEntry;
 use crate::mem::layout::SandboxMemoryLayout;
+use crate::sandbox::snapshot::SnapshotLayer;
 
 // --- Arch and hypervisor identifiers --------------------------------
 
@@ -153,12 +154,13 @@ impl CpuVendor {
 
 /// Top-level Hyperlight snapshot config JSON. Lives at
 /// `blobs/sha256/<config-digest>` with media type
-/// `application/vnd.hyperlight.snapshot.config.v1+json`.
+/// `application/vnd.hyperlight.snapshot.config.v2+json`.
 ///
 /// In OCI terms this is the "image config" blob that the manifest's
 /// `config` descriptor points to. It describes the accompanying
-/// memory layer (the snapshot bytes) and everything the loader needs
-/// to reconstruct a runnable `Snapshot`.
+/// memory layers (the snapshot bytes) and everything the loader needs
+/// to reconstruct a runnable `Snapshot`. Manifest layer `n` stores the
+/// blob described by `layers[n]`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OciSnapshotConfig {
@@ -171,6 +173,8 @@ pub(super) struct OciSnapshotConfig {
     pub(super) hypervisor: Hypervisor,
     /// CPU vendor captured at snapshot time. Checked on load.
     pub(super) cpu_vendor: CpuVendor,
+    /// Host page size used to align layer storage. Checked on load.
+    pub(super) host_page_size: usize,
     /// Top of the guest stack, in guest virtual address space.
     pub(super) stack_top_gva: u64,
     /// Guest virtual address the loader resumes the paused call at.
@@ -188,9 +192,10 @@ pub(super) struct OciSnapshotConfig {
     #[cfg(target_arch = "x86_64")]
     pub(super) msrs: Vec<MsrEntry>,
     pub(super) layout: MemoryLayout,
-    /// Total size of the memory blob in bytes (including the guest
-    /// page-table tail, if any). Equal to `self.memory.mem_size()`.
-    pub(super) memory_size: u64,
+    /// One or more snapshot layers in manifest order.
+    pub(super) layers: Vec<OciSnapshotLayer>,
+    /// Index of the one layer whose page tables are used during restore.
+    pub(super) active_page_table_layer: usize,
     /// Names and signatures of host functions registered when this
     /// snapshot was taken. Validated against the loader's registry.
     pub(super) host_functions: Vec<HostFunction>,
@@ -201,9 +206,76 @@ pub(super) struct OciSnapshotConfig {
     pub(super) snapshot_generation: u64,
 }
 
-/// Sizes and permissions of the regions inside the snapshot blob,
-/// enough for the loader to rebuild a `SandboxMemoryLayout`.
-#[derive(Serialize, Deserialize)]
+
+/// Metadata for one snapshot layer in an OCI manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OciSnapshotLayer {
+    /// Guest memory captured in this layer.
+    /// `Some` when capture added one or more guest pages.
+    /// `None` when capture added page tables only.
+    pub(super) data: Option<OciSnapshotDataRange>,
+    /// Zero or more data ranges visible in the current snapshot.
+    /// Empty when this layer contributes no guest memory.
+    pub(super) live_data: Vec<OciMemoryRange>,
+    /// Page tables captured in this layer.
+    /// `Some` when the layer records page tables from a capture.
+    /// `None` when the layer is reused only for its guest pages.
+    /// The restore page-table layer must be `Some`.
+    pub(super) page_tables: Option<OciMemoryRange>,
+}
+
+/// One contiguous guest physical range stored in a snapshot blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OciSnapshotDataRange {
+    /// GPA corresponding to blob offset zero.
+    pub(super) gpa_start: u64,
+    pub(super) len: usize,
+}
+
+/// One half-open byte range in a snapshot blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OciMemoryRange {
+    pub(super) start: usize,
+    pub(super) end: usize,
+}
+
+impl From<&std::ops::Range<usize>> for OciMemoryRange {
+    fn from(range: &std::ops::Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+impl From<OciMemoryRange> for std::ops::Range<usize> {
+    fn from(range: OciMemoryRange) -> Self {
+        range.start..range.end
+    }
+}
+
+impl From<&SnapshotLayer> for OciSnapshotLayer {
+    fn from(layer: &SnapshotLayer) -> Self {
+        let blob = layer.blob();
+        Self {
+            data: blob.data_gpa_range().map(|data| OciSnapshotDataRange {
+                gpa_start: data.gpa_start(),
+                len: data.len(),
+            }),
+            live_data: layer.live_data_ranges().iter().map(Into::into).collect(),
+            page_tables: blob.page_table_memory_range().map(Into::into),
+        }
+    }
+}
+
+
+
+/// Fixed guest memory layout fields needed to rebuild a `SandboxMemoryLayout`.
+/// Snapshot memory metadata is stored in `OciSnapshotConfig::layers`.
+#[derive(Copy, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MemoryLayout {
     pub(super) input_data_size: usize,
@@ -214,9 +286,10 @@ pub(super) struct MemoryLayout {
     /// Memory region flag bits. `None` means default permissions.
     pub(super) init_data_permissions: Option<u32>,
     pub(super) scratch_size: usize,
-    pub(super) snapshot_size: usize,
-    pub(super) pt_size: Option<usize>,
 }
+
+
+
 
 /// Name and signature of one host function registered when the
 /// snapshot was taken. The loader validates these against the
@@ -356,191 +429,8 @@ impl From<HostFunction> for HostFunctionDefinition {
     }
 }
 
-impl OciSnapshotConfig {
-    pub(super) fn validate_for_load(&self) -> crate::Result<()> {
-        if self.arch != Arch::current() {
-            return Err(crate::new_error!(
-                "snapshot architecture mismatch: file is {:?}, current host is {:?} \
-                 (snapshot produced by hyperlight {})",
-                self.arch,
-                Arch::current(),
-                self.hyperlight_version
-            ));
-        }
-        if self.abi_version != SNAPSHOT_ABI_VERSION {
-            return Err(crate::new_error!(
-                "snapshot ABI version mismatch: file has version {}, this build expects {}. \
-                 The snapshot must be regenerated from the guest binary \
-                 (snapshot produced by hyperlight {}).",
-                self.abi_version,
-                SNAPSHOT_ABI_VERSION,
-                self.hyperlight_version
-            ));
-        }
-        let current_hv = Hypervisor::current()
-            .ok_or_else(|| crate::new_error!("no hypervisor available to load snapshot"))?;
-        if self.hypervisor != current_hv {
-            return Err(crate::new_error!(
-                "snapshot hypervisor mismatch: file was created on {} but the current hypervisor is {} \
-                 (snapshot produced by hyperlight {})",
-                self.hypervisor.name(),
-                current_hv.name(),
-                self.hyperlight_version
-            ));
-        }
-        let current_vendor = CpuVendor::current();
-        if self.cpu_vendor != current_vendor {
-            return Err(crate::new_error!(
-                "snapshot CPU vendor mismatch: file was created on {} but the current CPU is {} \
-                 (snapshot produced by hyperlight {})",
-                self.cpu_vendor.as_str(),
-                current_vendor.as_str(),
-                self.hyperlight_version
-            ));
-        }
-        // Bound memory size early so the subsequent file-size check
-        // does not have to deal with absurd values.
-        if self.memory_size == 0 || self.memory_size > SandboxMemoryLayout::MAX_MEMORY_SIZE as u64 {
-            return Err(crate::new_error!(
-                "snapshot memory_size ({}) is out of range",
-                self.memory_size
-            ));
-        }
-        if !(self.memory_size as usize).is_multiple_of(PAGE_SIZE) {
-            return Err(crate::new_error!(
-                "snapshot memory_size ({}) is not a multiple of PAGE_SIZE",
-                self.memory_size
-            ));
-        }
-        // `snapshot_size` is the guest-visible prefix of the blob,
-        // mapped at `BASE_ADDRESS`. `pt_size` is the page-table tail
-        // after it, present in the blob and host mapping but outside
-        // the guest mapping. They sum to `memory_size`.
-        if self.layout.snapshot_size == 0 {
-            return Err(crate::new_error!("snapshot snapshot_size must be nonzero"));
-        }
-        if !self.layout.snapshot_size.is_multiple_of(PAGE_SIZE) {
-            return Err(crate::new_error!(
-                "snapshot snapshot_size ({}) is not a multiple of PAGE_SIZE",
-                self.layout.snapshot_size
-            ));
-        }
-        let pt = self
-            .layout
-            .pt_size
-            .ok_or_else(|| crate::new_error!("snapshot pt_size is missing"))?;
-        if pt == 0 {
-            return Err(crate::new_error!("snapshot pt_size must be nonzero"));
-        }
-        if !pt.is_multiple_of(PAGE_SIZE) {
-            return Err(crate::new_error!(
-                "snapshot pt_size ({}) is not a multiple of PAGE_SIZE",
-                pt
-            ));
-        }
-        // The total memory size might be bigger because it has to
-        // take into account the host page size, as well as the guest
-        // page size.
-        let total_size = (self.layout.snapshot_size as u64)
-            .saturating_add(pt as u64)
-            .next_multiple_of(page_size::get() as u64);
-        if total_size != self.memory_size {
-            return Err(crate::new_error!(
-                "snapshot snapshot_size ({}) + pt_size ({}), rounded to {}, does not equal memory_size ({})",
-                self.layout.snapshot_size,
-                pt,
-                total_size,
-                self.memory_size
-            ));
-        }
-        // Cap each layout field at `MAX_MEMORY_SIZE` so the later
-        // size and offset sums in `SandboxMemoryLayout` cannot
-        // overflow `u64`. Whether the regions fit the snapshot is
-        // checked against `snapshot_size` in `load_inner`.
-        let max_region = SandboxMemoryLayout::MAX_MEMORY_SIZE;
-        for (name, value) in [
-            ("input_data_size", self.layout.input_data_size),
-            ("output_data_size", self.layout.output_data_size),
-            ("heap_size", self.layout.heap_size),
-            ("code_size", self.layout.code_size),
-            ("init_data_size", self.layout.init_data_size),
-            ("scratch_size", self.layout.scratch_size),
-        ] {
-            if value > max_region {
-                return Err(crate::new_error!(
-                    "snapshot layout field {} ({}) exceeds maximum allowed {}",
-                    name,
-                    value,
-                    max_region
-                ));
-            }
-        }
 
-        // The saved dispatch entrypoint must be in the executable code
-        // region. Code occupies the page-rounded prefix of the snapshot.
-        let code_lo = SandboxMemoryLayout::BASE_ADDRESS as u64;
-        let code_hi = code_lo
-            .checked_add(self.layout.code_size.next_multiple_of(PAGE_SIZE) as u64)
-            .ok_or_else(|| {
-                crate::new_error!(
-                    "snapshot layout overflow: BASE_ADDRESS + code_size ({}) does not fit in u64",
-                    self.layout.code_size
-                )
-            })?;
-        if self.entrypoint_addr < code_lo || self.entrypoint_addr >= code_hi {
-            return Err(crate::new_error!(
-                "snapshot entrypoint addr {:#x} is outside the code region [{:#x}, {:#x})",
-                self.entrypoint_addr,
-                code_lo,
-                code_hi
-            ));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if !self.entrypoint_addr.is_multiple_of(4) {
-            return Err(crate::new_error!(
-                "snapshot entrypoint addr {:#x} is not 4-byte aligned",
-                self.entrypoint_addr
-            ));
-        }
 
-        // ELF entry point GVA for `AT_ENTRY` in core dumps. It must point
-        // inside the snapshot region, like `entrypoint_addr`.
-        let snapshot_hi = code_lo
-            .checked_add(self.layout.snapshot_size as u64)
-            .ok_or_else(|| {
-                crate::new_error!(
-                    "snapshot layout overflow: BASE_ADDRESS + snapshot_size ({}) does not fit in u64",
-                    self.layout.snapshot_size
-                )
-            })?;
-        if self.original_entrypoint_addr < code_lo || self.original_entrypoint_addr >= snapshot_hi {
-            return Err(crate::new_error!(
-                "snapshot original entrypoint addr {:#x} is outside the snapshot region [{:#x}, {:#x})",
-                self.original_entrypoint_addr,
-                code_lo,
-                snapshot_hi
-            ));
-        }
-
-        // `stack_top_gva` is restored directly into the guest stack
-        // pointer. It must be aligned and in the guest address range.
-        let max_gva = hyperlight_common::layout::SCRATCH_TOP_GVA as u64;
-        if self.stack_top_gva == 0 || self.stack_top_gva > max_gva {
-            return Err(crate::new_error!(
-                "snapshot stack_top_gva {:#x} is outside the valid range (0, {:#x}]",
-                self.stack_top_gva,
-                max_gva
-            ));
-        }
-        if !self.stack_top_gva.is_multiple_of(16) {
-            return Err(crate::new_error!(
-                "snapshot stack_top_gva {:#x} is not 16-byte aligned",
-                self.stack_top_gva
-            ));
-        }
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -760,6 +650,7 @@ mod tests {
             abi_version: SNAPSHOT_ABI_VERSION,
             hypervisor: Hypervisor::Mshv,
             cpu_vendor: CpuVendor::current(),
+            host_page_size: page_size::get(),
             stack_top_gva: 0x2000,
             entrypoint_addr: SandboxMemoryLayout::BASE_ADDRESS as u64,
             original_entrypoint_addr: SandboxMemoryLayout::BASE_ADDRESS as u64,
@@ -774,10 +665,9 @@ mod tests {
                 init_data_size: 0,
                 init_data_permissions: None,
                 scratch_size: 0,
-                snapshot_size: PAGE_SIZE,
-                pt_size: None,
             },
-            memory_size: PAGE_SIZE as u64,
+            layers: Vec::new(),
+            active_page_table_layer: 0,
             host_functions: Vec::new(),
             snapshot_generation: 0,
         }
@@ -840,9 +730,10 @@ mod schema_pin {
     const PINNED_CALL: &str = r#"{
   "hyperlight_version": "x.y.z",
   "arch": "x86_64",
-  "abi_version": 1,
+    "abi_version": 3,
   "hypervisor": "mshv",
   "cpu_vendor": "intel",
+    "host_page_size": 4096,
   "stack_top_gva": 3735928559,
   "entrypoint_addr": 8192,
   "original_entrypoint_addr": 4096,
@@ -1004,12 +895,28 @@ mod schema_pin {
     "heap_size": 3,
     "code_size": 4,
     "init_data_size": 5,
-    "init_data_permissions": null,
-    "scratch_size": 8,
-    "snapshot_size": 9,
-    "pt_size": null
+        "init_data_permissions": null,
+        "scratch_size": 8
   },
-  "memory_size": 65536,
+    "layers": [
+        {
+            "data": {
+                "gpa_start": 16384,
+                "len": 8192
+            },
+            "live_data": [
+                {
+                    "start": 0,
+                    "end": 8192
+                }
+            ],
+            "page_tables": {
+                "start": 8192,
+                "end": 12288
+            }
+        }
+    ],
+    "active_page_table_layer": 0,
   "host_functions": [
     {
       "function_name": "fn_void",
@@ -1026,9 +933,10 @@ mod schema_pin {
     const PINNED_CALL: &str = r#"{
   "hyperlight_version": "x.y.z",
   "arch": "aarch64",
-  "abi_version": 1,
+    "abi_version": 3,
   "hypervisor": "mshv",
   "cpu_vendor": "intel",
+    "host_page_size": 4096,
   "stack_top_gva": 3735928559,
   "entrypoint_addr": 8192,
   "original_entrypoint_addr": 4096,
@@ -1046,12 +954,28 @@ mod schema_pin {
     "heap_size": 3,
     "code_size": 4,
     "init_data_size": 5,
-    "init_data_permissions": null,
-    "scratch_size": 8,
-    "snapshot_size": 9,
-    "pt_size": null
+        "init_data_permissions": null,
+        "scratch_size": 8
   },
-  "memory_size": 65536,
+    "layers": [
+        {
+            "data": {
+                "gpa_start": 16384,
+                "len": 8192
+            },
+            "live_data": [
+                {
+                    "start": 0,
+                    "end": 8192
+                }
+            ],
+            "page_tables": {
+                "start": 8192,
+                "end": 12288
+            }
+        }
+    ],
+    "active_page_table_layer": 0,
   "host_functions": [
     {
       "function_name": "fn_void",
@@ -1086,7 +1010,7 @@ mod schema_pin {
         assert_eq!(
             actual_value, pinned_value,
             "Snapshot config JSON schema changed. If the change can break \
-             existing snapshots on disk, bump `MT_CONFIG_V1` in \
+             existing snapshots on disk, bump `MT_CONFIG_CURRENT` in \
              `super::media_types` and follow `docs/snapshot-versioning.md`. \
              Either way, paste the actual output below into the matching \
              `PINNED_*`.\n\nactual:\n{actual}"
