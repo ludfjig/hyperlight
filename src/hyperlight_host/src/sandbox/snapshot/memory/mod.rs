@@ -25,6 +25,9 @@ use crate::Result;
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
 
+mod backing;
+pub(crate) use backing::SnapshotMemoryBacking;
+
 // Arbitrary cap on the structure of one snapshot, applied to its layer count
 // and its mapping count alike. Each mapping costs a map/unmap when a sandbox
 // switches snapshots, so bounding this bounds restore latency.
