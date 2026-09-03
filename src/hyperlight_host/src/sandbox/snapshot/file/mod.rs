@@ -494,8 +494,8 @@ impl Snapshot {
         cfg: &OciSnapshotConfig,
         cfg_bytes: &[u8],
     ) -> crate::Result<Descriptor> {
-        let blob = self.v1_blob()?;
-        let memory_bytes = blob.memory().as_slice();
+        let memory = self.memory.flat_image()?;
+        let memory_bytes = memory.as_ref();
         let memory_size = memory_bytes.len();
         if memory_size == 0 || !memory_size.is_multiple_of(PAGE_SIZE) {
             return Err(crate::new_error!(
@@ -510,7 +510,10 @@ impl Snapshot {
         })?;
 
         // Snapshot blob: the raw memory bytes.
-        let snapshot_digest = Digest256::from_digest_array(blob.sha256());
+        let snapshot_digest = match (&memory, self.memory.layers()) {
+            (Cow::Borrowed(_), [layer]) => Digest256::from_digest_array(layer.blob().sha256()),
+            _ => Digest256::from_bytes(memory_bytes),
+        };
         put_blob_if_absent(&blobs_dir, &snapshot_digest, memory_bytes)?;
 
         // Config blob.
@@ -623,7 +626,7 @@ impl Snapshot {
                 snapshot_size: self.memory.gpa_span_len(),
                 pt_size: Some(self.memory.page_table_len()),
             },
-            memory_size: self.v1_blob()?.memory().mem_size() as u64,
+            memory_size: self.memory.flat_image_len()? as u64,
             host_functions,
             snapshot_generation: self.snapshot_generation,
         })
