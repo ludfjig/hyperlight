@@ -591,6 +591,41 @@ fn first_fit_blob_gpa(data_len: usize, layers: &[SnapshotLayer], scratch_base: u
     (candidate.checked_add(data_len)? <= scratch_base).then_some(candidate)
 }
 
+fn add_page_table_range(
+    tables: &mut BTreeSet<(usize, u8, u64)>,
+    root_index: usize,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = start
+        .checked_add(len - 1)
+        .ok_or_else(|| crate::new_error!("snapshot virtual mapping overflows"))?;
+    for shift in [39u8, 30, 21] {
+        for prefix in (start >> shift)..=(end >> shift) {
+            tables.insert((root_index, shift, prefix));
+        }
+    }
+    Ok(())
+}
+
+fn add_page_table_page(
+    tables: &mut BTreeSet<(usize, u8, u64)>,
+    previous_prefixes: &mut [Option<u64>; 3],
+    root_index: usize,
+    virt_gva: u64,
+) {
+    for (previous, shift) in previous_prefixes.iter_mut().zip([39u8, 30, 21]) {
+        let prefix = virt_gva >> shift;
+        if *previous != Some(prefix) {
+            tables.insert((root_index, shift, prefix));
+            *previous = Some(prefix);
+        }
+    }
+}
+
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
     if let Some((phys_base, virt_base)) = io_page() {
         // Map the IO page
