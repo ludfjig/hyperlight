@@ -380,6 +380,21 @@ impl SnapshotMemory {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_gpa(&self, gpa: u64, destination: &mut [u8]) -> Result<()> {
+        let (layer_index, offset) = self
+            .resolve(gpa, destination.len())
+            .ok_or_else(|| crate::new_error!("snapshot GPA range is not live: {gpa:#x}"))?;
+        let source = self.layers[layer_index]
+            .blob
+            .memory()
+            .as_slice()
+            .get(offset..offset + destination.len())
+            .ok_or_else(|| crate::new_error!("snapshot GPA range is out of bounds"))?;
+        destination.copy_from_slice(source);
+        Ok(())
+    }
+
     pub(crate) fn read_page_tables(
         &self,
         pt_gpa_base: u64,
