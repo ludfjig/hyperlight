@@ -14,10 +14,7 @@ use hyperlight_common::vmem::{BasicMapping, MappingKind};
 use tracing::{Span, instrument};
 
 use super::layout::SandboxMemoryLayout;
-use super::shared_mem::{
-    ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, HostSharedMemoryReadGuard,
-    SharedMemory,
-};
+use super::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, SharedMemory};
 use crate::hypervisor::regs::CommonSpecialRegisters;
 use crate::mem::memory_region::MemoryRegion;
 #[cfg(crashdump)]

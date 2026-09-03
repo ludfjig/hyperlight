@@ -3,10 +3,12 @@
 
 mod file;
 mod file_tests;
+mod memory;
 mod tripwires;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 pub(crate) use file::host_cpu_vendor_golden_tag;
 pub use file::reference::{OciDigest, OciReference, OciTag};
@@ -18,6 +20,9 @@ use hyperlight_common::vmem::{
 };
 use tracing::{Span, instrument};
 
+#[cfg(test)]
+pub(crate) use self::memory::SnapshotLayer;
+pub(crate) use self::memory::{SnapshotBlob, SnapshotMemory, SnapshotMemoryBacking};
 use crate::Result;
 use crate::hypervisor::regs::CommonSpecialRegisters;
 #[cfg(target_arch = "x86_64")]
@@ -25,8 +30,8 @@ use crate::hypervisor::regs::MsrEntry;
 use crate::mem::exe::{ExeInfo, LoadInfo};
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::memory_region::{GuestMemoryRegion, MemoryRegion, MemoryRegionFlags};
-use crate::mem::mgr::{GuestPageTableBuffer, GuestPhysicalMemoryView, SnapshotSharedMemory};
-use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
+use crate::mem::mgr::{GuestPageTableBuffer, GuestPhysicalMemoryView};
+use crate::mem::shared_mem::{HostSharedMemory, ReadonlySharedMemory};
 use crate::sandbox::SandboxConfiguration;
 use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
 
@@ -145,7 +150,7 @@ pub struct Snapshot {
     /// on?).
     layout: crate::mem::layout::SandboxMemoryLayout,
     /// Memory of the sandbox at the time this snapshot was taken
-    memory: ReadonlySharedMemory,
+    memory: Arc<SnapshotMemory>,
     /// Extra debug information about the binary in this snapshot,
     /// from when the binary was first loaded into the snapshot.
     ///
@@ -202,20 +207,22 @@ impl core::convert::AsRef<Snapshot> for Snapshot {
 impl hyperlight_common::vmem::TableReadOps for Snapshot {
     type TableAddr = u64;
     fn entry_addr(addr: u64, offset: u64) -> u64 {
-        addr + offset
+        addr.saturating_add(offset)
     }
     unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
-        let addr = addr as usize;
-        let Some(pte_bytes) = self.memory.as_slice().get(addr..addr + PTE_SIZE) else {
+        let mut pte_bytes = [0u8; PTE_SIZE];
+        if self
+            .memory
+            .read_page_tables(self.layout.get_pt_base_gpa(), addr, &mut pte_bytes)
+            .is_err()
+        {
             // Attacker-controlled data pointed out-of-bounds. We'll
             // default to returning 0 in this case, which, for most
             // architectures (including x86-64 and arm64, the ones we
             // care about presently) will be a not-present entry.
             return 0;
-        };
-        // The `get()` above ensures exactly PTE_SIZE bytes.
-        #[allow(clippy::unwrap_used)]
-        vmem::PageTableEntry::from_le_bytes(pte_bytes.try_into().unwrap())
+        }
+        vmem::PageTableEntry::from_le_bytes(pte_bytes)
     }
     #[allow(clippy::unnecessary_cast)]
     fn to_phys(addr: u64) -> vmem::PhysAddr {
@@ -230,72 +237,6 @@ impl hyperlight_common::vmem::TableReadOps for Snapshot {
     }
 }
 
-pub(crate) fn access_gpa<'a>(
-    snap: &'a [u8],
-    scratch: &'a [u8],
-    layout: SandboxMemoryLayout,
-    gpa: u64,
-) -> Option<(&'a [u8], usize)> {
-    let resolved = layout.resolve_gpa(gpa, &[])?.with_memories(snap, scratch);
-    Some((resolved.base.as_ref(), resolved.offset))
-}
-
-pub(crate) struct SharedMemoryPageTableBuffer<'a> {
-    snap: &'a [u8],
-    scratch: &'a [u8],
-    layout: SandboxMemoryLayout,
-    root: u64,
-}
-impl<'a> SharedMemoryPageTableBuffer<'a> {
-    pub(crate) fn new(
-        snap: &'a [u8],
-        scratch: &'a [u8],
-        layout: SandboxMemoryLayout,
-        root: u64,
-    ) -> Self {
-        Self {
-            snap,
-            scratch,
-            layout,
-            root,
-        }
-    }
-}
-impl<'a> hyperlight_common::vmem::TableReadOps for SharedMemoryPageTableBuffer<'a> {
-    type TableAddr = u64;
-    fn entry_addr(addr: u64, offset: u64) -> u64 {
-        addr + offset
-    }
-    unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
-        let memoff = access_gpa(self.snap, self.scratch, self.layout, addr);
-        let Some(pte_bytes) = memoff.and_then(|(mem, off)| mem.get(off..off + PTE_SIZE)) else {
-            // Attacker-controlled data pointed out-of-bounds. We'll
-            // default to returning 0 in this case, which, for most
-            // architectures (including x86-64 and arm64, the ones we
-            // care about presently) will be a not-present entry.
-            return 0;
-        };
-        // The `get()` above ensures exactly PTE_SIZE bytes.
-        #[allow(clippy::unwrap_used)]
-        vmem::PageTableEntry::from_le_bytes(pte_bytes.try_into().unwrap())
-    }
-    #[allow(clippy::unnecessary_cast)]
-    fn to_phys(addr: u64) -> vmem::PhysAddr {
-        addr as vmem::PhysAddr
-    }
-    #[allow(clippy::unnecessary_cast)]
-    fn from_phys(addr: vmem::PhysAddr) -> u64 {
-        addr as u64
-    }
-    fn root_table(&self) -> u64 {
-        self.root
-    }
-}
-impl<'a> core::convert::AsRef<SharedMemoryPageTableBuffer<'a>> for SharedMemoryPageTableBuffer<'a> {
-    fn as_ref(&self) -> &Self {
-        self
-    }
-}
 /// Return true if `virt_base` is a VA we must not preserve into the
 /// rebuilt snapshot page tables: it is either part of the scratch
 /// region (re-mapped freshly by `map_specials`) or, on amd64, part of
@@ -310,29 +251,6 @@ fn skip_virt(virt_base: u64, scratch_gva: u64) -> bool {
         return true;
     }
     false
-}
-
-/// Find the contents of the page which starts at gpa in guest physical
-/// memory, taking into account excess host->guest regions
-///
-/// # Safety
-/// The host side of the regions identified by MemoryRegion must be
-/// alive and must not be mutated by any other thread: references to
-/// these regions may be created and live for `'a`.
-unsafe fn guest_page<'a>(
-    snap: &'a [u8],
-    scratch: &'a [u8],
-    regions: &[MemoryRegion],
-    layout: SandboxMemoryLayout,
-    gpa: u64,
-) -> Option<&'a [u8]> {
-    let resolved = layout
-        .resolve_gpa(gpa, regions)?
-        .with_memories(snap, scratch);
-    if resolved.as_ref().len() < PAGE_SIZE {
-        return None;
-    }
-    Some(&resolved.as_ref()[..PAGE_SIZE])
 }
 
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
@@ -367,6 +285,24 @@ fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
 }
 
 impl Snapshot {
+    fn flat_snapshot_memory(
+        memory: ReadonlySharedMemory,
+        layout: &SandboxMemoryLayout,
+        data_len: usize,
+        page_table_len: usize,
+    ) -> Result<SnapshotMemory> {
+        let page_table_end = data_len
+            .checked_add(page_table_len)
+            .ok_or_else(|| crate::new_error!("snapshot memory size overflows"))?;
+        SnapshotMemory::from_flat(
+            memory,
+            SandboxMemoryLayout::BASE_ADDRESS as u64,
+            data_len,
+            data_len..page_table_end,
+            scratch_base_gpa(layout.get_scratch_size()),
+        )
+    }
+
     /// Create a new snapshot from the guest binary identified by `env`. With the configuration
     /// specified in `cfg`.
     pub(crate) fn from_env<'b>(
@@ -397,7 +333,7 @@ impl Snapshot {
         let guest_blob_size = blob.as_ref().map(|b| b.data.len()).unwrap_or(0);
         let guest_blob_mem_flags = blob.as_ref().map(|b| b.permissions);
 
-        let mut layout = crate::mem::layout::SandboxMemoryLayout::new(
+        let layout = crate::mem::layout::SandboxMemoryLayout::new(
             cfg,
             exe_info.loaded_size(),
             guest_blob_size,
@@ -452,8 +388,9 @@ impl Snapshot {
         // 2. Map the special mappings
         map_specials(&pt_buf, layout.get_scratch_size());
 
+        let data_len = memory.len();
         let pt_bytes = pt_buf.into_bytes();
-        layout.set_pt_size(pt_bytes.len())?;
+        layout.ensure_page_tables_fit(pt_bytes.len())?;
         memory.extend(&pt_bytes);
 
         let exn_stack_top_gva = hyperlight_common::layout::SCRATCH_TOP_GVA as u64
@@ -462,8 +399,16 @@ impl Snapshot {
 
         let entrypoint_gva = load_addr + entrypoint_va - base_va;
 
+        let storage = ReadonlySharedMemory::from_bytes(&memory)?;
+        let memory = Arc::new(Self::flat_snapshot_memory(
+            storage,
+            &layout,
+            data_len,
+            pt_bytes.len(),
+        )?);
+
         Ok(Self {
-            memory: ReadonlySharedMemory::from_bytes(&memory, layout.snapshot_size())?,
+            memory,
             layout,
             load_info,
             stack_top_gva: exn_stack_top_gva,
@@ -488,10 +433,10 @@ impl Snapshot {
     /// Take a snapshot of the memory in `shared_mem`, then create a new
     /// instance of `Self` with the snapshot stored therein.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
-    pub(crate) fn new<S: SharedMemory>(
-        shared_mem: &mut SnapshotSharedMemory<S>,
-        scratch_mem: &mut S,
-        mut layout: SandboxMemoryLayout,
+    pub(crate) fn new(
+        shared_mem: &SnapshotMemoryBacking<HostSharedMemory>,
+        scratch_mem: &HostSharedMemory,
+        layout: SandboxMemoryLayout,
         load_info: LoadInfo,
         regions: Vec<MemoryRegion>,
         root_pt_gpas: &[u64],
@@ -503,157 +448,155 @@ impl Snapshot {
         snapshot_generation: u64,
         host_functions: HostFunctionDetails,
     ) -> Result<Self> {
+        if root_pt_gpas.is_empty() {
+            return Err(crate::new_error!("snapshot has no page-table roots"));
+        }
         let mut phys_seen = HashMap::<u64, usize>::new();
         let scratch_gva = scratch_base_gva(layout.get_scratch_size());
-        let memory = shared_mem.with_contents(|snap_c| {
-            scratch_mem.with_contents(|scratch_c| {
-                // Phase 1: walk every PT root together. This detects
-                // aliased intermediate tables (e.g. Nanvix's kernel-
-                // half PTs, which multiple process PDs share by
-                // pointing at the same PT page). The walker emits
-                // `ThisSpace(leaf)` for private leaves and
-                // `AnotherSpace(ref)` for sub-trees that were already
-                // seen via an earlier root. Results are returned in
-                // `root_pt_gpas` order — which is also the topological
-                // order of the `AnotherSpace` references — so
-                // processing in iteration order is safe.
-                let op = SharedMemoryPageTableBuffer::new(
-                    snap_c,
-                    scratch_c,
-                    layout,
-                    root_pt_gpas.first().copied().unwrap_or(0),
-                );
-                let walk = unsafe {
-                    vmem::walk_va_spaces(
-                        &op,
-                        root_pt_gpas,
-                        0,
-                        hyperlight_common::layout::SCRATCH_TOP_GVA as u64,
-                    )
-                };
+        let memory_view = GuestPhysicalMemoryView::new(shared_mem, scratch_mem, &regions, layout);
+        let memory = {
+            // Phase 1: walk every PT root together. This detects
+            // aliased intermediate tables (e.g. Nanvix's kernel-
+            // half PTs, which multiple process PDs share by
+            // pointing at the same PT page). The walker emits
+            // `ThisSpace(leaf)` for private leaves and
+            // `AnotherSpace(ref)` for sub-trees that were already
+            // seen via an earlier root. Results are returned in
+            // `root_pt_gpas` order — which is also the topological
+            // order of the `AnotherSpace` references — so
+            // processing in iteration order is safe.
+            let op = PageTableReader::new(&memory_view, root_pt_gpas[0]);
+            let walk = unsafe {
+                vmem::walk_va_spaces(
+                    &op,
+                    root_pt_gpas,
+                    0,
+                    hyperlight_common::layout::SCRATCH_TOP_GVA as u64,
+                )
+            };
+            op.finish()?;
 
-                // Phase 2: rebuild each space's page tables, compacting
-                // `ThisSpace` leaves into a dense snapshot blob and
-                // linking `AnotherSpace` entries to already-built
-                // spaces' tables.
-                // TODO: Look for opportunities to hugepage map
-                let mut snapshot_memory: Vec<u8> = Vec::new();
-                let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
-                // Allocate one root table per space and remember the
-                // addresses returned by `alloc_table` instead of
-                // assuming the buffer's physical layout.
-                let mut root_addrs: Vec<u64> = Vec::with_capacity(root_pt_gpas.len());
-                root_addrs.push(pt_buf.initial_root());
-                for _ in 1..root_pt_gpas.len() {
-                    root_addrs.push(unsafe { pt_buf.alloc_table() });
-                }
+            // Phase 2: rebuild each space's page tables, compacting
+            // `ThisSpace` leaves into a dense snapshot blob and
+            // linking `AnotherSpace` entries to already-built
+            // spaces' tables.
+            // TODO: Look for opportunities to hugepage map
+            let mut snapshot_memory: Vec<u8> = Vec::new();
+            let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
+            // Allocate one root table per space and remember the
+            // addresses returned by `alloc_table` instead of
+            // assuming the buffer's physical layout.
+            let mut root_addrs: Vec<u64> = Vec::with_capacity(root_pt_gpas.len());
+            root_addrs.push(pt_buf.initial_root());
+            for _ in 1..root_pt_gpas.len() {
+                root_addrs.push(unsafe { pt_buf.alloc_table() });
+            }
 
-                let mut built_roots: BTreeMap<SpaceId, u64> = BTreeMap::new();
-                for (root_idx, (space_id, mappings)) in walk.into_iter().enumerate() {
-                    pt_buf.set_root(root_addrs[root_idx]);
-                    built_roots.insert(space_id, root_addrs[root_idx]);
+            let mut built_roots: BTreeMap<SpaceId, u64> = BTreeMap::new();
+            for (root_idx, (space_id, mappings)) in walk.into_iter().enumerate() {
+                pt_buf.set_root(root_addrs[root_idx]);
+                built_roots.insert(space_id, root_addrs[root_idx]);
 
-                    for sam in mappings {
-                        match sam {
-                            SpaceAwareMapping::ThisSpace(mapping) => {
-                                // Drop the scratch region and (on
-                                // amd64) the snapshot's own PT
-                                // self-map; both are re-mapped
-                                // freshly by `map_specials`.
-                                if skip_virt(mapping.virt_base, scratch_gva) {
-                                    continue;
-                                }
-                                let Some(contents) = (unsafe {
-                                    guest_page(
-                                        snap_c,
-                                        scratch_c,
-                                        &regions,
-                                        layout,
-                                        mapping.phys_base,
-                                    )
-                                }) else {
-                                    continue;
-                                };
-
-                                // Writable pages become CoW in the
-                                // rebuilt snapshot; read-only pages
-                                // stay read-only.
-                                let kind = match mapping.kind {
-                                    MappingKind::Cow(cm) => MappingKind::Cow(cm),
-                                    MappingKind::Basic(bm) if bm.writable => {
-                                        MappingKind::Cow(CowMapping {
-                                            readable: bm.readable,
-                                            executable: bm.executable,
-                                        })
-                                    }
-                                    MappingKind::Basic(bm) => MappingKind::Basic(BasicMapping {
-                                        readable: bm.readable,
-                                        writable: false,
-                                        executable: bm.executable,
-                                    }),
-                                    MappingKind::Unmapped => continue,
-                                };
-                                let new_gpa =
-                                    phys_seen.entry(mapping.phys_base).or_insert_with(|| {
-                                        let new_offset = snapshot_memory.len();
-                                        snapshot_memory.extend(contents);
-                                        new_offset + SandboxMemoryLayout::BASE_ADDRESS
-                                    });
-
-                                let compacted = Mapping {
-                                    phys_base: *new_gpa as u64,
-                                    virt_base: mapping.virt_base,
-                                    len: PAGE_SIZE as u64,
-                                    kind,
-                                };
-                                unsafe { vmem::map(&pt_buf, compacted) };
+                for sam in mappings {
+                    match sam {
+                        SpaceAwareMapping::ThisSpace(mapping) => {
+                            // Drop the scratch region and (on
+                            // amd64) the snapshot's own PT
+                            // self-map; both are re-mapped
+                            // freshly by `map_specials`.
+                            if skip_virt(mapping.virt_base, scratch_gva) {
+                                continue;
                             }
-                            SpaceAwareMapping::AnotherSpace(ref_map) => {
-                                // Link to the owning space's already-
-                                // rebuilt intermediate table — this
-                                // is what preserves Nanvix's
-                                // kernel-half-shared invariant across
-                                // process PDs after relocation.
-                                unsafe {
-                                    vmem::space_aware_map(&pt_buf, ref_map, &built_roots);
+                            let mut contents = [0u8; PAGE_SIZE];
+                            if memory_view.read(mapping.phys_base, &mut contents).is_err() {
+                                continue;
+                            }
+
+                            // Writable pages become CoW in the
+                            // rebuilt snapshot; read-only pages
+                            // stay read-only.
+                            let kind = match mapping.kind {
+                                MappingKind::Cow(cm) => MappingKind::Cow(cm),
+                                MappingKind::Basic(bm) if bm.writable => {
+                                    MappingKind::Cow(CowMapping {
+                                        readable: bm.readable,
+                                        executable: bm.executable,
+                                    })
                                 }
+                                MappingKind::Basic(bm) => MappingKind::Basic(BasicMapping {
+                                    readable: bm.readable,
+                                    writable: false,
+                                    executable: bm.executable,
+                                }),
+                                MappingKind::Unmapped => continue,
+                            };
+                            let new_gpa = phys_seen.entry(mapping.phys_base).or_insert_with(|| {
+                                let new_offset = snapshot_memory.len();
+                                snapshot_memory.extend(&contents);
+                                new_offset + SandboxMemoryLayout::BASE_ADDRESS
+                            });
+
+                            let compacted = Mapping {
+                                phys_base: *new_gpa as u64,
+                                virt_base: mapping.virt_base,
+                                len: PAGE_SIZE as u64,
+                                kind,
+                            };
+                            unsafe { vmem::map(&pt_buf, compacted) };
+                        }
+                        SpaceAwareMapping::AnotherSpace(ref_map) => {
+                            // Link to the owning space's already-
+                            // rebuilt intermediate table — this
+                            // is what preserves Nanvix's
+                            // kernel-half-shared invariant across
+                            // process PDs after relocation.
+                            unsafe {
+                                vmem::space_aware_map(&pt_buf, ref_map, &built_roots);
                             }
                         }
                     }
                 }
+            }
 
-                // Phase 3: Map the scratch region into each root.
-                for &root_addr in &root_addrs {
-                    pt_buf.set_root(root_addr);
-                    map_specials(&pt_buf, layout.get_scratch_size());
-                }
-                pt_buf.set_root(pt_buf.initial_root());
+            // Phase 3: Map the scratch region into each root.
+            for &root_addr in &root_addrs {
+                pt_buf.set_root(root_addr);
+                map_specials(&pt_buf, layout.get_scratch_size());
+            }
+            pt_buf.set_root(pt_buf.initial_root());
 
-                snapshot_memory.resize(
-                    snapshot_memory.len().next_multiple_of(page_size::get()),
-                    0u8,
-                );
+            snapshot_memory.resize(
+                snapshot_memory.len().next_multiple_of(page_size::get()),
+                0u8,
+            );
 
-                // Phase 4: finalize PT bytes.
-                let pt_data = pt_buf.into_bytes();
-                layout.set_pt_size(pt_data.len())?;
-                snapshot_memory.extend(&pt_data);
-                Ok::<_, crate::HyperlightError>(snapshot_memory)
-            })
-        })???;
+            // Phase 4: finalize PT bytes.
+            let pt_data = pt_buf.into_bytes();
+            layout.ensure_page_tables_fit(pt_data.len())?;
+            let page_table_len = pt_data.len();
+            snapshot_memory.extend(&pt_data);
+            (snapshot_memory, page_table_len)
+        };
         // Only the data prefix is exposed to the guest. The PT tail
         // sits past it in the host mapping and is copied into the
         // scratch region on restore. Keeping it out of the guest
         // mapping of the snapshot region avoids overlap with
         // `map_file_cow` regions installed immediately after the
         // snapshot in guest PA space.
-        let guest_visible_size = memory.len() - layout.get_pt_size();
+        let (memory, page_table_len) = memory;
+        let guest_visible_size = memory.len() - page_table_len;
         debug_assert!(guest_visible_size.is_multiple_of(page_size::get()));
-        layout.set_snapshot_size(guest_visible_size);
+        let storage = ReadonlySharedMemory::from_bytes(&memory)?;
+        let memory = Arc::new(Self::flat_snapshot_memory(
+            storage,
+            &layout,
+            guest_visible_size,
+            page_table_len,
+        )?);
 
         Ok(Self {
             layout,
-            memory: ReadonlySharedMemory::from_bytes(&memory, guest_visible_size)?,
+            memory,
             load_info,
             stack_top_gva,
             sregs: Some(sregs),
@@ -673,7 +616,7 @@ impl Snapshot {
 
     /// Return the main memory contents of the snapshot
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    pub(crate) fn memory(&self) -> &ReadonlySharedMemory {
+    pub(crate) fn snapshot_memory(&self) -> &Arc<SnapshotMemory> {
         &self.memory
     }
 
@@ -784,27 +727,24 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
     use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind, PAGE_SIZE};
 
+    use super::SnapshotMemoryBacking;
     use crate::hypervisor::regs::CommonSpecialRegisters;
     use crate::mem::exe::LoadInfo;
     use crate::mem::layout::SandboxMemoryLayout;
-    use crate::mem::mgr::{GuestPageTableBuffer, SandboxMemoryManager, SnapshotSharedMemory};
-    use crate::mem::shared_mem::{
-        ExclusiveSharedMemory, HostSharedMemory, ReadonlySharedMemory, SharedMemory,
-    };
+    use crate::mem::mgr::{GuestPageTableBuffer, SandboxMemoryManager};
+    use crate::mem::shared_mem::{ExclusiveSharedMemory, HostSharedMemory, ReadonlySharedMemory};
 
     fn default_sregs() -> CommonSpecialRegisters {
         CommonSpecialRegisters::default()
     }
 
-    fn simple_pt_base() -> usize {
-        page_size::get() + SandboxMemoryLayout::BASE_ADDRESS
-    }
-
-    fn make_simple_pt_mem(contents: &[u8]) -> SnapshotSharedMemory<ExclusiveSharedMemory> {
-        let pt_buf = GuestPageTableBuffer::new(simple_pt_base());
+    fn make_simple_pt_memory(contents: &[u8], pt_base: u64) -> super::SnapshotMemory {
+        let pt_buf = GuestPageTableBuffer::new(pt_base as usize);
         let mapping = Mapping {
             phys_base: SandboxMemoryLayout::BASE_ADDRESS as u64,
             virt_base: SandboxMemoryLayout::BASE_ADDRESS as u64,
@@ -822,23 +762,44 @@ mod tests {
         let mut snapshot_mem = vec![0u8; page_size::get() + pt_bytes.len()];
         snapshot_mem[0..page_size::get()].copy_from_slice(contents);
         snapshot_mem[page_size::get()..].copy_from_slice(&pt_bytes);
-        ReadonlySharedMemory::from_bytes(&snapshot_mem, page_size::get())
+        let storage = ReadonlySharedMemory::from_bytes(&snapshot_mem).unwrap();
+        super::SnapshotMemory::from_flat(
+            storage,
+            SandboxMemoryLayout::BASE_ADDRESS as u64,
+            page_size::get(),
+            page_size::get()..snapshot_mem.len(),
+            hyperlight_common::layout::scratch_base_gpa(PAGE_SIZE),
+        )
+        .unwrap()
+    }
+
+    fn make_simple_pt_host_mem(
+        contents: &[u8],
+        pt_base: u64,
+    ) -> SnapshotMemoryBacking<HostSharedMemory> {
+        SnapshotMemoryBacking::from_snapshot(Arc::new(make_simple_pt_memory(contents, pt_base)))
             .unwrap()
-            .to_mgr_snapshot_mem()
-            .unwrap()
+            .build()
+            .0
     }
 
     fn make_simple_pt_mgr() -> (SandboxMemoryManager<HostSharedMemory>, u64) {
         let cfg = crate::sandbox::SandboxConfiguration::default();
         let scratch_mem = ExclusiveSharedMemory::new(cfg.get_scratch_size()).unwrap();
+        let layout = SandboxMemoryLayout::new(cfg, 4096, 0x3000, None).unwrap();
+        let pt_base = layout.get_pt_base_gpa();
+        let memory = make_simple_pt_memory(&vec![0u8; page_size::get()], pt_base);
+        layout
+            .ensure_page_tables_fit(memory.page_table_len())
+            .unwrap();
         let mgr = SandboxMemoryManager::new(
-            SandboxMemoryLayout::new(cfg, 4096, 0x3000, None).unwrap(),
-            make_simple_pt_mem(&vec![0u8; page_size::get()]),
+            layout,
+            SnapshotMemoryBacking::from_snapshot(Arc::new(memory)).unwrap(),
             scratch_mem,
             super::NextAction::None,
         );
         let (mgr, _) = mgr.build().unwrap();
-        (mgr, simple_pt_base() as u64)
+        (mgr, pt_base)
     }
 
     #[test]
@@ -847,9 +808,10 @@ mod tests {
 
         // Create first snapshot with pattern A
         let pattern_a = vec![0xAA; page_size::get()];
+        let pattern_a_memory = make_simple_pt_host_mem(&pattern_a, pt_base);
         let snapshot_a = super::Snapshot::new(
-            &mut make_simple_pt_mem(&pattern_a).build().0,
-            &mut mgr.scratch_mem,
+            &pattern_a_memory,
+            &mgr.scratch_mem,
             mgr.layout,
             LoadInfo::dummy(),
             Vec::new(),
@@ -867,9 +829,10 @@ mod tests {
 
         // Create second snapshot with pattern B
         let pattern_b = vec![0xBB; page_size::get()];
+        let pattern_b_memory = make_simple_pt_host_mem(&pattern_b, pt_base);
         let snapshot_b = super::Snapshot::new(
-            &mut make_simple_pt_mem(&pattern_b).build().0,
-            &mut mgr.scratch_mem,
+            &pattern_b_memory,
+            &mgr.scratch_mem,
             mgr.layout,
             LoadInfo::dummy(),
             Vec::new(),
@@ -887,14 +850,45 @@ mod tests {
 
         // Restore snapshot A
         mgr.restore_snapshot(&snapshot_a).unwrap();
+        let mut restored = vec![0u8; pattern_a.len()];
         mgr.shared_mem
-            .with_contents(|contents| assert_eq!(&contents[0..pattern_a.len()], &pattern_a[..]))
+            .read_snapshot_gpa(SandboxMemoryLayout::BASE_ADDRESS as u64, &mut restored)
             .unwrap();
+        assert_eq!(restored, pattern_a);
 
         // Restore snapshot B
         mgr.restore_snapshot(&snapshot_b).unwrap();
+        restored.fill(0);
         mgr.shared_mem
-            .with_contents(|contents| assert_eq!(&contents[0..pattern_b.len()], &pattern_b[..]))
+            .read_snapshot_gpa(SandboxMemoryLayout::BASE_ADDRESS as u64, &mut restored)
             .unwrap();
+        assert_eq!(restored, pattern_b);
+    }
+
+    #[test]
+    fn page_table_reader_reports_a_suppressed_failure() {
+        let (manager, pt_base) = make_simple_pt_mgr();
+        let memory = crate::mem::mgr::GuestPhysicalMemoryView::new(
+            &manager.shared_mem,
+            &manager.scratch_mem,
+            &[],
+            manager.layout,
+        );
+
+        let reader = super::PageTableReader::new(&memory, pt_base);
+        assert!(reader.finish().is_ok());
+
+        // A read off every backing is recorded rather than returned, so the
+        // walk keeps going against not-present entries until finish() asks.
+        // SAFETY: the reader borrows `memory`, which outlives this call.
+        let entry = unsafe {
+            <super::PageTableReader as vmem::TableReadOps>::read_entry(
+                &reader,
+                !(PAGE_SIZE as u64 - 1),
+            )
+        };
+        assert_eq!(entry, 0);
+        let error = reader.finish().unwrap_err().to_string();
+        assert!(error.contains("accessed unbacked memory"), "{error}");
     }
 }
