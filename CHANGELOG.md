@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 ### Changed
+* **Breaking:** `PtRootFinder` receives a `SnapshotMemoryReader` and returns a
+  `Result<Vec<u64>>`. Read snapshot bytes with `snapshot.read(gpa, buffer)?`
+  and return roots with `Ok(roots)`.
 
 ### Removed
 
