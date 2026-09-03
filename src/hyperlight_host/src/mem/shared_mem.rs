@@ -610,6 +610,55 @@ fn mapping_at(
     }
 }
 
+pub(crate) fn snapshot_mapping_range(
+    memory: &impl SharedMemory,
+    data_len: usize,
+    blob_offset: std::ops::Range<usize>,
+    guest_start: u64,
+    flags: MemoryRegionFlags,
+) -> Result<MemoryRegion> {
+    let Some(size) = blob_offset.end.checked_sub(blob_offset.start) else {
+        return Err(SharedMemoryError::Bounds(blob_offset.start, 0, data_len));
+    };
+    if size == 0
+        || !blob_offset.start.is_multiple_of(page_size::get())
+        || !blob_offset.end.is_multiple_of(page_size::get())
+    {
+        return Err(SharedMemoryError::MemoryRequest(
+            size,
+            0,
+            data_len,
+            page_size::get(),
+        ));
+    }
+    bounds_check!(blob_offset.start, size, data_len);
+
+    let guest_start = usize::try_from(guest_start)?;
+    if !guest_start.is_multiple_of(page_size::get()) {
+        return Err(SharedMemoryError::MemoryRequest(
+            guest_start,
+            0,
+            usize::MAX,
+            page_size::get(),
+        ));
+    }
+    let guest_end = guest_start
+        .checked_add(size)
+        .ok_or(SharedMemoryError::Bounds(guest_start, size, usize::MAX))?;
+    let host_start = <HostGuestMemoryRegion as MemoryRegionKind>::add(
+        memory.host_region_base(),
+        blob_offset.start,
+    );
+    let host_end = <HostGuestMemoryRegion as MemoryRegionKind>::add(host_start, size);
+
+    Ok(MemoryRegion {
+        guest_region: guest_start..guest_end,
+        host_region: host_start..host_end,
+        region_type: MemoryRegionType::Snapshot,
+        flags,
+    })
+}
+
 /// These three structures represent various phases of the lifecycle of
 /// a memory buffer that is shared with the guest. An
 /// ExclusiveSharedMemory is used for certain operations that
@@ -996,22 +1045,10 @@ impl GuestSharedMemory {
             MemoryRegionType::Scratch => {
                 MemoryRegionFlags::READ | MemoryRegionFlags::WRITE | MemoryRegionFlags::EXECUTE
             }
-            #[cfg(unshared_snapshot_mem)]
-            MemoryRegionType::Snapshot => {
-                MemoryRegionFlags::READ | MemoryRegionFlags::WRITE | MemoryRegionFlags::EXECUTE
-            }
             #[allow(clippy::panic)]
-            // This will not ever actually panic: the only places this
-            // is called are HyperlightVm::update_snapshot_mapping and
-            // HyperlightVm::update_scratch_mapping. The latter
-            // statically uses the Scratch region type, and the former
-            // does not use this at all when the unshared_snapshot_mem
-            // feature is not set, since in that case the scratch
-            // mapping type is ReadonlySharedMemory, not
-            // GuestSharedMemory.
-            _ => panic!(
-                "GuestSharedMemory::mapping_at should only be used for Scratch or Snapshot regions"
-            ),
+            // This will not ever actually panic: every caller passes the
+            // Scratch region type.
+            _ => panic!("GuestSharedMemory::mapping_at only supports scratch memory"),
         };
         mapping_at(self, guest_base, self.mem_size(), region_type, flags)
     }
@@ -1556,12 +1593,6 @@ impl SharedMemory for HostSharedMemory {
 #[derive(Clone, Debug)]
 pub struct ReadonlySharedMemory {
     region: Arc<HostMapping>,
-    /// Number of bytes from the start of the blob that `mapping_at`
-    /// exposes to the guest. Production callers pass the size of the
-    /// guest-visible prefix of the snapshot blob; the remainder of
-    /// the blob is the page-table tail that lives only host-side.
-    #[cfg_attr(unshared_snapshot_mem, allow(dead_code))]
-    guest_mapped_size: usize,
 }
 // Safety: HostMapping is only non-Send/Sync (causing
 // ReadonlySharedMemory to not be automatically Send/Sync) because raw
@@ -1577,15 +1608,12 @@ unsafe impl Send for ReadonlySharedMemory {}
 unsafe impl Sync for ReadonlySharedMemory {}
 
 impl ReadonlySharedMemory {
-    pub(crate) fn from_bytes(contents: &[u8], guest_mapped_size: usize) -> Result<Self> {
-        if guest_mapped_size == 0
-            || guest_mapped_size > contents.len()
-            || !guest_mapped_size.is_multiple_of(page_size::get())
-        {
+    pub(crate) fn from_bytes(contents: &[u8]) -> Result<Self> {
+        if contents.is_empty() {
             return Err(SharedMemoryError::MemoryRequest(
-                guest_mapped_size,
-                0,
                 contents.len(),
+                0,
+                usize::MAX,
                 page_size::get(),
             ));
         }
@@ -1594,22 +1622,13 @@ impl ReadonlySharedMemory {
         anon.copy_from_slice(contents, 0)?;
         Ok(ReadonlySharedMemory {
             region: anon.region,
-            guest_mapped_size,
         })
-    }
-
-    /// The number of bytes that should be mapped into guest PA space.
-    #[cfg(not(unshared_snapshot_mem))]
-    pub(crate) fn guest_mapped_size(&self) -> usize {
-        self.guest_mapped_size
     }
 
     /// Create a `ReadonlySharedMemory` backed by a file on disk.
     ///
     /// The file's length must be a non-zero multiple of `PAGE_SIZE`.
-    /// `guest_mapped_size` must be a non-zero multiple of `PAGE_SIZE`
-    /// no greater than the file's length.
-    pub(crate) fn from_file(file: &std::fs::File, guest_mapped_size: usize) -> Result<Self> {
+    pub(crate) fn from_file(file: &std::fs::File) -> Result<Self> {
         let len: usize = file
             .metadata()
             .map_err(SharedMemoryError::FileMetadata)?
@@ -1626,23 +1645,8 @@ impl ReadonlySharedMemory {
             ));
         }
 
-        if guest_mapped_size == 0
-            || guest_mapped_size > len
-            || !guest_mapped_size.is_multiple_of(page_size::get())
-        {
-            return Err(SharedMemoryError::MemoryRequest(
-                guest_mapped_size,
-                0,
-                len,
-                page_size::get(),
-            ));
-        }
-
         let region = Self::map_file(file, len)?;
-        Ok(ReadonlySharedMemory {
-            region,
-            guest_mapped_size,
-        })
+        Ok(ReadonlySharedMemory { region })
     }
 
     /// Linux: reserve `[guard][blob][guard]` as one anonymous
@@ -1796,40 +1800,6 @@ impl ReadonlySharedMemory {
     pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.base_ptr(), self.mem_size()) }
     }
-
-    #[cfg(unshared_snapshot_mem)]
-    pub(crate) fn copy_to_writable(&self) -> Result<ExclusiveSharedMemory> {
-        let mut writable = ExclusiveSharedMemory::new(self.mem_size())?;
-        writable.copy_from_slice(self.as_slice(), 0)?;
-        Ok(writable)
-    }
-
-    #[cfg(not(unshared_snapshot_mem))]
-    pub(crate) fn build(self) -> (Self, Self) {
-        (self.clone(), self)
-    }
-
-    #[cfg(not(unshared_snapshot_mem))]
-    pub(crate) fn mapping_at(
-        &self,
-        guest_base: u64,
-        region_type: MemoryRegionType,
-    ) -> MemoryRegion {
-        #[allow(clippy::panic)]
-        // This will not ever actually panic: the only place this is
-        // called is HyperlightVm::update_snapshot_mapping, which
-        // always calls it with the Snapshot region type.
-        if region_type != MemoryRegionType::Snapshot {
-            panic!("ReadonlySharedMemory::mapping_at should only be used for Snapshot regions");
-        }
-        mapping_at(
-            self,
-            guest_base,
-            self.guest_mapped_size(),
-            region_type,
-            MemoryRegionFlags::READ | MemoryRegionFlags::EXECUTE,
-        )
-    }
 }
 
 impl SharedMemory for ReadonlySharedMemory {
@@ -1889,7 +1859,12 @@ mod tests {
 
     #[cfg(not(miri))]
     use super::HostSharedMemory;
-    use super::{ExclusiveSharedMemory, Result, SharedMemory};
+    use super::{
+        ExclusiveSharedMemory, Result, SharedMemory, SharedMemoryError, snapshot_mapping_range,
+    };
+    use crate::mem::memory_region::{
+        HostGuestMemoryRegion, MemoryRegionFlags, MemoryRegionKind, MemoryRegionType,
+    };
     #[cfg(not(miri))]
     use crate::mem::shared_mem_tests::read_write_test_suite;
 
@@ -1950,6 +1925,61 @@ mod tests {
 
         assert!(hshm.fill(0, usize::MAX, 1).is_err());
         assert!(hshm.fill(0, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn mapping_range_maps_only_the_requested_pages() {
+        let page_size = page_size::get();
+        let frozen = ExclusiveSharedMemory::new(3 * page_size)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        let guest_start = 4 * page_size;
+
+        let mapping = snapshot_mapping_range(
+            &frozen,
+            2 * page_size,
+            page_size..2 * page_size,
+            guest_start as u64,
+            MemoryRegionFlags::READ | MemoryRegionFlags::EXECUTE,
+        )
+        .unwrap();
+
+        assert_eq!(mapping.guest_region, guest_start..guest_start + page_size);
+        let expected_host_start =
+            <HostGuestMemoryRegion as MemoryRegionKind>::add(frozen.host_region_base(), page_size);
+        let expected_host_end =
+            <HostGuestMemoryRegion as MemoryRegionKind>::add(expected_host_start, page_size);
+        assert_eq!(mapping.host_region, expected_host_start..expected_host_end);
+        assert_eq!(mapping.region_type, MemoryRegionType::Snapshot);
+        assert_eq!(
+            mapping.flags,
+            MemoryRegionFlags::READ | MemoryRegionFlags::EXECUTE
+        );
+    }
+
+    #[test]
+    fn mapping_range_rejects_invalid_ranges() {
+        let page_size = page_size::get();
+        let frozen = ExclusiveSharedMemory::new(3 * page_size)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        let mapping_range = |range, guest_start| {
+            snapshot_mapping_range(
+                &frozen,
+                2 * page_size,
+                range,
+                guest_start,
+                MemoryRegionFlags::READ | MemoryRegionFlags::EXECUTE,
+            )
+        };
+
+        assert!(mapping_range(0..0, 0).is_err());
+        assert!(mapping_range(1..page_size, 0).is_err());
+        assert!(mapping_range(page_size..0, 0).is_err());
+        assert!(mapping_range(page_size..2 * page_size, 1).is_err());
+        assert!(mapping_range(2 * page_size..3 * page_size, 0).is_err());
     }
 
     #[test]
@@ -2661,8 +2691,8 @@ mod tests {
         #[test]
         fn from_file_success_single_page() {
             let tmp = make_temp_file(page_size::get());
-            let mut rsm = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
-                .expect("from_file should succeed");
+            let mut rsm =
+                ReadonlySharedMemory::from_file(tmp.as_file()).expect("from_file should succeed");
             assert_eq!(rsm.mem_size(), page_size::get());
             rsm.with_contents(|slice| {
                 for (i, b) in slice.iter().enumerate() {
@@ -2673,17 +2703,17 @@ mod tests {
         }
 
         #[test]
-        fn from_file_success_smaller_guest_mapped_size() {
+        fn from_file_success_multiple_pages() {
             let tmp = make_temp_file(2 * page_size::get());
-            let rsm = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
-                .expect("from_file should succeed");
+            let rsm =
+                ReadonlySharedMemory::from_file(tmp.as_file()).expect("from_file should succeed");
             assert_eq!(rsm.mem_size(), 2 * page_size::get());
         }
 
         #[test]
         fn from_file_rejects_empty_file() {
             let tmp = make_temp_file(0);
-            let err = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
+            let err = ReadonlySharedMemory::from_file(tmp.as_file())
                 .expect_err("empty file should be rejected");
             assert!(format!("{}", err).contains("0x0 < 0x0"));
         }
@@ -2691,43 +2721,11 @@ mod tests {
         #[test]
         fn from_file_rejects_unaligned_file_length() {
             let tmp = make_temp_file(page_size::get() + 1);
-            let err = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
+            let err = ReadonlySharedMemory::from_file(tmp.as_file())
                 .expect_err("unaligned file length should be rejected");
             assert!(format!("{}", err).contains(&format!(
                 "0x{:x} % 0x{:x} = 0",
                 page_size::get() + 1,
-                page_size::get()
-            )));
-        }
-
-        #[test]
-        fn from_file_rejects_zero_guest_mapped_size() {
-            let tmp = make_temp_file(page_size::get());
-            let err = ReadonlySharedMemory::from_file(tmp.as_file(), 0)
-                .expect_err("zero guest_mapped_size should be rejected");
-            assert!(format!("{}", err).contains("0x0 < 0x0"));
-        }
-
-        #[test]
-        fn from_file_rejects_unaligned_guest_mapped_size() {
-            let tmp = make_temp_file(2 * page_size::get());
-            let err = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get() + 1)
-                .expect_err("unaligned guest_mapped_size should be rejected");
-            assert!(format!("{}", err).contains(&format!(
-                "0x{:x} % 0x{:x} = ",
-                page_size::get() + 1,
-                page_size::get()
-            )));
-        }
-
-        #[test]
-        fn from_file_rejects_guest_mapped_size_exceeding_file() {
-            let tmp = make_temp_file(page_size::get());
-            let err = ReadonlySharedMemory::from_file(tmp.as_file(), 2 * page_size::get())
-                .expect_err("guest_mapped_size > file length should be rejected");
-            assert!(format!("{}", err).contains(&format!(
-                "0x{:x} <= 0x{:x}",
-                2 * page_size::get(),
                 page_size::get()
             )));
         }
@@ -2746,7 +2744,7 @@ mod tests {
             #[ignore]
             pub(super) fn leading_guard_page_traps() {
                 let tmp = make_temp_file(page_size::get());
-                let rsm = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
+                let rsm = ReadonlySharedMemory::from_file(tmp.as_file())
                     .expect("from_file should succeed");
                 let guard_ptr = unsafe { rsm.base_ptr().sub(page_size::get()) };
                 println!("reached_guard");
@@ -2759,7 +2757,7 @@ mod tests {
             #[ignore]
             pub(super) fn trailing_guard_page_traps() {
                 let tmp = make_temp_file(page_size::get());
-                let rsm = ReadonlySharedMemory::from_file(tmp.as_file(), page_size::get())
+                let rsm = ReadonlySharedMemory::from_file(tmp.as_file())
                     .expect("from_file should succeed");
                 let guard_ptr = unsafe { rsm.base_ptr().add(rsm.mem_size()) };
                 println!("reached_guard");
