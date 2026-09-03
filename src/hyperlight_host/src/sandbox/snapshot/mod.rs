@@ -253,6 +253,72 @@ fn skip_virt(virt_base: u64, scratch_gva: u64) -> bool {
     false
 }
 
+fn for_each_mapping_page(
+    mapping: &Mapping,
+    mut visitor: impl FnMut(u64, u64, MappingKind) -> Result<()>,
+) -> Result<()> {
+    if !validate_mapping(mapping)? {
+        return Ok(());
+    }
+    let mut offset = 0u64;
+    while offset < mapping.len {
+        let phys = mapping
+            .phys_base
+            .checked_add(offset)
+            .ok_or_else(|| crate::new_error!("guest physical mapping overflows"))?;
+        let virt = mapping
+            .virt_base
+            .checked_add(offset)
+            .ok_or_else(|| crate::new_error!("guest virtual mapping overflows"))?;
+        visitor(phys, virt, mapping.kind)?;
+        offset = offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| crate::new_error!("guest mapping offset overflows"))?;
+    }
+    Ok(())
+}
+
+fn validate_mapping(mapping: &Mapping) -> Result<bool> {
+    if mapping.kind == MappingKind::Unmapped {
+        return Ok(false);
+    }
+    if mapping.len == 0
+        || !mapping.phys_base.is_multiple_of(PAGE_SIZE as u64)
+        || !mapping.virt_base.is_multiple_of(PAGE_SIZE as u64)
+        || !mapping.len.is_multiple_of(PAGE_SIZE as u64)
+    {
+        return Err(crate::new_error!("guest mapping is not page aligned"));
+    }
+    Ok(true)
+}
+
+fn mapping_has_skipped_pages(mapping: &Mapping, scratch_gva: u64) -> Result<bool> {
+    let last_page = mapping
+        .virt_base
+        .checked_add(mapping.len - PAGE_SIZE as u64)
+        .ok_or_else(|| crate::new_error!("guest virtual mapping overflows"))?;
+    let snapshot_pt_start = hyperlight_common::layout::SNAPSHOT_PT_GVA_MIN as u64;
+    let snapshot_pt_end = hyperlight_common::layout::SNAPSHOT_PT_GVA_MAX as u64;
+    Ok(last_page >= scratch_gva
+        || (mapping.virt_base <= snapshot_pt_end && snapshot_pt_start <= last_page))
+}
+
+fn snapshot_mapping_kind(kind: MappingKind) -> Option<MappingKind> {
+    match kind {
+        MappingKind::Cow(mapping) => Some(MappingKind::Cow(mapping)),
+        MappingKind::Basic(mapping) if mapping.writable => Some(MappingKind::Cow(CowMapping {
+            readable: mapping.readable,
+            executable: mapping.executable,
+        })),
+        MappingKind::Basic(mapping) => Some(MappingKind::Basic(BasicMapping {
+            readable: mapping.readable,
+            writable: false,
+            executable: mapping.executable,
+        })),
+        MappingKind::Unmapped => None,
+    }
+}
+
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
     if let Some((phys_base, virt_base)) = io_page() {
         // Map the IO page
