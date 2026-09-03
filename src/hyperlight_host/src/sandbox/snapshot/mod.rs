@@ -414,6 +414,51 @@ fn record_backed_pages(
     Ok(())
 }
 
+fn move_partial_host_pages(
+    layer_index: usize,
+    reused_pages: &mut [bool],
+    blob_gpa_start: u64,
+    host_page_size: usize,
+    new_pages: &mut Vec<NewPage>,
+) -> Result<()> {
+    if host_page_size < PAGE_SIZE || !host_page_size.is_multiple_of(PAGE_SIZE) {
+        return Err(crate::new_error!(
+            "host page size {host_page_size} is incompatible with guest page size {PAGE_SIZE}"
+        ));
+    }
+    if host_page_size == PAGE_SIZE {
+        return Ok(());
+    }
+
+    let pages_per_host_page = host_page_size / PAGE_SIZE;
+    for (host_page_index, pages) in reused_pages.chunks_mut(pages_per_host_page).enumerate() {
+        if pages.iter().all(|reused| *reused) {
+            continue;
+        }
+        for (page_index, reused) in pages.iter_mut().enumerate() {
+            if !*reused {
+                continue;
+            }
+            *reused = false;
+            let offset = host_page_index
+                .checked_mul(host_page_size)
+                .and_then(|offset| offset.checked_add(page_index * PAGE_SIZE))
+                .ok_or_else(|| crate::new_error!("snapshot reused-page offset overflows"))?;
+            let gpa = blob_gpa_start
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| crate::new_error!("snapshot reused-page GPA overflows"))?;
+            new_pages.push(NewPage {
+                source_gpa: gpa,
+                backing: GuestBacking::Snapshot {
+                    layer_index,
+                    offset,
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
     if let Some((phys_base, virt_base)) = io_page() {
         // Map the IO page
@@ -902,6 +947,92 @@ mod tests {
 
     fn default_sregs() -> CommonSpecialRegisters {
         CommonSpecialRegisters::default()
+    }
+
+    #[test]
+    fn partial_host_pages_move_to_the_new_blob() {
+        let host_page_size = 4 * PAGE_SIZE;
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let mut reused = vec![true, true, false, false, true, true, true, true];
+        let mut copied = Vec::new();
+
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, host_page_size, &mut copied)
+            .unwrap();
+
+        assert_eq!(
+            reused,
+            vec![false, false, false, false, true, true, true, true]
+        );
+        assert_eq!(
+            copied
+                .iter()
+                .map(|page| page.source_gpa)
+                .collect::<Vec<_>>(),
+            vec![blob_gpa, blob_gpa + PAGE_SIZE as u64]
+        );
+    }
+
+    #[test]
+    fn partial_host_pages_move_from_the_final_group() {
+        let host_page_size = 4 * PAGE_SIZE;
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let mut reused = vec![true, true, true, true, true, false, true, false];
+        let mut copied = Vec::new();
+
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, host_page_size, &mut copied)
+            .unwrap();
+
+        assert_eq!(
+            reused,
+            vec![true, true, true, true, false, false, false, false]
+        );
+        assert_eq!(
+            copied
+                .iter()
+                .map(|page| page.source_gpa)
+                .collect::<Vec<_>>(),
+            vec![
+                blob_gpa + 4 * PAGE_SIZE as u64,
+                blob_gpa + 6 * PAGE_SIZE as u64
+            ]
+        );
+    }
+
+    /// Demotion splits one live run into several, and every run costs a
+    /// mapping. A layer that fits the cap on a 4K host can exceed it on a
+    /// host with larger pages.
+    #[test]
+    fn partial_host_pages_fragment_live_ranges() {
+        let host_page_size = 4 * PAGE_SIZE;
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let mut reused = vec![true; 16];
+        // Dirty one guest page in every second host page.
+        for index in [1, 9] {
+            reused[index] = false;
+        }
+        assert_eq!(super::coalesce_pages(&reused).len(), 3);
+
+        let mut copied = Vec::new();
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, host_page_size, &mut copied)
+            .unwrap();
+
+        // The two touched host pages lose every page they held, leaving the
+        // untouched host pages either side of them.
+        assert_eq!(super::coalesce_pages(&reused).len(), 2);
+        assert_eq!(copied.len(), 6);
+    }
+
+    #[test]
+    fn guest_sized_host_pages_need_no_regrouping() {
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let expected = vec![true, true, false, true];
+        let mut reused = expected.clone();
+        let mut copied = Vec::new();
+
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, PAGE_SIZE, &mut copied).unwrap();
+
+        assert_eq!(reused, expected);
+        assert!(copied.is_empty());
     }
 
     #[test]
