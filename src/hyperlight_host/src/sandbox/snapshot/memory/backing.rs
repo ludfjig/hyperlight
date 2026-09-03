@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::SnapshotMemory;
+use super::{SnapshotLayer, SnapshotMemory};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 use crate::mem::shared_mem::{
     ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, SharedMemory,
@@ -94,6 +94,11 @@ impl<S: SharedMemory> SnapshotMemoryBacking<S> {
         backing.ok_or_else(|| new_error!("snapshot layer index is out of bounds"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn layers(&self) -> &[SnapshotLayer] {
+        self.memory.layers()
+    }
+
     pub(crate) fn resolve(&self, gpa: u64, len: usize) -> Option<(usize, usize)> {
         self.memory.resolve(gpa, len)
     }
@@ -153,6 +158,17 @@ impl SnapshotMemoryBacking<GuestSharedMemory> {
 }
 
 impl SnapshotMemoryBacking<HostSharedMemory> {
+    pub(crate) fn reusable_layers(&self) -> Option<&[SnapshotLayer]> {
+        #[cfg(not(unshared_snapshot_mem))]
+        {
+            Some(self.memory.layers())
+        }
+        #[cfg(unshared_snapshot_mem)]
+        {
+            None
+        }
+    }
+
     pub(crate) fn copy_layer_to_slice(
         &self,
         layer_index: usize,

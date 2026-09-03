@@ -10,6 +10,7 @@ mod fsutil;
 mod media_types;
 pub(crate) mod reference;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ pub(super) use self::media_types::{
     MT_CONFIG_CURRENT, MT_CONFIG_V1, MT_SNAPSHOT_CURRENT, MT_SNAPSHOT_V1, SNAPSHOT_ABI_VERSION,
 };
 use self::reference::{OciDigest, OciReference, OciTag};
-use super::{NextAction, Snapshot, SnapshotBlob};
+use super::{NextAction, Snapshot};
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::memory_region::MemoryRegionFlags;
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
@@ -274,15 +275,6 @@ fn open_snapshot_blob(
 }
 
 impl Snapshot {
-    fn v1_blob(&self) -> crate::Result<&SnapshotBlob> {
-        let [layer] = self.memory.layers() else {
-            return Err(crate::new_error!(
-                "OCI v1 snapshots require exactly one memory layer"
-            ));
-        };
-        Ok(layer.blob())
-    }
-
     /// Save this snapshot into an OCI Image Layout directory on disk.
     /// The saved snapshot can be loaded later with
     /// [`Snapshot::load`].
