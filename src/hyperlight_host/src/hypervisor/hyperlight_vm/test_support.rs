@@ -13,6 +13,8 @@ use crate::hypervisor::regs::{
 use crate::hypervisor::virtual_machine::CreateVmError;
 use crate::hypervisor::virtual_machine::{HypervisorError, VirtualMachine};
 
+pub(crate) type BaseMappingState = (Vec<(u32, MemoryRegion)>, Option<(usize, usize)>);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VmOperation {
     Map(MemoryRegionType),
@@ -293,12 +295,12 @@ impl HyperlightVm {
         fault_plan
     }
 
-    #[allow(clippy::type_complexity, reason = "test-only mapping state")]
-    pub(crate) fn base_mapping_state(&self) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+    pub(crate) fn base_mapping_state(&self) -> BaseMappingState {
         let snapshot = self
-            .snapshot_memory
-            .as_ref()
-            .map(|memory| (memory.base_addr(), memory.mem_size()));
+            .snapshot_mappings
+            .iter()
+            .map(|(slot, mapping)| (*slot, mapping.clone()))
+            .collect();
         let scratch = self
             .scratch_memory
             .as_ref()
