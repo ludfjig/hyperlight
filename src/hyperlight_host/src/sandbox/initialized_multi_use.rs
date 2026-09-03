@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025 The Hyperlight Authors.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 #[cfg(crashdump)]
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ use crate::mem::shared_mem::{HostSharedMemory, SharedMemory as _};
 use crate::metrics::{
     METRIC_GUEST_ERROR, METRIC_GUEST_ERROR_LABEL_CODE, maybe_time_and_emit_guest_call,
 };
+use crate::sandbox::snapshot::SnapshotMemoryBacking;
 use crate::{HyperlightError, Result, log_then_return};
 
 /// The lifecycle state of a [`MultiUseSandbox`].
@@ -93,17 +95,37 @@ pub struct MultiUseSandbox {
     pt_root_finder: Option<PtRootFinder>,
 }
 
+/// Read-only access to live snapshot memory by guest physical address.
+pub struct SnapshotMemoryReader<'a> {
+    memory: &'a SnapshotMemoryBacking<HostSharedMemory>,
+}
+
+impl SnapshotMemoryReader<'_> {
+    /// Copy live snapshot bytes at `gpa` into `destination`.
+    pub fn read(&self, gpa: u64, destination: &mut [u8]) -> Result<()> {
+        self.memory.read_snapshot_gpa(gpa, destination)
+    }
+}
+
 /// Callback for discovering page table roots from guest memory.
 ///
 /// Called during [`MultiUseSandbox::snapshot`] with:
-/// - `snapshot_mem` - the sandbox's snapshot (shared) memory as a byte slice
+/// - `snapshot_mem` - live snapshot memory accessed by GPA
 /// - `scratch_mem` - the sandbox's scratch memory as a byte slice
 /// - `root_pt_gpa` - the root page table GPA of the currently-executing
 ///   address space
 ///
-/// Returns a list of root page table GPAs to walk. If the list is
-/// empty, only `root_pt_gpa` is used.
-pub type PtRootFinder = Box<dyn Fn(&[u8], &[u8], u64) -> Vec<u64> + Send>;
+/// Returns additional root page table GPAs to walk. `root_pt_gpa` is always
+/// walked first, ignoring duplicates. An error aborts the capture.
+pub type PtRootFinder =
+    Box<dyn Fn(&SnapshotMemoryReader<'_>, &[u8], u64) -> Result<Vec<u64>> + Send>;
+
+fn normalize_page_table_roots(roots: Vec<u64>, active_root: u64) -> Vec<u64> {
+    let mut seen = BTreeSet::from([active_root]);
+    let mut normalized = vec![active_root];
+    normalized.extend(roots.into_iter().filter(|root| seen.insert(*root)));
+    normalized
+}
 
 impl MultiUseSandbox {
     fn check_ready(&self) -> Result<()> {
@@ -143,7 +165,7 @@ impl MultiUseSandbox {
 
     /// Set a callback that discovers page table roots from guest memory.
     /// The callback receives (snapshot_mem, scratch_mem, cr3) and returns
-    /// the list of root GPAs to walk during snapshot creation.
+    /// additional root GPAs to walk during snapshot creation.
     ///
     /// The callback must support every guest restored into this sandbox.
     pub fn set_pt_root_finder(&mut self, finder: PtRootFinder) {
@@ -375,12 +397,14 @@ impl MultiUseSandbox {
             .map_err(|e| HyperlightError::HyperlightVmError(e.into()))?;
         // Use the callback if set, otherwise just CR3
         let root_pt_gpas = if let Some(finder) = &self.pt_root_finder {
-            let roots = self.mem_mgr.shared_mem.with_contents(|snap| {
-                self.mem_mgr
-                    .scratch_mem
-                    .with_contents(|scratch| finder(snap, scratch, cr3))
-            })??;
-            if roots.is_empty() { vec![cr3] } else { roots }
+            let snapshot = SnapshotMemoryReader {
+                memory: &self.mem_mgr.shared_mem,
+            };
+            let roots = self
+                .mem_mgr
+                .scratch_mem
+                .with_contents(|scratch| finder(&snapshot, scratch, cr3))??;
+            normalize_page_table_roots(roots, cr3)
         } else {
             vec![cr3]
         };
@@ -2276,6 +2300,26 @@ mod tests {
                 name
             )) if name == "GetStatic"
         ));
+    }
+
+    #[test]
+    fn active_page_table_root_is_first() {
+        const ACTIVE: u64 = 0x1000;
+        const OTHER: u64 = 0x2000;
+
+        assert_eq!(
+            normalize_page_table_roots(vec![OTHER, ACTIVE, ACTIVE], ACTIVE),
+            vec![ACTIVE, OTHER]
+        );
+        assert_eq!(
+            normalize_page_table_roots(vec![OTHER, OTHER], ACTIVE),
+            vec![ACTIVE, OTHER]
+        );
+        assert_eq!(
+            normalize_page_table_roots(vec![OTHER], ACTIVE),
+            vec![ACTIVE, OTHER]
+        );
+        assert_eq!(normalize_page_table_roots(Vec::new(), ACTIVE), vec![ACTIVE]);
     }
 
     #[test]
