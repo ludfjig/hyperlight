@@ -79,16 +79,6 @@ pub(crate) struct SandboxMemoryLayout {
     init_data_permissions: Option<MemoryRegionFlags>,
     /// The size of the scratch region in physical memory.
     scratch_size: usize,
-    /// Size of the primary guest memory region at `BASE_ADDRESS`
-    /// (code, PEB, heap, init data). For a snapshot-backed layout
-    /// this is also the guest-visible prefix of the host snapshot
-    /// mapping.
-    snapshot_size: usize,
-    /// Size of the page-table region. Sits at the tail of the host
-    /// snapshot mapping but is never mapped to the guest from there.
-    /// On restore the host copies it into scratch, where the guest
-    /// sees it at `SNAPSHOT_PT_GVA`. `None` until page tables are built.
-    pt_size: Option<usize>,
 }
 
 impl Debug for SandboxMemoryLayout {
@@ -113,8 +103,6 @@ impl Debug for SandboxMemoryLayout {
             &format_args!("{:#x}", self.output_data_size),
         )
         .field("Scratch Size", &format_args!("{:#x}", self.scratch_size))
-        .field("Snapshot Size", &format_args!("{:#x}", self.snapshot_size))
-        .field("PT Size", &format_args!("{:#x}", self.pt_size.unwrap_or(0)))
         .field(
             "Guest Code Offset",
             &format_args!("{:#x}", self.guest_code_offset()),
@@ -169,18 +157,16 @@ impl SandboxMemoryLayout {
             return Err(MemoryRequestTooSmall(scratch_size, min_scratch_size));
         }
 
-        let mut ret = Self {
+        let ret = Self {
             input_data_size,
             output_data_size,
             heap_size,
             code_size,
             init_data_size,
             init_data_permissions,
-            pt_size: None,
             scratch_size,
-            snapshot_size: 0,
         };
-        ret.set_snapshot_size(ret.get_memory_size()?);
+        ret.get_memory_size()?;
         Ok(ret)
     }
 
@@ -212,42 +198,18 @@ impl SandboxMemoryLayout {
         self.scratch_size
     }
 
-    /// Guest-visible prefix size of the snapshot blob.
-    pub(crate) fn snapshot_size(&self) -> usize {
-        self.snapshot_size
-    }
-
-    /// Recorded page-table tail size, `None` until page tables are built.
-    pub(crate) fn pt_size(&self) -> Option<usize> {
-        self.pt_size
-    }
-
-    /// Page-table tail size, or 0 if page tables are not yet built.
-    pub(crate) fn get_pt_size(&self) -> usize {
-        self.pt_size.unwrap_or(0)
-    }
-
-    /// Record the size of the page-table tail appended to the
-    /// snapshot blob. The PT bytes live at the end of the blob and
-    /// the host mapping, outside the guest mapping of the snapshot
-    /// region, and are copied into the scratch region on restore.
-    /// `snapshot_size` (the guest-visible prefix of the blob) is an
-    /// independent field and must be set separately.
-    pub(crate) fn set_pt_size(&mut self, size: usize) -> Result<()> {
+    pub(crate) fn ensure_page_tables_fit(&self, page_table_len: usize) -> Result<()> {
         let min_fixed_scratch = hyperlight_common::layout::min_scratch_size(
             self.input_data_size,
             self.output_data_size,
         );
-        let min_scratch = min_fixed_scratch + size;
+        let min_scratch = min_fixed_scratch
+            .checked_add(page_table_len)
+            .ok_or_else(|| new_error!("page-table scratch size overflows"))?;
         if self.scratch_size < min_scratch {
             return Err(MemoryRequestTooSmall(self.scratch_size, min_scratch));
         }
-        self.pt_size = Some(size);
         Ok(())
-    }
-
-    pub(crate) fn set_snapshot_size(&mut self, new_size: usize) {
-        self.snapshot_size = new_size;
     }
 
     /// Returns the memory regions associated with this memory layout,
@@ -477,12 +439,6 @@ impl SandboxMemoryLayout {
             + self.get_pt_base_scratch_offset() as u64
     }
 
-    /// First GPA of the scratch region the host has not used for
-    /// something else.
-    pub(crate) fn get_first_free_scratch_gpa(&self) -> u64 {
-        self.get_pt_base_gpa() + self.pt_size.unwrap_or(0) as u64
-    }
-
     /// Total size of guest memory in `self`'s memory layout.
     fn get_unaligned_memory_size(&self) -> usize {
         self.init_data_offset() + self.init_data_size
@@ -620,8 +576,6 @@ mod tests {
         pin_eq!(layout.get_memory_size().unwrap(), 0x4000);
 
         pin_eq!(layout.get_scratch_size(), 0x10000);
-        pin_eq!(layout.get_pt_size(), 0);
-
         pin_eq!(layout.get_input_data_buffer_scratch_host_offset(), 0);
         pin_eq!(layout.get_output_data_buffer_scratch_host_offset(), 0x2000);
         pin_eq!(layout.get_pt_base_scratch_offset(), 0x4000);
@@ -645,13 +599,6 @@ mod tests {
             layout.get_pt_base_gpa() - hyperlight_common::layout::scratch_base_gpa(0x10000),
             0x4000
         );
-        // pt_size is zero here, so the first free scratch GPA equals
-        // the page table base.
-        pin_eq!(
-            layout.get_first_free_scratch_gpa(),
-            layout.get_pt_base_gpa()
-        );
-
         // A second config with different sizes shifts the offsets off
         // the first config's page boundaries.
         let mut cfg = SandboxConfiguration::default();
@@ -672,8 +619,6 @@ mod tests {
         );
 
         pin_eq!(layout.get_scratch_size(), 0x20000);
-        pin_eq!(layout.get_pt_size(), 0);
-
         pin_eq!(layout.get_input_data_buffer_scratch_host_offset(), 0);
         pin_eq!(layout.get_output_data_buffer_scratch_host_offset(), 0x4000);
         pin_eq!(layout.get_pt_base_scratch_offset(), 0x6000);
@@ -691,10 +636,6 @@ mod tests {
         pin_eq!(
             layout.get_pt_base_gpa() - hyperlight_common::layout::scratch_base_gpa(0x20000),
             0x6000
-        );
-        pin_eq!(
-            layout.get_first_free_scratch_gpa(),
-            layout.get_pt_base_gpa()
         );
     }
 }
