@@ -5,6 +5,7 @@ mod file;
 mod file_tests;
 mod tripwires;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) use file::host_cpu_vendor_golden_tag;
@@ -24,12 +25,94 @@ use crate::hypervisor::regs::MsrEntry;
 use crate::mem::exe::{ExeInfo, LoadInfo};
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::memory_region::{GuestMemoryRegion, MemoryRegion, MemoryRegionFlags};
-use crate::mem::mgr::{GuestPageTableBuffer, SnapshotSharedMemory};
+use crate::mem::mgr::{GuestPageTableBuffer, GuestPhysicalMemoryView, SnapshotSharedMemory};
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
 use crate::sandbox::SandboxConfiguration;
 use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
 
 const PTE_SIZE: usize = size_of::<vmem::PageTableEntry>();
+// This per-capture budget is shared by every root to bound work from malformed
+// or excessive root lists. Shared tables are read once across all roots.
+//
+// The walk covers the whole virtual address space while physical memory stops
+// at MAX_MEMORY_SIZE, so a guest can alias one frame across far more virtual
+// addresses than it has pages. Sizing the budget to the page count bounds the
+// walk by the most content a snapshot can hold: aliased mappings past that
+// point resolve to pages already captured. The factor of two covers reads of
+// the levels above the leaves.
+//
+// Two address spaces that each map all of memory through wholly unshared
+// tables exceed this and are refused. They describe the same pages twice.
+const MAX_SNAPSHOT_PAGE_TABLE_READS: usize = 2 * (SandboxMemoryLayout::MAX_MEMORY_SIZE / PAGE_SIZE);
+
+pub(crate) struct PageTableReader<'a> {
+    memory: &'a GuestPhysicalMemoryView<'a>,
+    root: u64,
+    reads: Cell<usize>,
+    failure: Cell<Option<&'static str>>,
+}
+impl<'a> PageTableReader<'a> {
+    pub(crate) fn new(memory: &'a GuestPhysicalMemoryView<'a>, root: u64) -> Self {
+        Self {
+            memory,
+            root,
+            reads: Cell::new(0),
+            failure: Cell::new(None),
+        }
+    }
+
+    /// Report whatever the walk suppressed. A walk that reads past the budget
+    /// or off a backing keeps going against not-present entries, so callers
+    /// that need whole coverage must ask before trusting the result.
+    pub(crate) fn finish(&self) -> Result<()> {
+        match self.failure.get() {
+            Some(failure) => Err(crate::new_error!("{}", failure)),
+            None => Ok(()),
+        }
+    }
+}
+impl<'a> hyperlight_common::vmem::TableReadOps for PageTableReader<'a> {
+    type TableAddr = u64;
+    fn entry_addr(addr: u64, offset: u64) -> u64 {
+        addr.saturating_add(offset)
+    }
+    unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
+        if self.failure.get().is_some() {
+            return 0;
+        }
+        let reads = self.reads.get();
+        if reads >= MAX_SNAPSHOT_PAGE_TABLE_READS {
+            self.failure
+                .set(Some("snapshot page-table walk limit exceeded"));
+            return 0;
+        }
+        self.reads.set(reads + 1);
+
+        let mut pte_bytes = [0u8; PTE_SIZE];
+        if self.memory.read(addr, &mut pte_bytes).is_err() {
+            self.failure
+                .set(Some("snapshot page-table walk accessed unbacked memory"));
+            return 0;
+        }
+        vmem::PageTableEntry::from_le_bytes(pte_bytes)
+    }
+    #[allow(clippy::unnecessary_cast)]
+    fn to_phys(addr: u64) -> vmem::PhysAddr {
+        addr as vmem::PhysAddr
+    }
+    #[allow(clippy::unnecessary_cast)]
+    fn from_phys(addr: vmem::PhysAddr) -> u64 {
+        addr as u64
+    }
+    fn root_table(&self) -> u64 {
+        self.root
+    }
+}
+impl<'a> core::convert::AsRef<PageTableReader<'a>> for PageTableReader<'a> {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
 
 /// Presently, a snapshot can be of a preinitialised sandbox, which
 /// still needs an initialise function called in order to determine
