@@ -626,6 +626,52 @@ fn add_page_table_page(
     }
 }
 
+fn validate_layered_capture(
+    reused_layer_count: usize,
+    reused_mapping_count: usize,
+    projected_retained_bytes: usize,
+    layered_data_len: usize,
+    layered_gpa: Option<u64>,
+) -> Result<Option<u64>> {
+    let layer_count = reused_layer_count
+        .checked_add(1)
+        .ok_or_else(|| crate::new_error!("snapshot blob count overflows"))?;
+    if layer_count > MAX_SNAPSHOT_MAPPINGS {
+        return Err(crate::new_error!(
+            "snapshot layer count {} exceeds {}",
+            layer_count,
+            MAX_SNAPSHOT_MAPPINGS
+        ));
+    }
+
+    let mapping_count = reused_mapping_count
+        .checked_add(usize::from(layered_data_len != 0))
+        .ok_or_else(|| crate::new_error!("snapshot mapping count overflows"))?;
+    if mapping_count > MAX_SNAPSHOT_MAPPINGS {
+        return Err(crate::new_error!(
+            "snapshot mapping count {} exceeds {}",
+            mapping_count,
+            MAX_SNAPSHOT_MAPPINGS
+        ));
+    }
+
+    if projected_retained_bytes > MAX_SNAPSHOT_RETAINED_BYTES {
+        return Err(crate::new_error!(
+            "snapshot retained byte count {} exceeds {}",
+            projected_retained_bytes,
+            MAX_SNAPSHOT_RETAINED_BYTES
+        ));
+    }
+
+    if layered_data_len == 0 {
+        Ok(None)
+    } else {
+        layered_gpa
+            .map(Some)
+            .ok_or_else(|| crate::new_error!("snapshot has no address space for a new layer"))
+    }
+}
+
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
     if let Some((phys_base, virt_base)) = io_page() {
         // Map the IO page
@@ -1323,6 +1369,42 @@ mod tests {
                 offset: PAGE_SIZE,
             }
         );
+    }
+
+    #[test]
+    fn layered_capture_enforces_every_hard_limit() {
+        let gpa = Some(SandboxMemoryLayout::BASE_ADDRESS as u64);
+
+        assert_eq!(
+            super::validate_layered_capture(
+                super::MAX_SNAPSHOT_MAPPINGS - 1,
+                super::MAX_SNAPSHOT_MAPPINGS,
+                super::MAX_SNAPSHOT_RETAINED_BYTES,
+                0,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            super::validate_layered_capture(super::MAX_SNAPSHOT_MAPPINGS, 1, PAGE_SIZE, 0, None,)
+                .is_err()
+        );
+        assert!(
+            super::validate_layered_capture(
+                1,
+                super::MAX_SNAPSHOT_MAPPINGS,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                gpa,
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_layered_capture(1, 1, super::MAX_SNAPSHOT_RETAINED_BYTES + 1, 0, None,)
+                .is_err()
+        );
+        assert!(super::validate_layered_capture(1, 1, PAGE_SIZE, PAGE_SIZE, None).is_err());
     }
 
     fn make_simple_pt_memory(contents: &[u8], pt_base: u64) -> super::SnapshotMemory {
