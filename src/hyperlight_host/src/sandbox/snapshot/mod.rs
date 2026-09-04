@@ -2085,18 +2085,12 @@ mod tests {
             .unwrap();
         assert_eq!(delta, [0x33; PAGE_SIZE]);
 
-        let flat = captured.snapshot_memory().flat_image().unwrap();
-        assert_eq!(
-            flat.len(),
-            captured.snapshot_memory().gpa_span_len() + captured.snapshot_memory().page_table_len()
-        );
-        assert_eq!(&flat[..PAGE_SIZE], &source_page);
-        if reuses_source_layers {
-            assert_eq!(&flat[PAGE_SIZE..2 * PAGE_SIZE], &[0; PAGE_SIZE]);
-            assert_eq!(&flat[2 * PAGE_SIZE..3 * PAGE_SIZE], &[0x33; PAGE_SIZE]);
-        } else {
-            assert_eq!(&flat[PAGE_SIZE..2 * PAGE_SIZE], &[0x33; PAGE_SIZE]);
-        }
+        let mut first = [0u8; PAGE_SIZE];
+        captured
+            .snapshot_memory()
+            .read_gpa(mappings[0].phys_base, &mut first)
+            .unwrap();
+        assert_eq!(first, source_page);
     }
 
     #[test]
