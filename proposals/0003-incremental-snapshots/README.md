@@ -28,16 +28,15 @@ the host restores the base snapshot, adds the state of that customer, for
 example a WebAssembly module, and then runs the code of the customer.
 
 Caching a snapshot for the top N customers would remove that work from most
-requests. Unfortunately the memory cost currently makes this impractical as every snapshot stores a full
-copy of the sandbox memory, so N cached customers means N copies of the
-WebAssembly runtime, while the customer state is a small fraction of each one.
+requests. The memory cost makes this impractical today, because every snapshot
+stores a full copy of the sandbox memory. N cached customers means N copies of
+the WebAssembly runtime, while the customer state is a small fraction of each
+one.
 
 With incremental snapshots, a customer snapshot holds only the pages that the
 state of the customer changed. All N snapshots share the blob of the base
 snapshot. Thus the cache costs the size of the base snapshot and the sum of the
 changes, and the host can keep many more customers in memory.
-
-
 
 ## Proposal
 
@@ -87,8 +86,9 @@ that they use.
 ### Taking a Snapshot of a Sandbox
 
 1. Find the pages that this snapshot must save. Read the guest page tables to
-   get all the mapped pages. If the guest physical address of a page is in a
-   live range of a layer, this snapshot shares that page with a previous snapshot, and does not need to save it. All other pages must be saved.
+   get all the mapped pages. A page whose guest physical address is in a live
+   range of a layer is already in a previous snapshot, and this snapshot shares
+   it. All other pages must be saved.
 2. Find a place in the guest address space for the new pages. The new blob must
    not overlap the layers that this snapshot keeps. Use the first unused part
    that is large enough.
@@ -118,8 +118,8 @@ page tables of the snapshot into scratch, and resets the vCPU.
 A snapshot has one VM memory mapping for each live range of each of its layers.
 Mapping or unmapping one is a hypervisor call. A restore changes only the
 mappings that differ, but that can be all of them, so an unbounded number of
-live ranges would make a restore arbitrarily slow. A snapshot therefore has an
-arbitrary cap on its total mappings, and taking a snapshot above the cap fails.
+live ranges would make a restore arbitrarily slow. A snapshot therefore has a
+fixed cap on its total mappings, and taking a snapshot above the cap fails.
 Every layer except the one with the restore page tables must give at least one
 live range, so the cap bounds the layer count too.
 
