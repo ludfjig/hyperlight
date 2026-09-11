@@ -29,9 +29,8 @@ example a WebAssembly module, and then runs the code of the customer.
 
 Caching a snapshot for the top N customers would remove that work from most
 requests. The memory cost makes this impractical today, because every snapshot
-stores a full copy of the sandbox memory. N cached customers means N copies of
-the WebAssembly runtime, while the customer state is a small fraction of each
-one.
+stores a full copy of the sandbox memory, despite the specific customer state
+is a small fraction of each one.
 
 With incremental snapshots, a customer snapshot holds only the pages that the
 state of the customer changed. All N snapshots share the blob of the base
@@ -70,18 +69,22 @@ not hold page 2. Both snapshots share blob 0. Only page 2 is a copy.
 * A `SnapshotLayer` has one blob and the ranges in that blob that the layer
   gives. Each layer has its own ranges. Layers in different snapshots can share
   a blob.
-* A `SnapshotBlob` is immutable storage. It holds guest data and then page
-  tables. Either part can be absent. All snapshots that use this data share the
-  blob.
+* A `SnapshotBlob` is one immutable, contiguous block of host memory. It has two
+  parts, guest data and page tables. All snapshots that use this data share the
+  blob. A blob has no data
+  when every mapped page is already in a live range, for example when the host
+  calls `map_region` or `map_file_cow` and then takes a snapshot. Every layer
+  contains page tables, but only the last layer's page tables are needed for a
+  restore.
 
-The live ranges of the layers do not overlap. Thus at most one layer holds each
-address, and a lookup does a binary search.
+The data ranges of the blobs do not overlap, thus at most one layer holds each
+address. The layers are sorted by the start address of their data range. A
+lookup can then binary search them, and a new blob can take the first gap that
+is large enough.
 
 The snapshots make a tree. A sandbox can restore any snapshot and then make
 more snapshots from it. Snapshots with the same parent share the blobs of that
-parent. No snapshot points to its parent, because each one has the full list of
-its layers. Thus you can delete one snapshot, and the others keep the blobs
-that they use.
+parent.
 
 ### Taking a Snapshot of a Sandbox
 
@@ -97,8 +100,9 @@ that they use.
    the page tables are built again. A shared page keeps its address.
 4. Make the list of layers. The new blob is one layer, and it gives the page
    tables for a restore. This snapshot keeps each parent layer that still gives
-   at least one page, without the pages that moved into the new blob. It drops
-   a parent layer that gives no page.
+   at least one page. Such a layer keeps its blob, and its live ranges lose the
+   pages that moved into the new blob. This snapshot drops a parent layer that
+   gives no page.
 
 ### Restoring a Sandbox to a Snapshot
 
@@ -123,6 +127,15 @@ fixed cap on its total mappings, and taking a snapshot above the cap fails.
 Every layer except the one with the restore page tables must give at least one
 live range, so the cap bounds the layer count too.
 
+The page tables in the layers before the last waste space, in memory and on
+disk, unless the snapshot that created them is also kept.
+
+### API
+
+No public API changes, except `PtRootFinder`. It received the flat snapshot
+buffer, which no longer exists, so it now receives a reader that takes a guest
+physical address.
+
 ### Snapshots on Disk
 
 This builds on the OCI image format that snapshots already use. The image has
@@ -132,11 +145,44 @@ emits the version 2 config and memory media types. The loader still accepts
 version 1 images, and makes their single blob one layer. Thus old snapshots
 still load.
 
+Each snapshot is one manifest that lists every blob it needs by digest. Two
+snapshots that share a blob name the same digest. The layout stores that file
+once.
+
+Snapshot A and snapshot B saved to one directory:
+
+```
+index.json         tag a -> manifest A, tag b -> manifest B
+blobs/sha256/<mA>  manifest A: config <cA>, layers <b0>
+blobs/sha256/<mB>  manifest B: config <cB>, layers <b0> <b1>
+blobs/sha256/<cA>  config A: layer 0 live p0 p1 p2 p3
+blobs/sha256/<cB>  config B: layer 0 live p0 p1 p3, layer 1 live p2'
+blobs/sha256/<b0>  blob 0
+blobs/sha256/<b1>  blob 1
+```
+
+Deleting tag a leaves blob 0 in place, because manifest B still names it.
+
 #### Limitations
 
-* Snapshots on disk only share blobs if they are saved in the same directory.
-  That directory is the `path` of `Snapshot::save`, or the target of
+* Blobs are shared inside one OCI layout, because that layout is the blob
+  store. Saving the same snapshots to a second layout writes a second copy of
+  each blob. The layout is the `path` of `Snapshot::save`, or the target of
   `oras cp --to-oci-layout <ref> <dir>:<tag>`.
 
+## Alternatives considered
 
+* Separate page tables from memory blobs. This would make it so a snapshot
+  only carries the 1 page table it needs, rather than including page tables
+  for all layers. A future plan is for the guest to read the page tables from
+  the mapped blob, instead of from the copy that a restore puts in scratch. A
+  separate blob would then need its own mapping, which costs one more mapping
+  per snapshot and two hypercalls per restore. That argument is weak today,
+  because nothing maps the page tables yet.
 
+## Future work
+
+An API to compact a snapshot would rebuild it as a single layer. The new layer
+holds only the live pages, so the snapshot drops its dead pages and its extra
+page tables. It also needs one mapping instead of many, which gives a long
+chain room under the cap. This is out of scope for this HIP.
