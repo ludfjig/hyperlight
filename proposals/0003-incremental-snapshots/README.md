@@ -172,13 +172,38 @@ Deleting tag a leaves blob 0 in place, because manifest B still names it.
 
 ## Alternatives considered
 
-* Separate page tables from memory blobs. This would make it so a snapshot
-  only carries the 1 page table it needs, rather than including page tables
-  for all layers. A future plan is for the guest to read the page tables from
-  the mapped blob, instead of from the copy that a restore puts in scratch. A
-  separate blob would then need its own mapping, which costs one more mapping
-  per snapshot and two hypercalls per restore. That argument is weak today,
-  because nothing maps the page tables yet.
+* Snapshot the scratch region in place, as the [sandbox images
+  design](https://hackmd.io/Pgus9GO6TmyI1S1-T3GBxw) proposes. A snapshot copies
+  the whole scratch region into a blob, and a restore maps that blob back as
+  the scratch region. Incremental snapshots copy the changed pages out of
+  scratch into a read-only blob, and a restore starts scratch empty. Rejected
+  because:
+
+  * Snapshots share the blob, so a guest write must not reach it. The host has
+    to fault and copy each page the guest writes. Guest copy on write exists to
+    avoid that exit per page.
+  * Scratch has one fixed address, so a snapshot holds one scratch blob. A
+    chain of snapshots needs a flatten at each step.
+  * A sandbox gets two kinds of snapshot. A base holds the whole sandbox and
+    restores with scratch empty. A diff holds a scratch region and restores on
+    top of a base.
+
+## Open questions
+
+Should one blob hold both the guest data and the page tables?
+
+For separate blobs: A snapshot carries only the page tables it restores from,
+so it drops the page tables that its earlier layers waste. That saves memory
+and disk, though page tables are small next to the data. Guest data and page
+tables also become separate concerns with separate lifetimes, which makes the
+code simpler. The layer types lose the index of the page table layer, and the
+rule that every other layer must stay live.
+
+For one blob: A future plan is for the guest to read the page tables from the
+mapped blob, skipping the copy that a restore puts in scratch. A separate blob
+would then need its own mapping, which costs one more mapping per snapshot and
+two hypercalls per restore. This cost is hypothetical, because nothing maps the
+page tables yet.
 
 ## Future work
 
