@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 ### Changed
+* MSHV snapshot restore uses partition scrub when the kernel supports it. A scrub failure makes the sandbox unrecoverable.
 * Support overriding the guest log level when building or restoring initialized snapshots. Persisted snapshots use ABI version 3 and must be regenerated.
 * `Snapshot::save` now writes the guest memory blob sparsely, skipping all-zero
   blocks instead of writing them. A guest memory image is mostly untouched

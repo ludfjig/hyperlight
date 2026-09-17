@@ -3,6 +3,7 @@
 
 #[cfg(gdb)]
 use std::fmt::Debug;
+use std::os::fd::AsRawFd;
 #[cfg(feature = "hw-interrupts")]
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -47,8 +48,8 @@ use crate::hypervisor::virtual_machine::XSAVE_BUFFER_SIZE;
 #[cfg(feature = "hw-interrupts")]
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::TimerThread;
 use crate::hypervisor::virtual_machine::{
-    CreateVmError, MapMemoryError, RegisterError, RunVcpuError, UnmapMemoryError, VirtualMachine,
-    VmExit, XSAVE_MIN_SIZE,
+    CreateVmError, MapMemoryError, RegisterError, ResetVcpuError, RunVcpuError, UnmapMemoryError,
+    VirtualMachine, VmExit, XSAVE_MIN_SIZE,
 };
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 #[cfg(feature = "trace_guest")]
@@ -126,6 +127,17 @@ mod msr_mapping_tests {
     use crate::hypervisor::regs::resettable_msr_indices;
 
     #[test]
+    #[ignore = "requires a kernel with the partition scrub ioctl"]
+    fn partition_scrub_supported() {
+        let mut vm = MshvVm::new().unwrap();
+        for _ in 0..3 {
+            vm.set_xcr0(3).unwrap();
+            assert!(vm.scrub_partition().unwrap());
+            assert_eq!(vm.xcr0().unwrap(), 1);
+        }
+    }
+
+    #[test]
     fn maps_all_stateful_msrs() {
         for index in resettable_msr_indices() {
             assert!(
@@ -155,6 +167,7 @@ pub(crate) struct MshvVm {
     #[cfg(not(feature = "hw-interrupts"))]
     vm_fd: VmFd,
     vcpu_fd: VcpuFd,
+    scrub_unsupported: bool,
     /// Handle to the background timer (if started).
     #[cfg(feature = "hw-interrupts")]
     timer: Option<TimerThread>,
@@ -215,6 +228,7 @@ impl MshvVm {
             #[cfg(not(feature = "hw-interrupts"))]
             vm_fd,
             vcpu_fd,
+            scrub_unsupported: false,
             #[cfg(feature = "hw-interrupts")]
             timer: None,
         })
@@ -222,6 +236,36 @@ impl MshvVm {
 }
 
 impl VirtualMachine for MshvVm {
+    fn scrub_partition(&mut self) -> std::result::Result<bool, ResetVcpuError> {
+        const HVCALL_SCRUB_PARTITION: libc::c_ulong = 0x008d;
+
+        #[cfg(feature = "hw-interrupts")]
+        if let Some(mut timer) = self.timer.take() {
+            timer.stop();
+        }
+
+        if self.scrub_unsupported {
+            return Ok(false);
+        }
+
+        // SAFETY: This partition ioctl takes no argument and the fd remains valid.
+        let result = unsafe { libc::ioctl(self.vm_fd.as_raw_fd(), HVCALL_SCRUB_PARTITION) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOTTY) {
+                self.scrub_unsupported = true;
+                return Ok(false);
+            }
+            return Err(ResetVcpuError::Scrub(error));
+        }
+
+        #[cfg(feature = "hw-interrupts")]
+        Self::init_lapic(&self.vcpu_fd).map_err(ResetVcpuError::ScrubInitialize)?;
+
+        tracing::trace!("MSHV partition scrub completed");
+        Ok(true)
+    }
+
     unsafe fn map_memory(
         &mut self,
         (_slot, region): (u32, &MemoryRegion),

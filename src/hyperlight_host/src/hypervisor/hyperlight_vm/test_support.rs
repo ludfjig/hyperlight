@@ -18,6 +18,10 @@ pub(crate) enum VmOperation {
     Map(MemoryRegionType),
     Unmap(MemoryRegionType),
     #[cfg(target_arch = "x86_64")]
+    Scrub,
+    #[cfg(target_arch = "x86_64")]
+    ScrubUnsupported,
+    #[cfg(target_arch = "x86_64")]
     SetRegs,
     #[cfg(target_arch = "x86_64")]
     SetDebugRegs,
@@ -104,6 +108,19 @@ impl FaultInjectingVirtualMachine {
 }
 
 impl VirtualMachine for FaultInjectingVirtualMachine {
+    #[cfg(target_arch = "x86_64")]
+    fn scrub_partition(&mut self) -> std::result::Result<bool, ResetVcpuError> {
+        if self.should_fail(VmOperation::Scrub) {
+            return Err(ResetVcpuError::Scrub(std::io::Error::other(
+                "injected scrub failure",
+            )));
+        }
+        if self.should_fail(VmOperation::ScrubUnsupported) {
+            return Ok(false);
+        }
+        self.inner_mut().scrub_partition()
+    }
+
     unsafe fn map_memory(
         &mut self,
         region: (u32, &MemoryRegion),

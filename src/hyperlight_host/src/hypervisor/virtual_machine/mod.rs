@@ -338,6 +338,10 @@ pub enum RegisterError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResetVcpuError {
+    #[error("Partition scrub failed: {0}")]
+    Scrub(#[source] std::io::Error),
+    #[error("Partition initialization after scrub failed: {0}")]
+    ScrubInitialize(#[source] CreateVmError),
     #[error("Single-operation vcpu reset not supported on this hypervisor")]
     NotSupported,
     #[error("Hypervisor operation failed: {0}")]
@@ -523,6 +527,12 @@ pub(crate) trait VirtualMachine: Debug + Send {
         _msrs: &[MsrEntry],
     ) -> std::result::Result<(), RegisterError> {
         Err(RegisterError::BatchedSetRegistersUnsupported)
+    }
+
+    /// Returns whether partition runtime state was scrubbed. Errors forbid reuse.
+    #[cfg(target_arch = "x86_64")]
+    fn scrub_partition(&mut self) -> std::result::Result<bool, ResetVcpuError> {
+        Ok(false)
     }
 
     /// Single-operation vCPU reset

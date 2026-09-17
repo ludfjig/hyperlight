@@ -487,10 +487,10 @@ impl MultiUseSandbox {
     ///
     /// * Snapshot compatibility failures happen before mutation and leave the
     ///   current status unchanged.
-    /// * A failure while restoring base memory or its VM mappings sets the
-    ///   status to [`Unrecoverable`](SandboxStatus::Unrecoverable). The sandbox
-    ///   must be discarded.
-    /// * A later failure while restoring vCPU state, MSRs, or dynamic mappings
+    /// * A failure while scrubbing an MSHV partition, restoring base memory, or
+    ///   updating base VM mappings sets the status to
+    ///   [`Unrecoverable`](SandboxStatus::Unrecoverable). Discard the sandbox.
+    /// * A failure while restoring registers, MSRs, or dynamic mappings
     ///   leaves the sandbox [`Poisoned`](SandboxStatus::Poisoned). Restore can be
     ///   retried with a compatible snapshot.
     ///
@@ -590,9 +590,21 @@ impl MultiUseSandbox {
             HyperlightError::Error("snapshot from running sandbox should have MSRs".to_string())
         })?;
 
-        // Errors below leave the sandbox poisoned unless base mapping updates make it unrecoverable.
         self.status = SandboxStatus::Poisoned;
         self.snapshot = None;
+
+        #[cfg(target_arch = "x86_64")]
+        if let Err(error) = self.vm.reset_vcpu(snapshot.root_pt_gpa(), sregs, msrs) {
+            use crate::hypervisor::virtual_machine::ResetVcpuError;
+
+            if matches!(
+                error,
+                ResetVcpuError::Scrub(_) | ResetVcpuError::ScrubInitialize(_)
+            ) {
+                self.status = SandboxStatus::Unrecoverable;
+            }
+            return Err(HyperlightVmError::Restore(error).into());
+        }
 
         let current_regions: Vec<MemoryRegion> = self.vm.get_mapped_regions().cloned().collect();
         for region in &current_regions {
@@ -606,14 +618,9 @@ impl MultiUseSandbox {
             return Err(error);
         }
 
-        // Restore captured MSR state as part of the x86_64 vCPU reset.
+        #[cfg(target_arch = "aarch64")]
         self.vm
-            .reset_vcpu(
-                snapshot.root_pt_gpa(),
-                sregs,
-                #[cfg(target_arch = "x86_64")]
-                msrs,
-            )
+            .reset_vcpu(snapshot.root_pt_gpa(), sregs)
             .map_err(HyperlightVmError::Restore)?;
 
         self.vm.set_stack_top(snapshot.stack_top_gva());
@@ -1962,6 +1969,54 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_arch = "x86_64", not(gdb)))]
+    fn snapshot_restore_scrub_failure_is_unrecoverable() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+        let snapshot = sandbox.snapshot().unwrap();
+        let mappings = sandbox.vm.base_mapping_state();
+        let fault_plan = sandbox.vm.inject_vm_faults([VmOperation::Scrub]);
+
+        let error = sandbox.restore(snapshot.clone()).unwrap_err();
+        assert!(matches!(
+            error,
+            HyperlightError::HyperlightVmError(
+                crate::hypervisor::hyperlight_vm::HyperlightVmError::Restore(
+                    crate::hypervisor::virtual_machine::ResetVcpuError::Scrub(_)
+                )
+            )
+        ));
+        assert!(fault_plan.is_consumed());
+        assert_eq!(sandbox.status(), SandboxStatus::Unrecoverable);
+        assert_eq!(sandbox.vm.base_mapping_state(), mappings);
+        assert!(matches!(
+            sandbox.restore(snapshot),
+            Err(HyperlightError::UnrecoverableSandbox)
+        ));
+        assert!(matches!(
+            sandbox.call::<i32>("GetStatic", ()),
+            Err(HyperlightError::UnrecoverableSandbox)
+        ));
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(gdb)))]
+    fn snapshot_restore_scrub_unsupported_uses_register_reset() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+        let snapshot = sandbox.snapshot().unwrap();
+        sandbox.call::<i32>("AddToStatic", 42i32).unwrap();
+        let fault_plan = sandbox.vm.inject_vm_faults([VmOperation::ScrubUnsupported]);
+
+        sandbox.restore(snapshot).unwrap();
+        assert!(fault_plan.is_consumed());
+        assert_eq!(sandbox.status(), SandboxStatus::Ready);
+        assert_eq!(sandbox.call::<i32>("GetStatic", ()).unwrap(), 0);
+    }
+
+    #[test]
     #[cfg(not(gdb))]
     fn snapshot_restore_vcpu_reset_failure_is_recoverable() {
         let path = simple_guest_as_pathbuf();
@@ -1988,7 +2043,14 @@ mod tests {
                 .unwrap()
                 .evolve()
                 .unwrap();
-            let fault_plan = target.vm.inject_vm_faults([reset_operation]);
+            #[cfg(target_arch = "x86_64")]
+            let operations = (reset_operation == VmOperation::ResetXsave)
+                .then_some(VmOperation::ScrubUnsupported)
+                .into_iter()
+                .chain([reset_operation]);
+            #[cfg(target_arch = "aarch64")]
+            let operations = [reset_operation];
+            let fault_plan = target.vm.inject_vm_faults(operations);
 
             let error = target.restore(snapshot.clone()).unwrap_err();
             assert!(matches!(error, HyperlightError::HyperlightVmError(_)));

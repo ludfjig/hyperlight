@@ -328,16 +328,21 @@ impl HyperlightVm {
         let sregs = Self::sregs_with_cr3(cr3, sregs)?;
         let msrs = self.msr_reset.validate_snapshot(snapshot_msrs)?;
 
+        let scrubbed = self.vm.scrub_partition()?;
         self.pending_tlb_flush = true;
         // Batch to avoid multiple hvcall overhead if supported
         if self.vm.can_batch_registers() {
-            self.vm.reset_xsave()?;
+            if !scrubbed {
+                self.vm.reset_xsave()?;
+            }
             self.vm
                 .set_batched_registers(&regs, &debug_regs, &sregs, XCR0_RESET, &msrs)?;
         } else {
             self.vm.set_regs(&regs)?;
             self.vm.set_debug_regs(&debug_regs)?;
-            self.vm.reset_xsave()?;
+            if !scrubbed {
+                self.vm.reset_xsave()?;
+            }
             self.vm.set_xcr0(XCR0_RESET)?;
             self.vm.set_sregs(&sregs)?;
             self.vm.set_msrs(&msrs)?;
