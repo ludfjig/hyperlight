@@ -26,6 +26,19 @@ static mut LAST_HOST_RESULT: Option<Result<ReturnValue>> = None;
 
 type CGuestFunc = extern "C" fn(&FfiFunctionCall) -> *mut FfiReturnValue;
 
+core::arch::global_asm!(
+    ".weak c_guest_dispatch_function",
+    ".set c_guest_dispatch_function, {}",
+    sym c_guest_dispatch_function_default,
+);
+
+extern "C" fn c_guest_dispatch_function_default(
+    _function_call: &FfiFunctionCall,
+) -> *mut FfiReturnValue {
+    // Null surfaces as ErrorCode::GuestFunctionNotFound
+    core::ptr::null_mut()
+}
+
 unsafe extern "C" {
     // The C guest supplies this fallback. Non-null results come from hl_result_from_*.
     fn c_guest_dispatch_function(function_call: &FfiFunctionCall) -> *mut FfiReturnValue;

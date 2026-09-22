@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 * `Sandbox` lives in the private `sandbox::initialized` module and is reached
   through `hyperlight_host::Sandbox` or `hyperlight_host::sandbox::Sandbox`.
   `sandbox::initialized_multi_use` remains as a deprecated public path.
+* C guests may omit `c_guest_dispatch_function` when they do not need custom
+  fallback dispatch.
 * Support overriding the guest log level when building or restoring initialized
   snapshots.
 * `Snapshot::save` now writes the guest memory blob sparsely, skipping all-zero
