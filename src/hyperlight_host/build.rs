@@ -157,23 +157,10 @@ fn main() -> Result<()> {
         crashdump: { all(feature = "crashdump", target_arch = "x86_64") },
         // print_debug feature is aliased with debug_assertions to make it only available in debug-builds.
         print_debug: { all(feature = "print_debug", debug_assertions) },
-        // the gdb feature (only temporarily!) needs to use
-        // writable/un-shared snapshot memories.
-        unshared_snapshot_mem: { feature = "gdb" },
-        // The `ReadableSharedMemory` trait in `mem::layout` is only
-        // needed in two situations:
-        //   1. The `gdb` debug path reads guest memory through it
-        //      (`ResolvedGpa::copy_to_slice`), which only exists under
-        //      the `gdb` cfg (gdb feature + debug build).
-        //   2. The `mem_profile` stack unwinder reads guest memory
-        //      through it — but ONLY when snapshots are shared/read-only
-        //      (`not(unshared_snapshot_mem)`). When the gdb feature
-        //      forces un-shared snapshots, `mem_profile` instead reads
-        //      via the inherent `HostSharedMemory::copy_to_slice`, so
-        //      the trait is genuinely unused.
-        // Gating the trait (and its impls) on this exact condition means
-        // we never have to `#[allow(dead_code)]` it.
-        readable_shared_mem: { any(gdb, all(feature = "mem_profile", not(unshared_snapshot_mem))) },
+        // the gdb debug path (only temporarily!) needs to use
+        // writable/un-shared snapshot memories. Tracks the `gdb` alias so
+        // builds without a working debugger keep sharing snapshot memory.
+        unshared_snapshot_mem: { gdb },
     }
 
     #[cfg(feature = "build-metadata")]

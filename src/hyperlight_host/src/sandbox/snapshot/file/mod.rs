@@ -12,6 +12,7 @@ pub(crate) mod reference;
 mod transport;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use hyperlight_common::vmem::PAGE_SIZE;
@@ -31,7 +32,7 @@ pub(super) use self::media_types::{
     MT_SNAPSHOT_V1, MT_TRANSPORT_CURRENT, MT_TRANSPORT_V1, SNAPSHOT_ABI_VERSION,
 };
 use self::reference::{OciDigest, OciReference, OciTag};
-use super::{NextAction, Snapshot};
+use super::{NextAction, Snapshot, SnapshotBlob};
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::memory_region::MemoryRegionFlags;
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
@@ -286,6 +287,42 @@ fn load_blob(
 }
 
 impl Snapshot {
+    fn v1_blob(&self) -> crate::Result<&SnapshotBlob> {
+        let [layer] = self.state.memory.layers() else {
+            return Err(crate::new_error!(
+                "OCI v1 snapshots require exactly one memory layer"
+            ));
+        };
+        Ok(layer.blob())
+    }
+
+    fn v1_memory_size(&self) -> crate::Result<usize> {
+        self.state
+            .memory
+            .gpa_span_len()
+            .checked_add(self.state.memory.page_table_len())
+            .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or_else(|| crate::new_error!("snapshot memory size overflows"))
+    }
+
+    fn v1_memory_image(&self) -> crate::Result<Vec<u8>> {
+        let data_len = self.state.memory.gpa_span_len();
+        let mut image = vec![0u8; self.v1_memory_size()?];
+        let data = self
+            .v1_blob()?
+            .memory()
+            .as_slice()
+            .get(..data_len)
+            .ok_or_else(|| crate::new_error!("snapshot data range is out of bounds"))?;
+        image[..data_len].copy_from_slice(data);
+        let page_tables = self.state.memory.page_tables().bytes();
+        let page_table_end = data_len
+            .checked_add(page_tables.len())
+            .ok_or_else(|| crate::new_error!("snapshot page-table range overflows"))?;
+        image[data_len..page_table_end].copy_from_slice(page_tables);
+        Ok(image)
+    }
+
     /// Save this snapshot into an OCI Image Layout directory on disk.
     /// The saved snapshot can be loaded later with
     /// [`Snapshot::load`].
@@ -497,7 +534,8 @@ impl Snapshot {
         cfg: &OciSnapshotConfig,
         cfg_bytes: &[u8],
     ) -> crate::Result<Descriptor> {
-        let memory_bytes = self.state.memory.as_slice();
+        let memory = self.v1_memory_image()?;
+        let memory_bytes = memory.as_slice();
         let memory_size = memory_bytes.len();
         if memory_size == 0 || !memory_size.is_multiple_of(PAGE_SIZE) {
             return Err(crate::new_error!(
@@ -648,10 +686,10 @@ impl Snapshot {
                 h2g_buffer_size: l.get_h2g_buffer_size(),
                 g2h_pool_pages: l.get_g2h_pool_pages(),
                 h2g_pool_pages: l.get_h2g_pool_pages(),
-                snapshot_size: l.snapshot_size(),
-                pt_size: l.pt_size(),
+                snapshot_size: self.state.memory.gpa_span_len(),
+                pt_size: Some(self.state.memory.page_table_len()),
             },
-            memory_size: self.state.memory.mem_size() as u64,
+            memory_size: self.v1_memory_size()? as u64,
             host_functions,
             snapshot_generation: self.state.snapshot_generation,
             metadata: self.metadata.clone(),
@@ -890,11 +928,11 @@ impl Snapshot {
             cfg.layout.code_virt_base
         };
         layout.set_code_gva(code_gva)?;
-        // `snapshot_size` and `pt_size` are independent fields.
-        if let Some(pt) = cfg.layout.pt_size {
-            layout.set_pt_size(pt)?;
-        }
-        layout.set_snapshot_size(cfg.layout.snapshot_size);
+        let page_table_len = cfg
+            .layout
+            .pt_size
+            .ok_or_else(|| crate::new_error!("snapshot pt_size is missing"))?;
+        layout.ensure_page_tables_fit(page_table_len)?;
 
         // `snapshot_size` is the guest-visible prefix mapped into the
         // snapshot region. It must cover at least the regions the
@@ -904,10 +942,10 @@ impl Snapshot {
         // does not bound `snapshot_size` from below, since a smaller
         // `snapshot_size` can be offset by a larger `pt_size`.
         let required_memory_size = layout.get_memory_size()? as u64;
-        if (layout.snapshot_size() as u64) < required_memory_size {
+        if (cfg.layout.snapshot_size as u64) < required_memory_size {
             return Err(crate::new_error!(
                 "snapshot snapshot_size ({}) is smaller than the layout size ({})",
-                layout.snapshot_size(),
+                cfg.layout.snapshot_size,
                 required_memory_size
             ));
         }
@@ -924,7 +962,7 @@ impl Snapshot {
         //    of the snapshot region avoids overlap with
         //    `map_file_cow` regions installed immediately after the
         //    snapshot in guest PA space.
-        let memory = ReadonlySharedMemory::from_file(&snap_file, layout.snapshot_size())?;
+        let memory = ReadonlySharedMemory::from_file(&snap_file)?;
 
         // The size validation in `open_snapshot_blob` stats the file
         // before mapping. Nothing prevents the file from being
@@ -939,6 +977,12 @@ impl Snapshot {
                 cfg.memory_size
             ));
         }
+        let memory = Arc::new(Self::flat_snapshot_memory(
+            memory,
+            &layout,
+            cfg.layout.snapshot_size,
+            page_table_len,
+        )?);
 
         // 8. Build the next action + sregs back from the config.
         let next_action = NextAction::Call(cfg.entrypoint_addr);

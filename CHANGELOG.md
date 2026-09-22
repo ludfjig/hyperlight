@@ -60,6 +60,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 * Reject snapshot capture while guest-owned transport buffers are retained.
 * Use the reclaimed stack pages to raise the default G2H and H2G pools to 12
   and 8 pages.
+* **Breaking:** `PtRootFinder` receives a `SnapshotMemoryReader` and returns a
+  `Result<Vec<u64>>`. Read snapshot bytes with `snapshot.read(gpa, buffer)?`
+  and return roots with `Ok(roots)`.
 
 ### Removed
 * `RunPool` and the run-specific `AllocError::InvalidAlign` variant.
