@@ -8,7 +8,7 @@ use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFuncti
 use hyperlight_common::vmem::PAGE_SIZE;
 use serde::{Deserialize, Serialize};
 
-use super::media_types::{SNAPSHOT_ABI_VERSION, SNAPSHOT_ABI_VERSION_V4};
+use super::media_types::{SNAPSHOT_ABI_VERSION_V3, SNAPSHOT_ABI_VERSION_V4};
 use crate::hypervisor::regs::CommonSpecialRegisters;
 #[cfg(target_arch = "x86_64")]
 use crate::hypervisor::regs::MsrEntry;
@@ -732,13 +732,13 @@ impl OciSnapshotConfig {
                 self.hyperlight_version
             ));
         }
-        if self.abi_version != SNAPSHOT_ABI_VERSION {
+        if self.abi_version != SNAPSHOT_ABI_VERSION_V3 {
             return Err(crate::new_error!(
                 "snapshot ABI version mismatch: file has version {}, this build expects {}. \
                  The snapshot must be regenerated from the guest binary \
                  (snapshot produced by hyperlight {}).",
                 self.abi_version,
-                SNAPSHOT_ABI_VERSION,
+                SNAPSHOT_ABI_VERSION_V3,
                 self.hyperlight_version
             ));
         }
@@ -1148,7 +1148,7 @@ mod tests {
         OciSnapshotConfig {
             hyperlight_version: "test".to_string(),
             arch: Arch::current(),
-            abi_version: SNAPSHOT_ABI_VERSION,
+            abi_version: SNAPSHOT_ABI_VERSION_V3,
             hypervisor: Hypervisor::Mshv,
             cpu_vendor: CpuVendor::current(),
             stack_top_gva: 0x2000,
@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn validate_for_load_rejects_abi_version_mismatch() {
         let mut cfg = gating_config();
-        cfg.abi_version = SNAPSHOT_ABI_VERSION.wrapping_add(1);
+        cfg.abi_version = SNAPSHOT_ABI_VERSION_V3.wrapping_add(1);
         let err = cfg.validate_for_load().unwrap_err().to_string();
         assert!(err.contains("ABI version mismatch"), "got: {err}");
     }

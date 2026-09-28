@@ -8,12 +8,12 @@
 //! publish. See `docs/snapshot-versioning.md`.
 
 /// Goldens version, a `vMAJOR.MINOR` string.
-pub(crate) const GOLDENS_VERSION: &str = "v5.0";
+pub(crate) const GOLDENS_VERSION: &str = "v6.0";
 
 /// Old majors kept loadable through a compatibility path, verified
 /// alongside `GOLDENS_VERSION`. A backwards-compatible break (Option 2)
 /// adds the outgoing version here. See `docs/snapshot-versioning.md`.
-pub(crate) const COMPAT_VERSIONS: &[&str] = &[];
+pub(crate) const COMPAT_VERSIONS: &[&str] = &["v5.0"];
 
 /// Every version the verify test checks: the current one and each kept
 /// old major.

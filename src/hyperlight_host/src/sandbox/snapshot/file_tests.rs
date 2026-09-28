@@ -14,12 +14,12 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::func::Registerable;
-use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::mgr::GuestPageTableBuffer;
-use crate::mem::shared_mem::SharedMemory;
+use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory as _};
 use crate::sandbox::snapshot::memory::page_tables_from_bytes;
 use crate::sandbox::snapshot::{
-    NextAction, OciDigest, OciReference, OciTag, Snapshot, SnapshotLayer, SnapshotMemory,
+    NextAction, OciDigest, OciReference, OciTag, Snapshot, SnapshotBlob, SnapshotLayer,
+    SnapshotMemory,
 };
 use crate::{GuestBinary, HostFunctions, Sandbox, SandboxBuilder, UninitializedSandbox};
 
@@ -112,7 +112,7 @@ fn find_snapshot_blob(oci_dir: &std::path::Path) -> std::path::PathBuf {
     oci_dir.join("blobs").join("sha256").join(snap_digest)
 }
 
-/// Locate the transport (layer 1) blob inside `oci_dir`.
+/// Locate the final transport layer inside `oci_dir`.
 fn find_transport_blob(oci_dir: &std::path::Path) -> std::path::PathBuf {
     let index: Value =
         serde_json::from_slice(&std::fs::read(oci_dir.join("index.json")).unwrap()).unwrap();
@@ -123,7 +123,7 @@ fn find_transport_blob(oci_dir: &std::path::Path) -> std::path::PathBuf {
         .unwrap();
     let manifest_path = oci_dir.join("blobs").join("sha256").join(manifest_digest);
     let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    let transport_digest = manifest["layers"][1]["digest"]
+    let transport_digest = manifest["layers"].as_array().unwrap().last().unwrap()["digest"]
         .as_str()
         .unwrap()
         .strip_prefix("sha256:")
@@ -264,6 +264,125 @@ fn snapshot_without_metadata_omits_config_field() {
 
     assert!(config.get("metadata").is_none());
     assert_eq!(loaded.metadata::<Value>("missing").unwrap(), None);
+}
+
+#[test]
+fn layered_writer_preserves_blobs_and_transport_geometry() {
+    let snapshot = create_snapshot();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snap");
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(manifest_path(&path)).unwrap()).unwrap();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(find_config_blob(&path)).unwrap()).unwrap();
+    let layers = manifest["layers"].as_array().unwrap();
+    assert_eq!(manifest["config"]["mediaType"], super::file::MT_CONFIG_V4);
+    assert_eq!(manifest["artifactType"], super::file::MT_CONFIG_V4);
+    assert_eq!(config["abi_version"], 6);
+    assert_eq!(layers.len(), snapshot.snapshot_memory().layers().len() + 2);
+    for (index, layer) in snapshot.snapshot_memory().layers().iter().enumerate() {
+        assert_eq!(layers[index]["mediaType"], super::file::MT_SNAPSHOT_V2);
+        let bytes = std::fs::read(blob_path(&path, &layers[index])).unwrap();
+        assert_eq!(bytes, layer.blob().memory().as_slice());
+    }
+    let pt_index = layers.len() - 2;
+    assert_eq!(
+        layers[pt_index]["mediaType"],
+        super::file::MT_PAGE_TABLES_V1
+    );
+    assert_eq!(
+        std::fs::read(blob_path(&path, &layers[pt_index])).unwrap(),
+        snapshot.snapshot_memory().page_tables().storage_bytes()
+    );
+    assert_eq!(
+        layers[pt_index + 1]["mediaType"],
+        super::file::MT_TRANSPORT_V1
+    );
+
+    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+    assert_eq!(
+        loaded.snapshot_memory().layers().len(),
+        snapshot.snapshot_memory().layers().len()
+    );
+    assert_eq!(
+        loaded.layout().get_g2h_queue_size(),
+        snapshot.layout().get_g2h_queue_size()
+    );
+    assert_eq!(
+        loaded.layout().get_h2g_queue_size(),
+        snapshot.layout().get_h2g_queue_size()
+    );
+    assert_eq!(
+        loaded.layout().get_g2h_buffer_size(),
+        snapshot.layout().get_g2h_buffer_size()
+    );
+    assert_eq!(
+        loaded.layout().get_h2g_buffer_size(),
+        snapshot.layout().get_h2g_buffer_size()
+    );
+    assert_eq!(
+        loaded.layout().get_g2h_pool_pages(),
+        snapshot.layout().get_g2h_pool_pages()
+    );
+    assert_eq!(
+        loaded.layout().get_h2g_pool_pages(),
+        snapshot.layout().get_h2g_pool_pages()
+    );
+}
+
+#[test]
+fn layered_writer_round_trips_two_data_layers() {
+    let mut snapshot = Arc::try_unwrap(create_snapshot()).ok().unwrap();
+    let source = &snapshot.state.memory.layers()[0];
+    let data = source.blob().memory().as_slice();
+    let data_len = source.blob().data_gpa_range().len();
+    let page_size = page_size::get();
+    let boundary = (data_len / 2 / page_size) * page_size;
+    assert!(boundary > 0 && boundary < data_len);
+    let base = source.blob().data_gpa_range().gpa_start();
+    let scratch_base =
+        hyperlight_common::layout::scratch_base_gpa(snapshot.layout().get_scratch_size());
+    let layers = [(0, boundary), (boundary, data_len)].map(|(start, end)| {
+        let blob = SnapshotBlob::new(
+            ReadonlySharedMemory::from_bytes(&data[start..end]).unwrap(),
+            base + start as u64,
+            end - start,
+            scratch_base,
+        )
+        .unwrap();
+        SnapshotLayer::new(Arc::new(blob), std::iter::once(0..end - start).collect()).unwrap()
+    });
+    let page_tables = Arc::clone(snapshot.state.memory.page_tables());
+    Arc::get_mut(&mut snapshot.state).unwrap().memory =
+        Arc::new(SnapshotMemory::new(Box::new(layers), page_tables).unwrap());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snap");
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(manifest_path(&path)).unwrap()).unwrap();
+    let layers = manifest["layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 4);
+    assert_eq!(layers[0]["mediaType"], super::file::MT_SNAPSHOT_V2);
+    assert_eq!(layers[1]["mediaType"], super::file::MT_SNAPSHOT_V2);
+    assert_eq!(layers[2]["mediaType"], super::file::MT_PAGE_TABLES_V1);
+    assert_eq!(layers[3]["mediaType"], super::file::MT_TRANSPORT_V1);
+    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+    assert_eq!(loaded.snapshot_memory().layers().len(), 2);
+    let mut sandbox =
+        Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
+    assert_eq!(
+        sandbox
+            .call::<String>("Echo", "layers".to_string())
+            .unwrap(),
+        "layers"
+    );
 }
 
 #[test]
@@ -1286,12 +1405,7 @@ fn snapshot_blob_size_mismatch_rejected() {
 
 #[test]
 fn snapshot_layout_snapshot_size_zero_rejected() {
-    let snapshot = create_snapshot();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("snap");
-    snapshot
-        .save(&path, &OciTag::new("latest").unwrap())
-        .unwrap();
+    let (_dir, path) = save_for_mutation();
     rewrite_config(&path, |cfg| {
         cfg["layout"]["snapshot_size"] = Value::from(0u64);
     });
@@ -1309,12 +1423,7 @@ fn snapshot_layout_snapshot_size_zero_rejected() {
 
 #[test]
 fn snapshot_layout_snapshot_size_unaligned_rejected() {
-    let snapshot = create_snapshot();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("snap");
-    snapshot
-        .save(&path, &OciTag::new("latest").unwrap())
-        .unwrap();
+    let (_dir, path) = save_for_mutation();
     rewrite_config(&path, |cfg| {
         let s = cfg["layout"]["snapshot_size"].as_u64().unwrap();
         cfg["layout"]["snapshot_size"] = Value::from(s + 1);
@@ -1333,12 +1442,7 @@ fn snapshot_layout_snapshot_size_unaligned_rejected() {
 
 #[test]
 fn snapshot_layout_snapshot_size_must_match_memory_size() {
-    let snapshot = create_snapshot();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("snap");
-    snapshot
-        .save(&path, &OciTag::new("latest").unwrap())
-        .unwrap();
+    let (_dir, path) = save_for_mutation();
     let page = hyperlight_common::vmem::PAGE_SIZE as u64;
     rewrite_config(&path, |cfg| {
         let m = cfg["memory_size"].as_u64().unwrap();
@@ -1369,6 +1473,7 @@ fn snapshot_size_smaller_than_layout_rejected() {
     snapshot
         .save(&path, &OciTag::new("latest").unwrap())
         .unwrap();
+    make_v3_layout(&path);
     let page = hyperlight_common::vmem::PAGE_SIZE as u64;
     // Size the layout fields imply. The guest-visible prefix must
     // cover at least this much.
@@ -1394,12 +1499,7 @@ fn snapshot_size_smaller_than_layout_rejected() {
 
 #[test]
 fn snapshot_layout_pt_size_unaligned_rejected() {
-    let snapshot = create_snapshot();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("snap");
-    snapshot
-        .save(&path, &OciTag::new("latest").unwrap())
-        .unwrap();
+    let (_dir, path) = save_for_mutation();
     rewrite_config(&path, |cfg| {
         if let Some(p) = cfg["layout"]["pt_size"].as_u64() {
             cfg["layout"]["pt_size"] = Value::from(p + 1);
@@ -1730,7 +1830,7 @@ fn save_same_tag_same_content_is_idempotent() {
     );
 }
 
-/// Two tags written from one in-memory snapshot share all four blobs.
+/// Two tags written from one in-memory snapshot share all five blobs.
 #[test]
 fn save_shares_blobs_across_tags_with_identical_content() {
     let snap = create_snapshot();
@@ -1744,7 +1844,7 @@ fn save_shares_blobs_across_tags_with_identical_content() {
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name()))
         .collect();
-    assert_eq!(blobs.len(), 4, "expected 4 deduped blobs, got {:?}", blobs);
+    assert_eq!(blobs.len(), 5, "expected 5 deduped blobs, got {:?}", blobs);
 }
 
 /// Replacing one tag in a three-tag layout keeps the other two
@@ -1977,6 +2077,12 @@ fn checked_load_rejects_config_blob_byte_mutation() {
 // Input validation for `checked_load`.
 
 fn save_for_mutation() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (dir, path) = save_layered_for_mutation();
+    make_v3_layout(&path);
+    (dir, path)
+}
+
+fn save_layered_for_mutation() -> (tempfile::TempDir, std::path::PathBuf) {
     let snapshot = create_snapshot();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("snap");
@@ -1984,6 +2090,48 @@ fn save_for_mutation() -> (tempfile::TempDir, std::path::PathBuf) {
         .save(&path, &OciTag::new("latest").unwrap())
         .unwrap();
     (dir, path)
+}
+
+fn blob_path(path: &std::path::Path, descriptor: &Value) -> std::path::PathBuf {
+    path.join("blobs").join("sha256").join(
+        descriptor["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap(),
+    )
+}
+
+fn make_v3_layout(path: &std::path::Path) {
+    let mut cfg: Value =
+        serde_json::from_slice(&std::fs::read(find_config_blob(path)).unwrap()).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(manifest_path(path)).unwrap()).unwrap();
+    let layers = manifest["layers"].as_array().unwrap();
+    let data = std::fs::read(blob_path(path, &layers[0])).unwrap();
+    let page_tables = std::fs::read(blob_path(path, &layers[1])).unwrap();
+    let data_len = cfg["layers"][0]["data"]["len"].as_u64().unwrap() as usize;
+    let pt_len = cfg["page_table_len"].as_u64().unwrap() as usize;
+    let image_len = (data_len + pt_len).next_multiple_of(hyperlight_common::vmem::PAGE_SIZE);
+    let mut image = vec![0; image_len];
+    image[..data_len].copy_from_slice(&data[..data_len]);
+    image[data_len..data_len + pt_len].copy_from_slice(&page_tables[..pt_len]);
+    let mut descriptor = layers[0].clone();
+    descriptor["mediaType"] = Value::from(super::file::MT_SNAPSHOT_V1);
+    write_layered_blob(path, &image, &mut descriptor);
+    cfg["abi_version"] = Value::from(5);
+    cfg["memory_size"] = Value::from(image_len);
+    cfg["layout"]["snapshot_size"] = Value::from(data_len);
+    cfg["layout"]["pt_size"] = Value::from(pt_len);
+    cfg.as_object_mut().unwrap().remove("host_page_size");
+    cfg.as_object_mut().unwrap().remove("layers");
+    cfg.as_object_mut().unwrap().remove("page_table_len");
+    rewrite_config(path, |config| *config = cfg);
+    rewrite_manifest(path, |value| {
+        value["config"]["mediaType"] = Value::from(super::file::MT_CONFIG_V3);
+        value["artifactType"] = Value::from(super::file::MT_CONFIG_V3);
+        value["layers"] = Value::Array(vec![descriptor, layers.last().unwrap().clone()]);
+    });
 }
 
 fn write_layered_blob(path: &std::path::Path, bytes: &[u8], descriptor: &mut Value) {
@@ -1994,19 +2142,17 @@ fn write_layered_blob(path: &std::path::Path, bytes: &[u8], descriptor: &mut Val
 }
 
 fn make_layered_layout(path: &std::path::Path, split_data: bool) {
+    if !split_data {
+        return;
+    }
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(find_config_blob(path)).unwrap()).unwrap();
     let image = std::fs::read(find_snapshot_blob(path)).unwrap();
-    let data_len = cfg["layout"]["snapshot_size"].as_u64().unwrap() as usize;
-    let pt_len = cfg["layout"]["pt_size"].as_u64().unwrap() as usize;
+    let data_len = cfg["layers"][0]["data"]["len"].as_u64().unwrap() as usize;
     let page_size = page_size::get();
-    let boundary = if split_data {
-        (data_len / 2 / page_size) * page_size
-    } else {
-        data_len
-    };
-    assert!(boundary > 0 && boundary <= data_len);
-    let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+    let boundary = (data_len / 2 / page_size) * page_size;
+    assert!(boundary > 0 && boundary < data_len);
+    let base = cfg["layers"][0]["data"]["gpa_start"].as_u64().unwrap();
     let parts = [&image[..boundary], &image[boundary..data_len]];
     let mut layers = Vec::new();
     let mut data_descriptors = Vec::new();
@@ -2017,46 +2163,48 @@ fn make_layered_layout(path: &std::path::Path, split_data: bool) {
             continue;
         }
         let start = if index == 0 { 0 } else { boundary };
+        let end = start + bytes.len();
+        let live_data = cfg["layers"][0]["live_data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|range| {
+                let live_start = (range["start"].as_u64().unwrap() as usize).max(start);
+                let live_end = (range["end"].as_u64().unwrap() as usize).min(end);
+                (live_start < live_end).then(
+                    || serde_json::json!({ "start": live_start - start, "end": live_end - start }),
+                )
+            })
+            .collect::<Vec<_>>();
         layers.push(serde_json::json!({
             "data": { "gpa_start": base + start as u64, "len": bytes.len() },
-            "live_data": [{ "start": 0, "end": bytes.len() }]
+            "live_data": live_data
         }));
         let mut descriptor = manifest["layers"][0].clone();
         descriptor["mediaType"] = Value::from(super::file::MT_SNAPSHOT_V2);
         write_layered_blob(path, bytes, &mut descriptor);
         data_descriptors.push(descriptor);
     }
-    let mut page_tables = image[data_len..data_len + pt_len].to_vec();
-    page_tables.resize(pt_len.next_multiple_of(page_size), 0);
-    let mut pt_descriptor = manifest["layers"][0].clone();
-    pt_descriptor["mediaType"] = Value::from(super::file::MT_PAGE_TABLES_V1);
-    write_layered_blob(path, &page_tables, &mut pt_descriptor);
-    data_descriptors.push(pt_descriptor);
-    data_descriptors.push(manifest["layers"][1].clone());
+    layers.extend_from_slice(&cfg["layers"].as_array().unwrap()[1..]);
+    data_descriptors.extend_from_slice(&manifest["layers"].as_array().unwrap()[1..]);
 
     rewrite_config(path, |cfg| {
-        cfg["abi_version"] = Value::from(6);
-        cfg["host_page_size"] = Value::from(page_size);
         cfg["layers"] = Value::Array(layers);
-        cfg["page_table_len"] = Value::from(pt_len);
-        cfg.as_object_mut().unwrap().remove("memory_size");
-        let layout = cfg["layout"].as_object_mut().unwrap();
-        layout.remove("snapshot_size");
-        layout.remove("pt_size");
     });
     rewrite_manifest(path, |manifest| {
-        manifest["config"]["mediaType"] = Value::from(super::file::MT_CONFIG_V4);
-        manifest["artifactType"] = Value::from(super::file::MT_CONFIG_V4);
         manifest["layers"] = Value::Array(data_descriptors);
     });
 }
 
 #[test]
 fn layered_oci_load_restores_data_page_tables_and_transport() {
-    let (_dir, path) = save_for_mutation();
+    let (_dir, path) = save_layered_for_mutation();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(find_config_blob(&path)).unwrap()).unwrap();
+    let data_layers = config["layers"].as_array().unwrap().len();
     make_layered_layout(&path, true);
     let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
-    assert_eq!(loaded.snapshot_memory().layers().len(), 2);
+    assert_eq!(loaded.snapshot_memory().layers().len(), data_layers + 1);
     let mut sandbox =
         Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
     let result: String = sandbox.call("Echo", "layered".to_string()).unwrap();
@@ -2082,7 +2230,7 @@ fn layered_oci_load_preserves_metadata_and_code_base() {
 
 #[test]
 fn layered_oci_rejects_missing_descriptor() {
-    let (_dir, path) = save_for_mutation();
+    let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, false);
     rewrite_manifest(&path, |manifest| {
         manifest["layers"].as_array_mut().unwrap().remove(1);
@@ -2097,7 +2245,7 @@ fn layered_oci_rejects_missing_descriptor() {
 #[test]
 fn layered_oci_rejects_wrong_descriptor_media() {
     for index in 0..3 {
-        let (_dir, path) = save_for_mutation();
+        let (_dir, path) = save_layered_for_mutation();
         make_layered_layout(&path, false);
         rewrite_manifest(&path, |manifest| {
             manifest["layers"][index]["mediaType"] = Value::from("application/vnd.example.other");
@@ -2112,7 +2260,7 @@ fn layered_oci_rejects_wrong_descriptor_media() {
 
 #[test]
 fn layered_oci_rejects_mismatched_storage_size() {
-    let (_dir, path) = save_for_mutation();
+    let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, false);
     rewrite_manifest(&path, |manifest| {
         manifest["layers"][1]["size"] = Value::from(0);
@@ -2126,7 +2274,7 @@ fn layered_oci_rejects_mismatched_storage_size() {
 
 #[test]
 fn layered_oci_rejects_overlapping_data_layers() {
-    let (_dir, path) = save_for_mutation();
+    let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, true);
     rewrite_config(&path, |cfg| {
         cfg["layers"][1]["data"]["gpa_start"] = cfg["layers"][0]["data"]["gpa_start"].clone();
@@ -2140,7 +2288,7 @@ fn layered_oci_rejects_overlapping_data_layers() {
 
 #[test]
 fn layered_oci_rejects_mismatched_artifact_type() {
-    let (_dir, path) = save_for_mutation();
+    let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, false);
     rewrite_manifest(&path, |manifest| {
         manifest["artifactType"] = Value::from(super::file::MT_CONFIG_V3);
@@ -2154,7 +2302,7 @@ fn layered_oci_rejects_mismatched_artifact_type() {
 
 #[test]
 fn layered_oci_rejects_unmapped_entrypoint() {
-    let (_dir, path) = save_for_mutation();
+    let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, false);
     rewrite_config(&path, |cfg| {
         let page_size = page_size::get();
@@ -2390,7 +2538,13 @@ fn legacy_config_versions_rejected() {
             &path,
             OciTag::new("latest").unwrap(),
         ));
-        assert_err_contains(err, "incompatible with snapshot ABI 5");
+        assert_err_contains(
+            err,
+            &format!(
+                "incompatible with snapshot ABI {}",
+                super::file::SNAPSHOT_ABI_VERSION
+            ),
+        );
     }
 }
 
@@ -2897,23 +3051,30 @@ fn manifest_uses_correct_config_and_layer_media_types() {
         serde_json::from_slice(&std::fs::read(manifest_path(&path)).unwrap()).unwrap();
     assert_eq!(
         manifest["config"]["mediaType"].as_str().unwrap(),
-        "application/vnd.hyperlight.snapshot.config.v3+json"
+        "application/vnd.hyperlight.snapshot.config.v4+json"
     );
-    assert_eq!(manifest["layers"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        manifest["layers"].as_array().unwrap().len(),
+        snap.snapshot_memory().layers().len() + 2
+    );
     assert_eq!(
         manifest["layers"][0]["mediaType"].as_str().unwrap(),
-        "application/vnd.hyperlight.snapshot.memory.v1"
+        "application/vnd.hyperlight.snapshot.memory.v2"
     );
     assert_eq!(
         manifest["layers"][1]["mediaType"].as_str().unwrap(),
-        "application/vnd.hyperlight.snapshot.transport.v1"
+        "application/vnd.hyperlight.snapshot.page-tables.v1"
+    );
+    assert_eq!(
+        manifest["layers"].as_array().unwrap().last().unwrap()["mediaType"],
+        super::file::MT_TRANSPORT_V1
     );
     // `artifactType` mirrors `config.mediaType` so registries that surface
     // the distribution-spec referrers API report a useful type, and tooling
     // that falls back to `config.mediaType` sees the same value.
     assert_eq!(
         manifest["artifactType"].as_str().unwrap(),
-        "application/vnd.hyperlight.snapshot.config.v3+json"
+        "application/vnd.hyperlight.snapshot.config.v4+json"
     );
 }
 

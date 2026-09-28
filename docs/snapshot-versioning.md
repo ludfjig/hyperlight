@@ -18,25 +18,26 @@ A snapshot carries four independently evolvable version markers:
   size), and the calling convention for guest function entry. A change
   to any of these breaks older snapshots unless the loader adds a
   compat path.
-* **Snapshot blob encoding**, `MT_SNAPSHOT_V1`
-  (`application/vnd.hyperlight.snapshot.memory.v1`), aliased as
+* **Snapshot blob encoding**, `MT_SNAPSHOT_V2`
+   (`application/vnd.hyperlight.snapshot.memory.v2`), aliased as
   `MT_SNAPSHOT_CURRENT`. This is the on-wire format of the snapshot
-  blob: framing, section ordering, alignment, dirty/zero-page elision,
-  anything about how the bytes are packed inside the OCI layer.
+   data blobs: alignment and the bytes packed inside each OCI layer.
+   Page tables have their own `MT_PAGE_TABLES_V1` descriptor after the
+   data layers. The loader also accepts the flat memory v1 blob.
 * **Transport blob encoding**, `MT_TRANSPORT_V1`
   (`application/vnd.hyperlight.snapshot.transport.v1`), aliased as
   `MT_TRANSPORT_CURRENT`. This is the binary encoding of canonical
   virtqueue state stored outside the memory layer.
-* **Config schema**, `MT_CONFIG_V3`
-  (`application/vnd.hyperlight.snapshot.config.v3+json`), aliased as
+* **Config schema**, `MT_CONFIG_V4`
+   (`application/vnd.hyperlight.snapshot.config.v4+json`), aliased as
   `MT_CONFIG_CURRENT`. This is the JSON shape of the config blob:
   field names, types, required vs optional, the descriptors the loader
   needs in order to reconstruct the sandbox (memory sizes, buffer
   sizes, `abi_version`, `hyperlight_version`, etc.). Renaming a field,
   changing its type, or adding a required field is a schema change and
-  bumps this constant. Version 3 describes the virtqueue-only memory layout
-  and requires a transport layer. Config v1 and v2 are incompatible with
-  the current ABI.
+   bumps this constant. Version 4 describes data layers, page tables, and
+   transport geometry, and requires a separate transport layer. Config v3
+   with ABI 5 remains loadable. Config v1 and v2 are incompatible.
 
 The `OCI_LAYOUT_VERSION` constant is pinned by the OCI image-layout
 spec at `1.0.0`.
