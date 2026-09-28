@@ -497,7 +497,7 @@ impl Snapshot {
         cfg: &OciSnapshotConfig,
         cfg_bytes: &[u8],
     ) -> crate::Result<Descriptor> {
-        let memory_bytes = self.memory.as_slice();
+        let memory_bytes = self.state.memory.as_slice();
         let memory_size = memory_bytes.len();
         if memory_size == 0 || !memory_size.is_multiple_of(PAGE_SIZE) {
             return Err(crate::new_error!(
@@ -516,7 +516,7 @@ impl Snapshot {
         put_blob_if_absent(&blobs_dir, &snapshot_digest, memory_bytes)?;
 
         // Transport blob: the canonical ring image omitted from memory.
-        let transport = self.virtq.as_ref().ok_or_else(|| {
+        let transport = self.state.virtq.as_ref().ok_or_else(|| {
             crate::new_error!("initialized snapshot has no canonical transport state")
         })?;
         let transport_bytes = transport::encode(transport)?;
@@ -585,7 +585,7 @@ impl Snapshot {
     }
 
     fn build_config(&self) -> crate::Result<OciSnapshotConfig> {
-        let (entrypoint_addr, sregs) = match (self.next_action, self.sregs.as_ref()) {
+        let (entrypoint_addr, sregs) = match (self.state.next_action, self.state.sregs.as_ref()) {
             (NextAction::Call(addr), Some(sregs)) => (addr, sregs),
             (NextAction::Call(_), None) => {
                 return Err(crate::new_error!(
@@ -605,18 +605,18 @@ impl Snapshot {
             }
         };
 
-        if self.virtq.is_none() {
+        if self.state.virtq.is_none() {
             return Err(crate::new_error!(
                 "initialized snapshot has no canonical transport state"
             ));
         }
 
-        let host_functions = match &self.host_functions.host_functions {
+        let host_functions = match &self.state.host_functions.host_functions {
             Some(v) => v.iter().map(HostFunction::from).collect(),
             None => Vec::new(),
         };
 
-        let l = &self.layout;
+        let l = &self.state.layout;
         Ok(OciSnapshotConfig {
             hyperlight_version: env!("CARGO_PKG_VERSION").to_string(),
             arch: Arch::current(),
@@ -624,12 +624,13 @@ impl Snapshot {
             hypervisor: Hypervisor::current()
                 .ok_or_else(|| crate::new_error!("no hypervisor available to tag snapshot"))?,
             cpu_vendor: CpuVendor::current(),
-            stack_top_gva: self.stack_top_gva,
+            stack_top_gva: self.state.stack_top_gva,
             entrypoint_addr,
-            original_entrypoint_addr: self.original_entrypoint,
+            original_entrypoint_addr: self.state.original_entrypoint,
             sregs: *sregs,
             #[cfg(target_arch = "x86_64")]
             msrs: self
+                .state
                 .msrs
                 .as_ref()
                 .ok_or_else(|| crate::new_error!("snapshot has no MSR state"))?
@@ -650,9 +651,9 @@ impl Snapshot {
                 snapshot_size: l.snapshot_size(),
                 pt_size: l.pt_size(),
             },
-            memory_size: self.memory.mem_size() as u64,
+            memory_size: self.state.memory.mem_size() as u64,
             host_functions,
-            snapshot_generation: self.snapshot_generation,
+            snapshot_generation: self.state.snapshot_generation,
         })
     }
 
@@ -957,18 +958,20 @@ impl Snapshot {
         };
 
         Ok(Snapshot {
-            layout,
-            memory,
-            load_info: crate::mem::exe::LoadInfo::dummy(),
-            stack_top_gva: cfg.stack_top_gva,
-            sregs: Some(cfg.sregs),
-            #[cfg(target_arch = "x86_64")]
-            msrs: Some(cfg.msrs),
-            next_action,
-            original_entrypoint: cfg.original_entrypoint_addr,
-            snapshot_generation,
-            host_functions,
-            virtq: Some(virtq),
+            state: std::sync::Arc::new(super::SnapshotState {
+                layout,
+                memory,
+                load_info: crate::mem::exe::LoadInfo::dummy(),
+                stack_top_gva: cfg.stack_top_gva,
+                sregs: Some(cfg.sregs),
+                #[cfg(target_arch = "x86_64")]
+                msrs: Some(cfg.msrs),
+                next_action,
+                original_entrypoint: cfg.original_entrypoint_addr,
+                snapshot_generation,
+                host_functions,
+                virtq: Some(virtq),
+            }),
         })
     }
 }

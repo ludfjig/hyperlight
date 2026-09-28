@@ -438,7 +438,8 @@ fn restore_from_loaded_snapshot() {
 fn restore_missing_transport_preserves_target() {
     // Remove transport from a snapshot with valid memory and vCPU state.
     let mut bad_snapshot = create_snapshot();
-    Arc::get_mut(&mut bad_snapshot).unwrap().virtq = None;
+    let snapshot = Arc::get_mut(&mut bad_snapshot).unwrap();
+    Arc::get_mut(&mut snapshot.state).unwrap().virtq = None;
 
     // Seed guest state and read the mapped file before caching the snapshot.
     let file = tempfile::NamedTempFile::new().unwrap();
@@ -3423,7 +3424,7 @@ fn save_new_tag_into_loaded_layout_preserves_live_mapping() {
 
     // Record the full mapped image and every on-disk blob before the
     // second save, so any byte change is caught.
-    let mapping_before = loaded_a.memory.as_slice().to_vec();
+    let mapping_before = loaded_a.memory().as_slice().to_vec();
     let blobs_dir = path.join("blobs").join("sha256");
     let blobs_before = read_blob_dir(&blobs_dir);
 
@@ -3436,7 +3437,7 @@ fn save_new_tag_into_loaded_layout_preserves_live_mapping() {
 
     // The live mapping is unchanged, byte for byte.
     assert_eq!(
-        loaded_a.memory.as_slice(),
+        loaded_a.memory().as_slice(),
         mapping_before.as_slice(),
         "live snapshot mapping changed after a new tag was written"
     );

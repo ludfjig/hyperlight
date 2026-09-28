@@ -6,6 +6,7 @@ mod file_tests;
 mod tripwires;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 pub(crate) use file::host_cpu_vendor_golden_tag;
 pub use file::reference::{OciDigest, OciReference, OciTag};
@@ -55,9 +56,13 @@ pub enum NextAction {
     None,
 }
 
-/// A wrapper around a `SharedMemory` reference and a snapshot
-/// of the memory therein
+/// An immutable snapshot of sandbox state.
 pub struct Snapshot {
+    state: Arc<SnapshotState>,
+}
+
+/// Immutable sandbox state held by a snapshot.
+struct SnapshotState {
     /// Layout object for the sandbox. TODO: get rid of this and
     /// replace with something saner and set up from the guest (early
     /// on?).
@@ -118,6 +123,7 @@ pub struct Snapshot {
     /// Both the images and layout remain immutable afterwards.
     virtq: Option<VirtqSnapshot>,
 }
+
 impl core::convert::AsRef<Snapshot> for Snapshot {
     fn as_ref(&self) -> &Self {
         self
@@ -130,7 +136,7 @@ impl hyperlight_common::vmem::TableReadOps for Snapshot {
     }
     unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
         let addr = addr as usize;
-        let Some(pte_bytes) = self.memory.as_slice().get(addr..addr + PTE_SIZE) else {
+        let Some(pte_bytes) = self.state.memory.as_slice().get(addr..addr + PTE_SIZE) else {
             // Attacker-controlled data pointed out-of-bounds. We'll
             // default to returning 0 in this case, which, for most
             // architectures (including x86-64 and arm64, the ones we
@@ -403,20 +409,22 @@ impl Snapshot {
             .ok_or_else(|| crate::new_error!("ELF entrypoint GVA overflows"))?;
 
         Ok(Self {
-            memory: ReadonlySharedMemory::from_bytes(&memory, layout.snapshot_size())?,
-            layout,
-            load_info,
-            stack_top_gva: exn_stack_top_gva,
-            sregs: None,
-            #[cfg(target_arch = "x86_64")]
-            msrs: None,
-            next_action: NextAction::Initialise(entrypoint_gva),
-            original_entrypoint: entrypoint_gva,
-            snapshot_generation: 0,
-            host_functions: HostFunctionDetails {
-                host_functions: None,
-            },
-            virtq: None,
+            state: Arc::new(SnapshotState {
+                memory: ReadonlySharedMemory::from_bytes(&memory, layout.snapshot_size())?,
+                layout,
+                load_info,
+                stack_top_gva: exn_stack_top_gva,
+                sregs: None,
+                #[cfg(target_arch = "x86_64")]
+                msrs: None,
+                next_action: NextAction::Initialise(entrypoint_gva),
+                original_entrypoint: entrypoint_gva,
+                snapshot_generation: 0,
+                host_functions: HostFunctionDetails {
+                    host_functions: None,
+                },
+                virtq: None,
+            }),
         })
     }
 
@@ -595,47 +603,49 @@ impl Snapshot {
         layout.set_snapshot_size(guest_visible_size);
 
         Ok(Self {
-            layout,
-            memory: ReadonlySharedMemory::from_bytes(&memory, guest_visible_size)?,
-            load_info,
-            stack_top_gva,
-            sregs: Some(sregs),
-            #[cfg(target_arch = "x86_64")]
-            msrs: Some(msrs),
-            next_action,
-            original_entrypoint,
-            snapshot_generation,
-            host_functions,
-            virtq,
+            state: Arc::new(SnapshotState {
+                layout,
+                memory: ReadonlySharedMemory::from_bytes(&memory, guest_visible_size)?,
+                load_info,
+                stack_top_gva,
+                sregs: Some(sregs),
+                #[cfg(target_arch = "x86_64")]
+                msrs: Some(msrs),
+                next_action,
+                original_entrypoint,
+                snapshot_generation,
+                host_functions,
+                virtq,
+            }),
         })
     }
 
     /// Generation number assigned to this snapshot when it was taken.
     pub(crate) fn snapshot_generation(&self) -> u64 {
-        self.snapshot_generation
+        self.state.snapshot_generation
     }
 
     /// Return the main memory contents of the snapshot
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     pub(crate) fn memory(&self) -> &ReadonlySharedMemory {
-        &self.memory
+        &self.state.memory
     }
 
     /// Return a copy of the load info for the exe in the snapshot
     pub(crate) fn load_info(&self) -> LoadInfo {
-        self.load_info.clone()
+        self.state.load_info.clone()
     }
 
     pub(crate) fn layout(&self) -> &crate::mem::layout::SandboxMemoryLayout {
-        &self.layout
+        &self.state.layout
     }
 
     pub(crate) fn root_pt_gpa(&self) -> u64 {
-        self.layout.get_pt_base_gpa()
+        self.state.layout.get_pt_base_gpa()
     }
 
     pub(crate) fn stack_top_gva(&self) -> u64 {
-        self.stack_top_gva
+        self.state.stack_top_gva
     }
 
     /// Returns the special registers stored in this snapshot.
@@ -644,28 +654,28 @@ impl Snapshot {
     /// Note: The CR3 value in the returned struct should NOT be used for restore;
     /// use `root_pt_gpa()` instead since page tables are relocated during snapshot.
     pub(crate) fn sregs(&self) -> Option<&CommonSpecialRegisters> {
-        self.sregs.as_ref()
+        self.state.sregs.as_ref()
     }
 
     /// The MSRs saved in this snapshot.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn msrs(&self) -> Option<&Vec<MsrEntry>> {
-        self.msrs.as_ref()
+        self.state.msrs.as_ref()
     }
 
     pub(crate) fn next_action(&self) -> NextAction {
-        self.next_action
+        self.state.next_action
     }
 
     pub(crate) fn virtq(&self) -> Option<&VirtqSnapshot> {
-        self.virtq.as_ref()
+        self.state.virtq.as_ref()
     }
 
     /// Guest virtual address of the guest binary's ELF entry point,
     /// preserved across the `Initialise` -> `Call` transition. Used
     /// to fill `AT_ENTRY` in guest core dumps. 0 if unknown.
     pub(crate) fn original_entrypoint(&self) -> u64 {
-        self.original_entrypoint
+        self.state.original_entrypoint
     }
 
     /// Validate that `provided` is a superset of the host functions
@@ -680,7 +690,7 @@ impl Snapshot {
         &self,
         provided: &crate::sandbox::host_funcs::FunctionRegistry,
     ) -> Result<()> {
-        let required = match &self.host_functions.host_functions {
+        let required = match &self.state.host_functions.host_functions {
             Some(v) => v,
             None => return Ok(()),
         };
