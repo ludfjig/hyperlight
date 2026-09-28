@@ -14,6 +14,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::func::Registerable;
+use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::mgr::GuestPageTableBuffer;
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory as _};
 use crate::sandbox::snapshot::memory::page_tables_from_bytes;
@@ -346,19 +347,22 @@ fn layered_writer_round_trips_two_data_layers() {
     let base = source.blob().data_gpa_range().gpa_start();
     let scratch_base =
         hyperlight_common::layout::scratch_base_gpa(snapshot.layout().get_scratch_size());
-    let layers = [(0, boundary), (boundary, data_len)].map(|(start, end)| {
-        let blob = SnapshotBlob::new(
-            ReadonlySharedMemory::from_bytes(&data[start..end]).unwrap(),
-            base + start as u64,
-            end - start,
-            scratch_base,
-        )
-        .unwrap();
-        SnapshotLayer::new(Arc::new(blob), std::iter::once(0..end - start).collect()).unwrap()
-    });
+    let mut layers = [(0, boundary), (boundary, data_len)]
+        .map(|(start, end)| {
+            let blob = SnapshotBlob::new(
+                ReadonlySharedMemory::from_bytes(&data[start..end]).unwrap(),
+                base + start as u64,
+                end - start,
+                scratch_base,
+            )
+            .unwrap();
+            SnapshotLayer::new(Arc::new(blob), std::iter::once(0..end - start).collect()).unwrap()
+        })
+        .to_vec();
+    layers.extend_from_slice(&snapshot.state.memory.layers()[1..]);
     let page_tables = Arc::clone(snapshot.state.memory.page_tables());
     Arc::get_mut(&mut snapshot.state).unwrap().memory =
-        Arc::new(SnapshotMemory::new(Box::new(layers), page_tables).unwrap());
+        Arc::new(SnapshotMemory::new(layers.into_boxed_slice(), page_tables).unwrap());
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("snap");
@@ -368,13 +372,21 @@ fn layered_writer_round_trips_two_data_layers() {
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(manifest_path(&path)).unwrap()).unwrap();
     let layers = manifest["layers"].as_array().unwrap();
-    assert_eq!(layers.len(), 4);
-    assert_eq!(layers[0]["mediaType"], super::file::MT_SNAPSHOT_V2);
-    assert_eq!(layers[1]["mediaType"], super::file::MT_SNAPSHOT_V2);
-    assert_eq!(layers[2]["mediaType"], super::file::MT_PAGE_TABLES_V1);
-    assert_eq!(layers[3]["mediaType"], super::file::MT_TRANSPORT_V1);
+    let data_layers = snapshot.state.memory.layers().len();
+    assert_eq!(layers.len(), data_layers + 2);
+    for layer in &layers[..data_layers] {
+        assert_eq!(layer["mediaType"], super::file::MT_SNAPSHOT_V2);
+    }
+    assert_eq!(
+        layers[data_layers]["mediaType"],
+        super::file::MT_PAGE_TABLES_V1
+    );
+    assert_eq!(
+        layers[data_layers + 1]["mediaType"],
+        super::file::MT_TRANSPORT_V1
+    );
     let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
-    assert_eq!(loaded.snapshot_memory().layers().len(), 2);
+    assert_eq!(loaded.snapshot_memory().layers().len(), data_layers);
     let mut sandbox =
         Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
     assert_eq!(
@@ -775,7 +787,7 @@ fn restore_missing_transport_preserves_target() {
 
     // Seed guest state and read the mapped file before caching the snapshot.
     let file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(file.path(), vec![0x5a; page_size::get()]).unwrap();
+    std::fs::write(file.path(), vec![0x5a; page_size::get() * 2]).unwrap();
 
     let mut target = create_test_sandbox();
     target.call::<i32>("AddToStatic", 5i32).unwrap();
@@ -804,7 +816,12 @@ fn restore_missing_transport_preserves_target() {
     assert!(Arc::ptr_eq(target.snapshot.as_ref().unwrap(), &cached));
     assert_eq!(target.mem_mgr.snapshot_count, generation);
     assert_eq!(
-        target.call::<Vec<u8>>("ReadMappedBuffer", args).unwrap(),
+        target
+            .call::<Vec<u8>>(
+                "ReadMappedBuffer",
+                (guest_base, hyperlight_common::vmem::PAGE_SIZE as u64, false),
+            )
+            .unwrap(),
         expected
     );
     assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 5);
@@ -826,7 +843,7 @@ fn load_noncanonical_transport_preserves_target() {
 
     // Seed guest state and read the mapped file before caching the snapshot.
     let file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(file.path(), vec![0x5a; page_size::get()]).unwrap();
+    std::fs::write(file.path(), vec![0x5a; page_size::get() * 2]).unwrap();
 
     let mut target = create_test_sandbox();
     target.call::<i32>("AddToStatic", 5i32).unwrap();
@@ -856,7 +873,12 @@ fn load_noncanonical_transport_preserves_target() {
     assert_eq!(target.mem_mgr.snapshot_count, generation);
 
     assert_eq!(
-        target.call::<Vec<u8>>("ReadMappedBuffer", args).unwrap(),
+        target
+            .call::<Vec<u8>>(
+                "ReadMappedBuffer",
+                (guest_base, hyperlight_common::vmem::PAGE_SIZE as u64, false),
+            )
+            .unwrap(),
         expected
     );
     assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 5);
@@ -1830,7 +1852,7 @@ fn save_same_tag_same_content_is_idempotent() {
     );
 }
 
-/// Two tags written from one in-memory snapshot share all five blobs.
+/// Two tags written from one in-memory snapshot share all blobs.
 #[test]
 fn save_shares_blobs_across_tags_with_identical_content() {
     let snap = create_snapshot();
@@ -1844,7 +1866,12 @@ fn save_shares_blobs_across_tags_with_identical_content() {
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name()))
         .collect();
-    assert_eq!(blobs.len(), 5, "expected 5 deduped blobs, got {:?}", blobs);
+    assert_eq!(
+        blobs.len(),
+        snap.snapshot_memory().layers().len() + 4,
+        "expected deduped blobs, got {:?}",
+        blobs
+    );
 }
 
 /// Replacing one tag in a three-tag layout keeps the other two
@@ -2108,13 +2135,27 @@ fn make_v3_layout(path: &std::path::Path) {
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(manifest_path(path)).unwrap()).unwrap();
     let layers = manifest["layers"].as_array().unwrap();
-    let data = std::fs::read(blob_path(path, &layers[0])).unwrap();
-    let page_tables = std::fs::read(blob_path(path, &layers[1])).unwrap();
-    let data_len = cfg["layers"][0]["data"]["len"].as_u64().unwrap() as usize;
+    let data_layers = cfg["layers"].as_array().unwrap();
+    let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+    let data_len = data_layers
+        .iter()
+        .map(|layer| {
+            (layer["data"]["gpa_start"].as_u64().unwrap() - base) as usize
+                + layer["data"]["len"].as_u64().unwrap() as usize
+        })
+        .max()
+        .unwrap();
+    let mut data = vec![0; data_len];
+    for (index, layer) in data_layers.iter().enumerate() {
+        let start = (layer["data"]["gpa_start"].as_u64().unwrap() - base) as usize;
+        let bytes = std::fs::read(blob_path(path, &layers[index])).unwrap();
+        data[start..start + bytes.len()].copy_from_slice(&bytes);
+    }
+    let page_tables = std::fs::read(blob_path(path, &layers[data_layers.len()])).unwrap();
     let pt_len = cfg["page_table_len"].as_u64().unwrap() as usize;
     let image_len = (data_len + pt_len).next_multiple_of(hyperlight_common::vmem::PAGE_SIZE);
     let mut image = vec![0; image_len];
-    image[..data_len].copy_from_slice(&data[..data_len]);
+    image[..data_len].copy_from_slice(&data);
     image[data_len..data_len + pt_len].copy_from_slice(&page_tables[..pt_len]);
     let mut descriptor = layers[0].clone();
     descriptor["mediaType"] = Value::from(super::file::MT_SNAPSHOT_V1);
@@ -2263,7 +2304,8 @@ fn layered_oci_rejects_mismatched_storage_size() {
     let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, false);
     rewrite_manifest(&path, |manifest| {
-        manifest["layers"][1]["size"] = Value::from(0);
+        let page_table_index = manifest["layers"].as_array().unwrap().len() - 2;
+        manifest["layers"][page_table_index]["size"] = Value::from(0);
     });
     let err = unwrap_err_snapshot(Snapshot::checked_load(
         &path,
@@ -2304,10 +2346,41 @@ fn layered_oci_rejects_mismatched_artifact_type() {
 fn layered_oci_rejects_unmapped_entrypoint() {
     let (_dir, path) = save_layered_for_mutation();
     make_layered_layout(&path, false);
+    let snapshot = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+    let NextAction::Call(entrypoint_gva) = snapshot.next_action() else {
+        panic!("captured snapshot must resume a call");
+    };
+    // SAFETY: The snapshot owns immutable page tables for the walk.
+    let mapping = unsafe { vmem::virt_to_phys(&snapshot, entrypoint_gva, 1) }
+        .next()
+        .unwrap();
+    let entrypoint_gpa = mapping.phys_base + entrypoint_gva - mapping.virt_base;
     rewrite_config(&path, |cfg| {
-        let page_size = page_size::get();
-        let data_len = cfg["layers"][0]["data"]["len"].as_u64().unwrap() as usize;
-        cfg["layers"][0]["live_data"][0]["start"] = Value::from(data_len - page_size);
+        for layer in cfg["layers"].as_array_mut().unwrap() {
+            let base = layer["data"]["gpa_start"].as_u64().unwrap();
+            let len = layer["data"]["len"].as_u64().unwrap();
+            if entrypoint_gpa < base || entrypoint_gpa >= base + len {
+                continue;
+            }
+            let page_size = page_size::get() as u64;
+            let hole_start = (entrypoint_gpa - base) / page_size * page_size;
+            let hole_end = hole_start + page_size;
+            let live_data = layer["live_data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|range| {
+                    let start = range["start"].as_u64().unwrap();
+                    let end = range["end"].as_u64().unwrap();
+                    [(start, end.min(hole_start)), (start.max(hole_end), end)]
+                        .into_iter()
+                        .filter(|(start, end)| start < end)
+                        .map(|(start, end)| serde_json::json!({ "start": start, "end": end }))
+                })
+                .collect::<Vec<_>>();
+            assert!(!live_data.is_empty());
+            layer["live_data"] = Value::Array(live_data);
+        }
     });
     let err = unwrap_err_snapshot(Snapshot::checked_load(
         &path,
@@ -3062,7 +3135,9 @@ fn manifest_uses_correct_config_and_layer_media_types() {
         "application/vnd.hyperlight.snapshot.memory.v2"
     );
     assert_eq!(
-        manifest["layers"][1]["mediaType"].as_str().unwrap(),
+        manifest["layers"][snap.snapshot_memory().layers().len()]["mediaType"]
+            .as_str()
+            .unwrap(),
         "application/vnd.hyperlight.snapshot.page-tables.v1"
     );
     assert_eq!(

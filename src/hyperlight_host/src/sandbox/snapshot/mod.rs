@@ -7,7 +7,8 @@ pub(crate) mod memory;
 mod tripwires;
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) use file::host_cpu_vendor_golden_tag;
@@ -16,14 +17,14 @@ use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionD
 use hyperlight_common::layout::{io_page, scratch_base_gpa, scratch_base_gva};
 use hyperlight_common::vmem;
 use hyperlight_common::vmem::{
-    BasicMapping, CowMapping, Mapping, MappingKind, PAGE_SIZE, SpaceAwareMapping, SpaceId, TableOps,
+    BasicMapping, CowMapping, Mapping, MappingKind, PAGE_SIZE, PAGE_TABLE_SIZE, SpaceAwareMapping,
+    SpaceId, TableOps,
 };
 use tracing::{Span, instrument};
 
-#[cfg(test)]
-pub(crate) use self::memory::SnapshotLayer;
 pub(crate) use self::memory::{
-    SnapshotBlob, SnapshotMemory, SnapshotMemoryBacking, SnapshotPageTables,
+    MAX_SNAPSHOT_MAPPINGS, MAX_SNAPSHOT_RETAINED_BYTES, SnapshotBlob, SnapshotLayer,
+    SnapshotMemory, SnapshotMemoryBacking, SnapshotPageTables,
 };
 use crate::Result;
 use crate::hypervisor::regs::CommonSpecialRegisters;
@@ -32,8 +33,10 @@ use crate::hypervisor::regs::MsrEntry;
 use crate::mem::exe::{ExeInfo, LoadInfo};
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
-use crate::mem::mgr::{GuestPageTableBuffer, GuestPhysicalMemoryView};
-use crate::mem::shared_mem::{ExclusiveSharedMemory, HostSharedMemory, ReadonlySharedMemory};
+use crate::mem::mgr::{GuestBacking, GuestPageTableBuffer, GuestPhysicalMemoryView};
+use crate::mem::shared_mem::{
+    ExclusiveSharedMemory, HostSharedMemory, ReadonlySharedMemory, SharedMemory,
+};
 use crate::mem::virtq::VirtqSnapshot;
 use crate::sandbox::SandboxConfiguration;
 use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
@@ -85,6 +88,8 @@ impl<'a> hyperlight_common::vmem::TableReadOps for PageTableReader<'a> {
         addr.saturating_add(offset)
     }
     unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
+        // TableReadOps cannot return errors. Preserve the first failure and
+        // return a not-present entry until the caller checks it after the walk.
         if self.failure.get().is_some() {
             return 0;
         }
@@ -270,6 +275,414 @@ fn skip_virt(virt_base: u64, scratch_gva: u64) -> bool {
         return true;
     }
     false
+}
+
+fn for_each_mapping_page(
+    mapping: &Mapping,
+    mut visitor: impl FnMut(u64, u64, MappingKind) -> Result<()>,
+) -> Result<()> {
+    if !validate_mapping(mapping)? {
+        return Ok(());
+    }
+    let mut offset = 0u64;
+    while offset < mapping.len {
+        let phys = mapping
+            .phys_base
+            .checked_add(offset)
+            .ok_or_else(|| crate::new_error!("guest physical mapping overflows"))?;
+        let virt = mapping
+            .virt_base
+            .checked_add(offset)
+            .ok_or_else(|| crate::new_error!("guest virtual mapping overflows"))?;
+        visitor(phys, virt, mapping.kind)?;
+        offset = offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| crate::new_error!("guest mapping offset overflows"))?;
+    }
+    Ok(())
+}
+
+fn validate_mapping(mapping: &Mapping) -> Result<bool> {
+    if mapping.kind == MappingKind::Unmapped {
+        return Ok(false);
+    }
+    if mapping.len == 0
+        || !mapping.phys_base.is_multiple_of(PAGE_SIZE as u64)
+        || !mapping.virt_base.is_multiple_of(PAGE_SIZE as u64)
+        || !mapping.len.is_multiple_of(PAGE_SIZE as u64)
+    {
+        return Err(crate::new_error!("guest mapping is not page aligned"));
+    }
+    Ok(true)
+}
+
+fn mapping_has_skipped_pages(mapping: &Mapping, scratch_gva: u64) -> Result<bool> {
+    let last_page = mapping
+        .virt_base
+        .checked_add(mapping.len - PAGE_SIZE as u64)
+        .ok_or_else(|| crate::new_error!("guest virtual mapping overflows"))?;
+    let snapshot_pt_start = hyperlight_common::layout::SNAPSHOT_PT_GVA_MIN as u64;
+    let snapshot_pt_end = hyperlight_common::layout::SNAPSHOT_PT_GVA_MAX as u64;
+    Ok(last_page >= scratch_gva
+        || (mapping.virt_base <= snapshot_pt_end && snapshot_pt_start <= last_page))
+}
+
+fn coalesce_pages(pages: &[bool]) -> Box<[Range<usize>]> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (page_index, reused) in pages.iter().enumerate() {
+        if !reused {
+            continue;
+        }
+        let page = page_index * PAGE_SIZE;
+        let end = page + PAGE_SIZE;
+        if let Some(previous) = ranges.last_mut()
+            && previous.end == page
+        {
+            previous.end = end;
+        } else {
+            ranges.push(page..end);
+        }
+    }
+    ranges.into_boxed_slice()
+}
+
+#[derive(Clone, Copy)]
+struct NewPage {
+    source_gpa: u64,
+    backing: GuestBacking,
+}
+
+fn backing_with_offset(backing: GuestBacking, offset: usize) -> Option<GuestBacking> {
+    match backing {
+        GuestBacking::Snapshot {
+            layer_index,
+            offset: backing_offset,
+        } => Some(GuestBacking::Snapshot {
+            layer_index,
+            offset: backing_offset.checked_add(offset)?,
+        }),
+        GuestBacking::Scratch {
+            offset: backing_offset,
+        } => Some(GuestBacking::Scratch {
+            offset: backing_offset.checked_add(offset)?,
+        }),
+        GuestBacking::Dynamic {
+            region_index,
+            offset: backing_offset,
+        } => Some(GuestBacking::Dynamic {
+            region_index,
+            offset: backing_offset.checked_add(offset)?,
+        }),
+    }
+}
+
+fn record_backed_pages(
+    backing: GuestBacking,
+    source_gpa: u64,
+    len: usize,
+    reused_pages: Option<&mut [Vec<bool>]>,
+    new_pages: &mut Vec<NewPage>,
+) -> Result<()> {
+    if let GuestBacking::Snapshot { offset, .. } = backing
+        && (!offset.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE))
+    {
+        return Err(crate::new_error!(
+            "snapshot backing range is not page aligned"
+        ));
+    }
+
+    if let GuestBacking::Snapshot {
+        layer_index,
+        offset,
+    } = backing
+        && let Some(pages) = reused_pages
+    {
+        let start = offset / PAGE_SIZE;
+        let end = offset
+            .checked_add(len)
+            .map(|end| end / PAGE_SIZE)
+            .ok_or_else(|| crate::new_error!("snapshot backing range overflows"))?;
+        pages
+            .get_mut(layer_index)
+            .and_then(|pages| pages.get_mut(start..end))
+            .ok_or_else(|| crate::new_error!("snapshot backing range is out of bounds"))?
+            .fill(true);
+        return Ok(());
+    }
+
+    for offset in (0..len).step_by(PAGE_SIZE) {
+        new_pages.push(NewPage {
+            source_gpa: source_gpa
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| crate::new_error!("snapshot source GPA overflows"))?,
+            backing: backing_with_offset(backing, offset)
+                .ok_or_else(|| crate::new_error!("snapshot source backing offset overflows"))?,
+        });
+    }
+    Ok(())
+}
+
+fn move_partial_host_pages(
+    layer_index: usize,
+    reused_pages: &mut [bool],
+    blob_gpa_start: u64,
+    host_page_size: usize,
+    new_pages: &mut Vec<NewPage>,
+) -> Result<()> {
+    if host_page_size < PAGE_SIZE || !host_page_size.is_multiple_of(PAGE_SIZE) {
+        return Err(crate::new_error!(
+            "host page size {host_page_size} is incompatible with guest page size {PAGE_SIZE}"
+        ));
+    }
+    if host_page_size == PAGE_SIZE {
+        return Ok(());
+    }
+
+    let pages_per_host_page = host_page_size / PAGE_SIZE;
+    for (host_page_index, pages) in reused_pages.chunks_mut(pages_per_host_page).enumerate() {
+        if pages.iter().all(|reused| *reused) {
+            continue;
+        }
+        for (page_index, reused) in pages.iter_mut().enumerate() {
+            if !*reused {
+                continue;
+            }
+            *reused = false;
+            let offset = host_page_index
+                .checked_mul(host_page_size)
+                .and_then(|offset| offset.checked_add(page_index * PAGE_SIZE))
+                .ok_or_else(|| crate::new_error!("snapshot reused-page offset overflows"))?;
+            let gpa = blob_gpa_start
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| crate::new_error!("snapshot reused-page GPA overflows"))?;
+            new_pages.push(NewPage {
+                source_gpa: gpa,
+                backing: GuestBacking::Snapshot {
+                    layer_index,
+                    offset,
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+struct NewPageRun {
+    source: Range<u64>,
+    destination_start: u64,
+}
+
+struct NewPageCopy {
+    backing: GuestBacking,
+    destination: Range<usize>,
+}
+
+fn backing_is_contiguous(first: GuestBacking, next: GuestBacking, len: usize) -> bool {
+    match (first, next) {
+        (
+            GuestBacking::Snapshot {
+                layer_index: first_layer,
+                offset: first_offset,
+            },
+            GuestBacking::Snapshot {
+                layer_index: next_layer,
+                offset: next_offset,
+            },
+        ) => first_layer == next_layer && first_offset.checked_add(len) == Some(next_offset),
+        (
+            GuestBacking::Scratch {
+                offset: first_offset,
+            },
+            GuestBacking::Scratch {
+                offset: next_offset,
+            },
+        ) => first_offset.checked_add(len) == Some(next_offset),
+        (
+            GuestBacking::Dynamic {
+                region_index: first_region,
+                offset: first_offset,
+            },
+            GuestBacking::Dynamic {
+                region_index: next_region,
+                offset: next_offset,
+            },
+        ) => first_region == next_region && first_offset.checked_add(len) == Some(next_offset),
+        _ => false,
+    }
+}
+
+fn new_page_copies(pages: &[NewPage]) -> Result<Vec<NewPageCopy>> {
+    let mut copies = Vec::<NewPageCopy>::new();
+    for (index, page) in pages.iter().enumerate() {
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| crate::new_error!("snapshot page offset overflows"))?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .ok_or_else(|| crate::new_error!("snapshot page range overflows"))?;
+        if let Some(copy) = copies.last_mut()
+            && backing_is_contiguous(copy.backing, page.backing, copy.destination.len())
+        {
+            copy.destination.end = end;
+        } else {
+            copies.push(NewPageCopy {
+                backing: page.backing,
+                destination: start..end,
+            });
+        }
+    }
+    Ok(copies)
+}
+
+fn new_page_runs(pages: &[NewPage], destination_start: u64) -> Result<Vec<NewPageRun>> {
+    let mut runs = Vec::<NewPageRun>::new();
+    for (index, page) in pages.iter().enumerate() {
+        let source_gpa = page.source_gpa;
+        let destination = destination_start
+            .checked_add(u64::try_from(index.checked_mul(PAGE_SIZE).ok_or_else(
+                || crate::new_error!("snapshot page offset overflows"),
+            )?)?)
+            .ok_or_else(|| crate::new_error!("snapshot page GPA overflows"))?;
+        if let Some(run) = runs.last_mut()
+            && run.source.end == source_gpa
+        {
+            run.source.end = run
+                .source
+                .end
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| crate::new_error!("snapshot source page run overflows"))?;
+        } else {
+            let source_end = source_gpa
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| crate::new_error!("snapshot source page overflows"))?;
+            runs.push(NewPageRun {
+                source: source_gpa..source_end,
+                destination_start: destination,
+            });
+        }
+    }
+    Ok(runs)
+}
+
+fn page_destination(runs: &[NewPageRun], source_gpa: u64) -> Option<u64> {
+    let index = runs.partition_point(|run| run.source.end <= source_gpa);
+    let run = runs.get(index)?;
+    let offset = source_gpa.checked_sub(run.source.start)?;
+    (source_gpa < run.source.end).then(|| run.destination_start.checked_add(offset))?
+}
+
+fn packed_data_len(page_count: usize, host_page_size: usize) -> Result<usize> {
+    let page_bytes = page_count
+        .checked_mul(PAGE_SIZE)
+        .ok_or_else(|| crate::new_error!("snapshot data size overflows"))?;
+    page_bytes
+        .checked_next_multiple_of(host_page_size)
+        .ok_or_else(|| crate::new_error!("snapshot data padding overflows"))
+}
+
+fn add_page_table_range(
+    tables: &mut BTreeSet<(usize, u8, u64)>,
+    root_index: usize,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = start
+        .checked_add(len - 1)
+        .ok_or_else(|| crate::new_error!("snapshot virtual mapping overflows"))?;
+    for shift in [39u8, 30, 21] {
+        for prefix in (start >> shift)..=(end >> shift) {
+            tables.insert((root_index, shift, prefix));
+        }
+    }
+    Ok(())
+}
+
+fn add_page_table_page(
+    tables: &mut BTreeSet<(usize, u8, u64)>,
+    previous_prefixes: &mut [Option<u64>; 3],
+    root_index: usize,
+    virt_gva: u64,
+) {
+    for (previous, shift) in previous_prefixes.iter_mut().zip([39u8, 30, 21]) {
+        let prefix = virt_gva >> shift;
+        if *previous != Some(prefix) {
+            tables.insert((root_index, shift, prefix));
+            *previous = Some(prefix);
+        }
+    }
+}
+
+fn first_fit_blob_gpa(data_len: usize, layers: &[SnapshotLayer], scratch_base: u64) -> Option<u64> {
+    if data_len == 0 {
+        return None;
+    }
+    let data_len = u64::try_from(data_len).ok()?;
+    let mut candidate = SandboxMemoryLayout::BASE_ADDRESS as u64;
+    for range in layers
+        .iter()
+        .map(|layer| layer.blob().data_gpa_range().gpa_range())
+    {
+        let end = candidate.checked_add(data_len)?;
+        if end <= range.start {
+            return Some(candidate);
+        }
+        candidate = candidate.max(range.end);
+    }
+    (candidate.checked_add(data_len)? <= scratch_base).then_some(candidate)
+}
+
+fn validate_layered_capture(
+    reused_mapping_count: usize,
+    projected_retained_bytes: usize,
+    layered_data_len: usize,
+    layered_gpa: Option<u64>,
+) -> Result<Option<u64>> {
+    let mapping_count = reused_mapping_count
+        .checked_add(usize::from(layered_data_len != 0))
+        .ok_or_else(|| crate::new_error!("snapshot mapping count overflows"))?;
+    if mapping_count > MAX_SNAPSHOT_MAPPINGS {
+        return Err(crate::new_error!(
+            "snapshot mapping count {} exceeds {}",
+            mapping_count,
+            MAX_SNAPSHOT_MAPPINGS
+        ));
+    }
+
+    if projected_retained_bytes > MAX_SNAPSHOT_RETAINED_BYTES {
+        return Err(crate::new_error!(
+            "snapshot retained byte count {} exceeds {}",
+            projected_retained_bytes,
+            MAX_SNAPSHOT_RETAINED_BYTES
+        ));
+    }
+
+    if layered_data_len == 0 {
+        Ok(None)
+    } else {
+        layered_gpa
+            .map(Some)
+            .ok_or_else(|| crate::new_error!("snapshot has no address space for a new layer"))
+    }
+}
+
+fn snapshot_mapping_kind(kind: MappingKind) -> Option<MappingKind> {
+    match kind {
+        MappingKind::Cow(mapping) => Some(MappingKind::Cow(mapping)),
+        MappingKind::Basic(mapping) if mapping.writable => Some(MappingKind::Cow(CowMapping {
+            readable: mapping.readable,
+            executable: mapping.executable,
+        })),
+        MappingKind::Basic(mapping) => Some(MappingKind::Basic(BasicMapping {
+            readable: mapping.readable,
+            writable: false,
+            executable: mapping.executable,
+        })),
+        MappingKind::ZeroInit(mapping) => Some(MappingKind::ZeroInit(mapping)),
+        MappingKind::Unmapped => None,
+    }
 }
 
 fn map_specials(pt_buf: &GuestPageTableBuffer, scratch_size: usize) {
@@ -513,160 +926,316 @@ impl Snapshot {
         if root_pt_gpas.is_empty() {
             return Err(crate::new_error!("snapshot has no page-table roots"));
         }
-        let mut phys_seen = HashMap::<u64, usize>::new();
         let scratch_gva = scratch_base_gva(layout.get_scratch_size());
         // SAFETY: The caller upholds the mapped-region lifetime and nonmutation
         // requirements for this call.
         let memory_view = unsafe {
             GuestPhysicalMemoryView::with_dynamic(shared_mem, scratch_mem, &regions, layout)
         };
-        let memory = {
-            // Phase 1: walk every PT root together. This detects
-            // aliased intermediate tables (e.g. Nanvix's kernel-
-            // half PTs, which multiple process PDs share by
-            // pointing at the same PT page). The walker emits
-            // `ThisSpace(leaf)` for private leaves and
-            // `AnotherSpace(ref)` for sub-trees that were already
-            // seen via an earlier root. Results are returned in
-            // `root_pt_gpas` order — which is also the topological
-            // order of the `AnotherSpace` references — so
-            // processing in iteration order is safe.
-            let op = PageTableReader::new(&memory_view, root_pt_gpas[0]);
-            let walk = unsafe {
-                vmem::walk_va_spaces(
-                    &op,
-                    root_pt_gpas,
-                    0,
-                    hyperlight_common::layout::SCRATCH_TOP_GVA as u64,
-                )
-            };
-            op.finish()?;
-
-            // Phase 2: rebuild each space's page tables, compacting
-            // `ThisSpace` leaves into a dense snapshot blob and
-            // linking `AnotherSpace` entries to already-built
-            // spaces' tables.
-            // TODO: Look for opportunities to hugepage map
-            let mut snapshot_memory: Vec<u8> = Vec::new();
-            let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
-            // Allocate one root table per space and remember the
-            // addresses returned by `alloc_table` instead of
-            // assuming the buffer's physical layout.
-            let mut root_addrs: Vec<u64> = Vec::with_capacity(root_pt_gpas.len());
-            root_addrs.push(pt_buf.initial_root());
-            for _ in 1..root_pt_gpas.len() {
-                root_addrs.push(unsafe { pt_buf.alloc_table() });
+        let mut unique_roots = BTreeSet::new();
+        for &root in root_pt_gpas {
+            if !root.is_multiple_of(PAGE_SIZE as u64) {
+                return Err(crate::new_error!(
+                    "snapshot page-table root {root:#x} is not aligned"
+                ));
             }
+            if !unique_roots.insert(root) {
+                return Err(crate::new_error!(
+                    "snapshot page-table root {root:#x} is duplicated"
+                ));
+            }
+            if memory_view.resolve(root, PAGE_SIZE).is_none() {
+                return Err(crate::new_error!(
+                    "snapshot page-table root {root:#x} is unbacked"
+                ));
+            }
+        }
+        // Walk every PT root together. This detects aliased intermediate
+        // tables (e.g. Nanvix's kernel-half PTs, which multiple process PDs
+        // share by pointing at the same PT page). Results retain topological
+        // order for cross-space table references.
+        let op = PageTableReader::new(&memory_view, root_pt_gpas[0]);
+        // SAFETY: Snapshot capture runs with the vCPU stopped, so the source
+        // page tables cannot change during the walk.
+        let walk = unsafe {
+            vmem::walk_va_spaces(
+                &op,
+                root_pt_gpas,
+                0,
+                hyperlight_common::layout::SCRATCH_TOP_GVA as u64,
+            )
+        };
+        op.finish()?;
+        let source_layers = shared_mem.reusable_layers();
+        let mut reused_pages = source_layers.map(|layers| {
+            layers
+                .iter()
+                .map(|layer| vec![false; layer.blob().data_gpa_range().len() / PAGE_SIZE])
+                .collect::<Vec<_>>()
+        });
+        let mut new_pages = Vec::new();
+        let mut required_tables = BTreeSet::new();
+        for (root_index, (_, mappings)) in walk.iter().enumerate() {
+            let mut previous_table_prefixes = [None; 3];
+            for mapping in mappings {
+                let SpaceAwareMapping::ThisSpace(mapping) = mapping else {
+                    continue;
+                };
+                if validate_mapping(mapping)? && !mapping_has_skipped_pages(mapping, scratch_gva)? {
+                    let mapping_len = usize::try_from(mapping.len)?;
+                    add_page_table_range(
+                        &mut required_tables,
+                        root_index,
+                        mapping.virt_base,
+                        mapping.len,
+                    )?;
+                    if matches!(mapping.kind, MappingKind::ZeroInit(_)) {
+                        continue;
+                    }
+                    if let Some(backing) = memory_view.resolve(mapping.phys_base, mapping_len) {
+                        record_backed_pages(
+                            backing,
+                            mapping.phys_base,
+                            mapping_len,
+                            reused_pages.as_deref_mut(),
+                            &mut new_pages,
+                        )?;
+                        continue;
+                    }
+                }
+                for_each_mapping_page(mapping, |source_gpa, virt_gva, kind| {
+                    if skip_virt(virt_gva, scratch_gva) {
+                        return Ok(());
+                    }
+                    add_page_table_page(
+                        &mut required_tables,
+                        &mut previous_table_prefixes,
+                        root_index,
+                        virt_gva,
+                    );
+                    if matches!(kind, MappingKind::ZeroInit(_)) {
+                        return Ok(());
+                    }
+                    let backing = memory_view.resolve(source_gpa, PAGE_SIZE).ok_or_else(|| {
+                        crate::new_error!("snapshot leaf names unbacked GPA {source_gpa:#x}")
+                    })?;
+                    record_backed_pages(
+                        backing,
+                        source_gpa,
+                        PAGE_SIZE,
+                        reused_pages.as_deref_mut(),
+                        &mut new_pages,
+                    )?;
+                    Ok(())
+                })?;
+            }
+            if let Some((_, io_gva)) = io_page() {
+                add_page_table_range(&mut required_tables, root_index, io_gva, PAGE_SIZE as u64)?;
+            }
+            add_page_table_range(
+                &mut required_tables,
+                root_index,
+                scratch_gva,
+                u64::try_from(layout.get_scratch_size())?,
+            )?;
+        }
+        let rebuilt_page_table_len = walk
+            .len()
+            .checked_add(required_tables.len())
+            .and_then(|count| count.checked_mul(PAGE_TABLE_SIZE))
+            .ok_or_else(|| crate::new_error!("snapshot page-table size overflows"))?;
+        drop(required_tables);
 
-            let mut built_roots: BTreeMap<SpaceId, u64> = BTreeMap::new();
-            for (root_idx, (space_id, mappings)) in walk.into_iter().enumerate() {
-                pt_buf.set_root(root_addrs[root_idx]);
-                built_roots.insert(space_id, root_addrs[root_idx]);
+        let host_page_size = page_size::get();
+        if let (Some(source_layers), Some(pages)) = (source_layers, reused_pages.as_mut()) {
+            for (layer_index, (layer, pages)) in source_layers.iter().zip(pages).enumerate() {
+                move_partial_host_pages(
+                    layer_index,
+                    pages,
+                    layer.blob().data_gpa_range().gpa_start(),
+                    host_page_size,
+                    &mut new_pages,
+                )?;
+            }
+        }
+        new_pages.sort_unstable_by_key(|page| page.source_gpa);
+        new_pages.dedup_by_key(|page| page.source_gpa);
 
-                for sam in mappings {
-                    match sam {
-                        SpaceAwareMapping::ThisSpace(mapping) => {
-                            // Drop the scratch region and (on
-                            // amd64) the snapshot's own PT
-                            // self-map; both are re-mapped
-                            // freshly by `map_specials`.
-                            if skip_virt(mapping.virt_base, scratch_gva) {
-                                continue;
+        let mut reused_layers =
+            if let (Some(source_layers), Some(pages)) = (source_layers, reused_pages.as_deref()) {
+                source_layers
+                    .iter()
+                    .zip(pages)
+                    .filter(|(_, pages)| pages.iter().any(|reused| *reused))
+                    .map(|(layer, pages)| {
+                        SnapshotLayer::new(layer.blob().clone(), coalesce_pages(pages))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+        let reused_mapping_count = reused_layers
+            .iter()
+            .map(|layer| layer.live_data_ranges().len())
+            .sum::<usize>();
+        let layered_data_len = packed_data_len(new_pages.len(), host_page_size)?;
+        let layered_gpa = first_fit_blob_gpa(
+            layered_data_len,
+            &reused_layers,
+            scratch_base_gpa(layout.get_scratch_size()),
+        );
+        // The cap runs before the tables are built, so this uses the predicted
+        // size. `debug_assert_eq!` below pins the prediction to what the
+        // rebuild produces.
+        let projected_retained_bytes = reused_layers
+            .iter()
+            .fold(0usize, |total, layer| {
+                total.saturating_add(layer.blob().memory().mem_size())
+            })
+            .saturating_add(
+                layered_data_len
+                    .saturating_add(rebuilt_page_table_len)
+                    .next_multiple_of(host_page_size),
+            );
+        let new_blob_gpa = validate_layered_capture(
+            reused_mapping_count,
+            projected_retained_bytes,
+            layered_data_len,
+            layered_gpa,
+        )?;
+
+        let data_len = layered_data_len;
+        let ordered_new_pages = new_pages;
+        let new_page_runs = new_blob_gpa.map_or_else(
+            || Ok(Vec::new()),
+            |destination_start| new_page_runs(&ordered_new_pages, destination_start),
+        )?;
+        let new_page_copies = new_page_copies(&ordered_new_pages)?;
+
+        let pt_buf = GuestPageTableBuffer::with_capacity(
+            layout.get_pt_base_gpa() as usize,
+            rebuilt_page_table_len,
+        );
+        let mut root_addrs = Vec::with_capacity(root_pt_gpas.len());
+        root_addrs.push(pt_buf.initial_root());
+        for _ in 1..root_pt_gpas.len() {
+            // SAFETY: `pt_buf` is local to this capture and accessed serially.
+            root_addrs.push(unsafe { pt_buf.alloc_table() });
+        }
+
+        let mut built_roots: BTreeMap<SpaceId, u64> = BTreeMap::new();
+        for (root_index, (space_id, mappings)) in walk.into_iter().enumerate() {
+            pt_buf.set_root(root_addrs[root_index]);
+            built_roots.insert(space_id, root_addrs[root_index]);
+            let mut pending_mapping: Option<Mapping> = None;
+            let flush_mapping = |pending: &mut Option<Mapping>| {
+                if let Some(mapping) = pending.take() {
+                    // SAFETY: The mapping is page-aligned and `pt_buf` is local
+                    // to this capture.
+                    unsafe { vmem::map(&pt_buf, mapping) };
+                }
+            };
+            for mapping in mappings {
+                match mapping {
+                    SpaceAwareMapping::ThisSpace(mapping) => {
+                        for_each_mapping_page(&mapping, |source_gpa, virt_gva, kind| {
+                            if skip_virt(virt_gva, scratch_gva) {
+                                flush_mapping(&mut pending_mapping);
+                                return Ok(());
                             }
-
-                            // Writable pages become CoW in the
-                            // rebuilt snapshot; read-only pages
-                            // stay read-only.
-                            let (kind, has_contents) = match mapping.kind {
-                                MappingKind::Cow(cm) => (MappingKind::Cow(cm), true),
-                                MappingKind::Basic(bm) if bm.writable => (
-                                    MappingKind::Cow(CowMapping {
-                                        readable: bm.readable,
-                                        executable: bm.executable,
-                                    }),
-                                    true,
-                                ),
-                                MappingKind::Basic(bm) => (
-                                    MappingKind::Basic(BasicMapping {
-                                        readable: bm.readable,
-                                        writable: false,
-                                        executable: bm.executable,
-                                    }),
-                                    true,
-                                ),
-                                MappingKind::Unmapped => continue,
-                                MappingKind::ZeroInit(bm) => (MappingKind::ZeroInit(bm), false),
-                            };
-                            let new_gpa = if has_contents {
-                                let mut contents = [0u8; PAGE_SIZE];
-                                if memory_view.read(mapping.phys_base, &mut contents).is_err() {
-                                    continue;
-                                }
-                                Some(*phys_seen.entry(mapping.phys_base).or_insert_with(|| {
-                                    let new_offset = snapshot_memory.len();
-                                    snapshot_memory.extend(&contents);
-                                    new_offset + SandboxMemoryLayout::BASE_ADDRESS
-                                }))
+                            let kind = snapshot_mapping_kind(kind).ok_or_else(|| {
+                                crate::new_error!("snapshot walker returned an unmapped leaf")
+                            })?;
+                            let destination_gpa =
+                                page_destination(&new_page_runs, source_gpa).unwrap_or(source_gpa);
+                            if let Some(pending) = pending_mapping.as_mut()
+                                && pending.kind == kind
+                                && pending.phys_base.checked_add(pending.len)
+                                    == Some(destination_gpa)
+                                && pending.virt_base.checked_add(pending.len) == Some(virt_gva)
+                            {
+                                pending.len =
+                                    pending.len.checked_add(PAGE_SIZE as u64).ok_or_else(|| {
+                                        crate::new_error!("snapshot mapping length overflows")
+                                    })?;
                             } else {
-                                None
-                            };
-
-                            let compacted = Mapping {
-                                phys_base: new_gpa.unwrap_or(0) as u64,
-                                virt_base: mapping.virt_base,
-                                len: PAGE_SIZE as u64,
-                                kind,
-                            };
-                            unsafe { vmem::map(&pt_buf, compacted) };
-                        }
-                        SpaceAwareMapping::AnotherSpace(ref_map) => {
-                            // Link to the owning space's already-
-                            // rebuilt intermediate table — this
-                            // is what preserves Nanvix's
-                            // kernel-half-shared invariant across
-                            // process PDs after relocation.
-                            unsafe {
-                                vmem::space_aware_map(&pt_buf, ref_map, &built_roots);
+                                flush_mapping(&mut pending_mapping);
+                                pending_mapping = Some(Mapping {
+                                    phys_base: destination_gpa,
+                                    virt_base: virt_gva,
+                                    len: PAGE_SIZE as u64,
+                                    kind,
+                                });
                             }
-                        }
+                            Ok(())
+                        })?;
+                    }
+                    SpaceAwareMapping::AnotherSpace(reference) => {
+                        flush_mapping(&mut pending_mapping);
+                        // Linking to the owning space's already-rebuilt
+                        // intermediate table preserves Nanvix's
+                        // kernel-half-shared invariant across process PDs
+                        // after relocation.
+                        // SAFETY: The reference came from the source walk and
+                        // `pt_buf` is local to this capture. The walk returns
+                        // spaces in topological order, so the owner named by
+                        // `reference` already has its root in `built_roots`.
+                        unsafe { vmem::space_aware_map(&pt_buf, reference, &built_roots) };
                     }
                 }
             }
+            flush_mapping(&mut pending_mapping);
+        }
 
-            // Phase 3: Map the scratch region into each root.
-            for &root_addr in &root_addrs {
-                pt_buf.set_root(root_addr);
-                map_specials(&pt_buf, layout.get_scratch_size());
+        for &root_addr in &root_addrs {
+            pt_buf.set_root(root_addr);
+            map_specials(&pt_buf, layout.get_scratch_size());
+        }
+        pt_buf.set_root(pt_buf.initial_root());
+        let page_tables = pt_buf.into_bytes();
+        debug_assert_eq!(page_tables.len(), rebuilt_page_table_len);
+        layout.ensure_page_tables_fit(page_tables.len())?;
+
+        let mut pt_allocation = ExclusiveSharedMemory::new(
+            page_tables
+                .len()
+                .checked_next_multiple_of(host_page_size)
+                .ok_or_else(|| crate::new_error!("snapshot page-table padding overflows"))?,
+        )?;
+        pt_allocation.copy_from_slice(&page_tables, 0)?;
+        let snapshot_page_tables = Arc::new(SnapshotPageTables::new(
+            pt_allocation.freeze()?,
+            page_tables.len(),
+        )?);
+
+        if data_len != 0 {
+            let allocation_len = data_len
+                .checked_next_multiple_of(host_page_size)
+                .ok_or_else(|| crate::new_error!("snapshot allocation padding overflows"))?;
+            let mut allocation = ExclusiveSharedMemory::new(allocation_len)?;
+            for copy in new_page_copies {
+                let destination = allocation
+                    .as_mut_slice()
+                    .get_mut(copy.destination)
+                    .ok_or_else(|| {
+                        crate::new_error!("snapshot destination page is out of bounds")
+                    })?;
+                memory_view.read_backing(copy.backing, destination)?;
             }
-            pt_buf.set_root(pt_buf.initial_root());
-
-            snapshot_memory.resize(
-                snapshot_memory.len().next_multiple_of(page_size::get()),
-                0u8,
-            );
-
-            // Phase 4: finalize PT bytes.
-            let pt_data = pt_buf.into_bytes();
-            layout.ensure_page_tables_fit(pt_data.len())?;
-            let page_table_len = pt_data.len();
-            snapshot_memory.extend(&pt_data);
-            (snapshot_memory, page_table_len)
-        };
-        // Only the data prefix is exposed to the guest. The PT tail
-        // sits past it in the host mapping and is copied into the
-        // scratch region on restore. Keeping it out of the guest
-        // mapping of the snapshot region avoids overlap with
-        // `map_file_cow` regions installed immediately after the
-        // snapshot in guest PA space.
-        let (memory, page_table_len) = memory;
-        let guest_visible_size = memory.len() - page_table_len;
-        debug_assert!(guest_visible_size.is_multiple_of(page_size::get()));
-        let storage = ReadonlySharedMemory::from_bytes(&memory)?;
-        let memory = Arc::new(Self::flat_snapshot_memory(
-            storage,
-            &layout,
-            guest_visible_size,
-            page_table_len,
+            let blob = Arc::new(SnapshotBlob::new(
+                allocation.freeze()?,
+                new_blob_gpa.ok_or_else(|| crate::new_error!("snapshot blob has no GPA"))?,
+                data_len,
+                scratch_base_gpa(layout.get_scratch_size()),
+            )?);
+            reused_layers.push(SnapshotLayer::new(
+                blob,
+                std::iter::once(0..data_len).collect(),
+            )?);
+        }
+        let memory = Arc::new(SnapshotMemory::new(
+            reused_layers.into_boxed_slice(),
+            snapshot_page_tables,
         )?);
 
         Ok(Self {
@@ -900,17 +1469,260 @@ mod tests {
     use std::sync::Arc;
 
     use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
-    use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind, PAGE_SIZE};
+    use hyperlight_common::vmem::{
+        self, BasicMapping, Mapping, MappingKind, PAGE_SIZE, PAGE_TABLE_SIZE,
+    };
 
     use super::SnapshotMemoryBacking;
     use crate::hypervisor::regs::CommonSpecialRegisters;
     use crate::mem::exe::LoadInfo;
     use crate::mem::layout::SandboxMemoryLayout;
-    use crate::mem::mgr::{GuestPageTableBuffer, SandboxMemoryManager};
+    use crate::mem::mgr::{
+        GuestBacking, GuestPageTableBuffer, GuestPhysicalMemoryView, SandboxMemoryManager,
+    };
     use crate::mem::shared_mem::{ExclusiveSharedMemory, HostSharedMemory, ReadonlySharedMemory};
 
     fn default_sregs() -> CommonSpecialRegisters {
         CommonSpecialRegisters::default()
+    }
+
+    #[test]
+    fn partial_host_pages_move_to_the_new_blob() {
+        let host_page_size = 4 * PAGE_SIZE;
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let mut reused = vec![true, true, false, false, true, true, true, true];
+        let mut copied = Vec::new();
+
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, host_page_size, &mut copied)
+            .unwrap();
+
+        assert_eq!(
+            reused,
+            vec![false, false, false, false, true, true, true, true]
+        );
+        assert_eq!(
+            copied
+                .iter()
+                .map(|page| page.source_gpa)
+                .collect::<Vec<_>>(),
+            vec![blob_gpa, blob_gpa + PAGE_SIZE as u64]
+        );
+        assert_eq!(
+            super::packed_data_len(copied.len(), host_page_size).unwrap(),
+            host_page_size
+        );
+    }
+
+    #[test]
+    fn partial_host_pages_move_from_the_final_group() {
+        let host_page_size = 4 * PAGE_SIZE;
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let mut reused = vec![true, true, true, true, true, false, true, false];
+        let mut copied = Vec::new();
+
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, host_page_size, &mut copied)
+            .unwrap();
+
+        assert_eq!(
+            reused,
+            vec![true, true, true, true, false, false, false, false]
+        );
+        assert_eq!(
+            copied
+                .iter()
+                .map(|page| page.source_gpa)
+                .collect::<Vec<_>>(),
+            vec![
+                blob_gpa + 4 * PAGE_SIZE as u64,
+                blob_gpa + 6 * PAGE_SIZE as u64
+            ]
+        );
+    }
+
+    /// Demotion splits one live run into several, and every run costs a
+    /// mapping. A layer that fits the cap on a 4K host can exceed it on a
+    /// host with larger pages.
+    #[test]
+    fn partial_host_pages_fragment_live_ranges() {
+        let host_page_size = 4 * PAGE_SIZE;
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let mut reused = vec![true; 16];
+        // Dirty one guest page in every second host page.
+        for index in [1, 9] {
+            reused[index] = false;
+        }
+        assert_eq!(super::coalesce_pages(&reused).len(), 3);
+
+        let mut copied = Vec::new();
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, host_page_size, &mut copied)
+            .unwrap();
+
+        // The two touched host pages lose every page they held, leaving the
+        // untouched host pages either side of them.
+        assert_eq!(super::coalesce_pages(&reused).len(), 2);
+        assert_eq!(copied.len(), 6);
+    }
+
+    fn new_page(source_gpa: u64, offset: usize) -> super::NewPage {
+        super::NewPage {
+            source_gpa,
+            backing: GuestBacking::Snapshot {
+                layer_index: 0,
+                offset,
+            },
+        }
+    }
+
+    #[test]
+    fn page_runs_map_each_source_to_its_destination() {
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let page = PAGE_SIZE as u64;
+        let destination = base + 0x10_0000;
+        // Two contiguous pages, then a gap, then one more.
+        let pages = [
+            new_page(base, 0),
+            new_page(base + page, PAGE_SIZE),
+            new_page(base + 8 * page, 8 * PAGE_SIZE),
+        ];
+
+        let runs = super::new_page_runs(&pages, destination).unwrap();
+        assert_eq!(runs.len(), 2);
+
+        // Destinations are packed in index order regardless of source gaps.
+        assert_eq!(super::page_destination(&runs, base), Some(destination));
+        assert_eq!(
+            super::page_destination(&runs, base + page),
+            Some(destination + page)
+        );
+        assert_eq!(
+            super::page_destination(&runs, base + 8 * page),
+            Some(destination + 2 * page)
+        );
+        // An address in the source gap belongs to no run.
+        assert_eq!(super::page_destination(&runs, base + 2 * page), None);
+        assert_eq!(super::page_destination(&runs, base + 9 * page), None);
+    }
+
+    #[test]
+    fn page_copies_merge_only_contiguous_backings() {
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let page = PAGE_SIZE as u64;
+        // Contiguous source addresses, but the third page comes from a
+        // backing offset that does not follow the second.
+        let pages = [
+            new_page(base, 0),
+            new_page(base + page, PAGE_SIZE),
+            new_page(base + 2 * page, 9 * PAGE_SIZE),
+        ];
+
+        let copies = super::new_page_copies(&pages).unwrap();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].destination, 0..2 * PAGE_SIZE);
+        assert_eq!(copies[1].destination, 2 * PAGE_SIZE..3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn blob_placement_respects_the_scratch_boundary() {
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let scratch_base = base + 2 * PAGE_SIZE as u64;
+
+        // An empty delta needs no address.
+        assert_eq!(super::first_fit_blob_gpa(0, &[], scratch_base), None);
+        // With nothing to reuse the delta lands at the base.
+        assert_eq!(
+            super::first_fit_blob_gpa(PAGE_SIZE, &[], scratch_base),
+            Some(base)
+        );
+        // Exactly filling the space below scratch is allowed.
+        assert_eq!(
+            super::first_fit_blob_gpa(2 * PAGE_SIZE, &[], scratch_base),
+            Some(base)
+        );
+        // One page more is not.
+        assert_eq!(
+            super::first_fit_blob_gpa(3 * PAGE_SIZE, &[], scratch_base),
+            None
+        );
+    }
+
+    #[test]
+    fn guest_sized_host_pages_need_no_regrouping() {
+        let blob_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let expected = vec![true, true, false, true];
+        let mut reused = expected.clone();
+        let mut copied = Vec::new();
+
+        super::move_partial_host_pages(0, &mut reused, blob_gpa, PAGE_SIZE, &mut copied).unwrap();
+
+        assert_eq!(reused, expected);
+        assert!(copied.is_empty());
+    }
+
+    #[test]
+    fn snapshot_page_policy_reuses_shared_and_copies_private_backings() {
+        let source_gpa = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let backing = GuestBacking::Snapshot {
+            layer_index: 0,
+            offset: 0,
+        };
+        let mut reused = vec![vec![false; 2]];
+        let mut copied = Vec::new();
+
+        super::record_backed_pages(
+            backing,
+            source_gpa,
+            2 * PAGE_SIZE,
+            Some(reused.as_mut_slice()),
+            &mut copied,
+        )
+        .unwrap();
+        assert_eq!(reused, [vec![true; 2]]);
+        assert!(copied.is_empty());
+
+        reused[0].fill(false);
+        super::record_backed_pages(backing, source_gpa, 2 * PAGE_SIZE, None, &mut copied).unwrap();
+        assert_eq!(reused, [vec![false; 2]]);
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].source_gpa, source_gpa);
+        assert_eq!(copied[0].backing, backing);
+        assert_eq!(copied[1].source_gpa, source_gpa + PAGE_SIZE as u64);
+        assert_eq!(
+            copied[1].backing,
+            GuestBacking::Snapshot {
+                layer_index: 0,
+                offset: PAGE_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn layered_capture_enforces_every_hard_limit() {
+        let gpa = Some(SandboxMemoryLayout::BASE_ADDRESS as u64);
+
+        assert_eq!(
+            super::validate_layered_capture(
+                super::MAX_SNAPSHOT_MAPPINGS,
+                super::MAX_SNAPSHOT_RETAINED_BYTES,
+                0,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            super::validate_layered_capture(
+                super::MAX_SNAPSHOT_MAPPINGS,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                gpa,
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_layered_capture(1, super::MAX_SNAPSHOT_RETAINED_BYTES + 1, 0, None,)
+                .is_err()
+        );
+        assert!(super::validate_layered_capture(1, PAGE_SIZE, PAGE_SIZE, None).is_err());
     }
 
     fn make_simple_pt_memory(contents: &[u8], pt_base: u64) -> super::SnapshotMemory {
@@ -930,18 +1742,11 @@ mod tests {
         let pt_bytes = pt_buf.into_bytes();
 
         let storage = ReadonlySharedMemory::from_bytes(contents).unwrap();
-        let page_tables = Arc::new(
-            super::SnapshotPageTables::new(
-                ReadonlySharedMemory::from_bytes(&pt_bytes).unwrap(),
-                pt_bytes.len(),
-            )
-            .unwrap(),
-        );
         super::SnapshotMemory::from_flat(
             storage,
             SandboxMemoryLayout::BASE_ADDRESS as u64,
             page_size::get(),
-            page_tables,
+            super::memory::page_tables_from_bytes(&pt_bytes),
             hyperlight_common::layout::scratch_base_gpa(PAGE_SIZE),
         )
         .unwrap()
@@ -977,6 +1782,186 @@ mod tests {
     }
 
     #[test]
+    fn capture_rejects_invalid_page_table_roots() {
+        let (manager, pt_base) = make_simple_pt_mgr();
+        for roots in [vec![pt_base, pt_base], vec![!(PAGE_SIZE as u64 - 1)]] {
+            // SAFETY: No dynamic regions are supplied.
+            let result = unsafe {
+                super::Snapshot::new(
+                    &manager.shared_mem,
+                    &manager.scratch_mem,
+                    manager.layout,
+                    LoadInfo::dummy(),
+                    Vec::new(),
+                    &roots,
+                    0,
+                    default_sregs(),
+                    #[cfg(target_arch = "x86_64")]
+                    Vec::new(),
+                    super::NextAction::None,
+                    0,
+                    1,
+                    HostFunctionDetails::default(),
+                    None,
+                )
+            };
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn capture_and_restore_preserve_multiple_page_table_roots() {
+        let cfg = crate::sandbox::SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, 4096, 0x3000, None).unwrap();
+        let pt_base = layout.get_pt_base_gpa();
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let pt_buf = GuestPageTableBuffer::new(pt_base as usize);
+        let first_root = pt_buf.initial_root();
+        let second_root = unsafe { <GuestPageTableBuffer as vmem::TableOps>::alloc_table(&pt_buf) };
+        let kind = MappingKind::Basic(BasicMapping {
+            readable: true,
+            writable: false,
+            executable: false,
+        });
+        unsafe {
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: base,
+                    virt_base: base,
+                    len: PAGE_SIZE as u64,
+                    kind,
+                },
+            );
+            pt_buf.set_root(second_root);
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: base + PAGE_SIZE as u64,
+                    virt_base: base + PAGE_SIZE as u64,
+                    len: PAGE_SIZE as u64,
+                    kind,
+                },
+            );
+        }
+        pt_buf.set_root(first_root);
+        let page_tables = pt_buf.into_bytes();
+        layout.ensure_page_tables_fit(page_tables.len()).unwrap();
+
+        let data_len = 2 * page_size::get();
+        let mut bytes = vec![0u8; data_len];
+        bytes[..PAGE_SIZE].fill(0x11);
+        bytes[PAGE_SIZE..2 * PAGE_SIZE].fill(0x22);
+        let memory = super::SnapshotMemory::from_flat(
+            ReadonlySharedMemory::from_bytes(&bytes).unwrap(),
+            base,
+            data_len,
+            super::memory::page_tables_from_bytes(&page_tables),
+            hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size()),
+        )
+        .unwrap();
+        let manager = SandboxMemoryManager::new(
+            layout,
+            SnapshotMemoryBacking::from_snapshot(Arc::new(memory)).unwrap(),
+            ExclusiveSharedMemory::new(layout.get_scratch_size()).unwrap(),
+            super::NextAction::None,
+        );
+        let (mut manager, _) = manager.build().unwrap();
+
+        // SAFETY: No dynamic regions are supplied.
+        let snapshot = unsafe {
+            super::Snapshot::new(
+                &manager.shared_mem,
+                &manager.scratch_mem,
+                manager.layout,
+                LoadInfo::dummy(),
+                Vec::new(),
+                &[first_root, second_root],
+                0,
+                default_sregs(),
+                #[cfg(target_arch = "x86_64")]
+                Vec::new(),
+                super::NextAction::None,
+                0,
+                1,
+                HostFunctionDetails::default(),
+                None,
+            )
+        }
+        .unwrap();
+        let rebuilt_first_root = snapshot.root_pt_gpa();
+        let rebuilt_second_root = rebuilt_first_root + PAGE_TABLE_SIZE as u64;
+        let roots = [rebuilt_first_root, rebuilt_second_root];
+        let walked = unsafe { vmem::walk_va_spaces(&snapshot, &roots, base, 2 * PAGE_SIZE as u64) };
+        assert_eq!(walked.len(), 2);
+        assert!(walked[0].1.iter().any(|mapping| matches!(
+            mapping,
+            vmem::SpaceAwareMapping::ThisSpace(mapping) if mapping.virt_base == base
+        )));
+        assert!(walked[1].1.iter().any(|mapping| matches!(
+            mapping,
+            vmem::SpaceAwareMapping::ThisSpace(mapping)
+                if mapping.virt_base == base + PAGE_SIZE as u64
+        )));
+
+        manager.restore_snapshot(&snapshot).unwrap();
+        let memory =
+            GuestPhysicalMemoryView::new(&manager.shared_mem, &manager.scratch_mem, manager.layout);
+        for (root, gva, expected) in [
+            (rebuilt_first_root, base, 0x11),
+            (rebuilt_second_root, base + PAGE_SIZE as u64, 0x22),
+        ] {
+            let reader = super::PageTableReader::new(&memory, root);
+            let mapping = unsafe { vmem::virt_to_phys(&reader, gva, 1) }
+                .next()
+                .unwrap();
+            let gpa = mapping.phys_base + gva - mapping.virt_base;
+            let mut byte = [0u8; 1];
+            memory.read(gpa, &mut byte).unwrap();
+            assert_eq!(byte, [expected]);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn capture_rejects_unbacked_intermediate_page_table() {
+        let (manager, pt_base) = make_simple_pt_mgr();
+        let scratch_base =
+            hyperlight_common::layout::scratch_base_gpa(manager.layout.get_scratch_size());
+        let root_offset = usize::try_from(pt_base - scratch_base).unwrap();
+        let invalid_entry = (0xdead_0000 | vmem::PAGE_PRESENT).to_le_bytes();
+        manager
+            .scratch_mem
+            .copy_from_slice(&invalid_entry, root_offset)
+            .unwrap();
+
+        // SAFETY: No dynamic regions are supplied.
+        let result = unsafe {
+            super::Snapshot::new(
+                &manager.shared_mem,
+                &manager.scratch_mem,
+                manager.layout,
+                LoadInfo::dummy(),
+                Vec::new(),
+                &[pt_base],
+                0,
+                default_sregs(),
+                Vec::new(),
+                super::NextAction::None,
+                0,
+                1,
+                HostFunctionDetails::default(),
+                None,
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("capture unexpectedly accepted an unbacked page table"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("accessed unbacked memory"));
+    }
+
+    #[test]
     fn multiple_snapshots_independent() {
         let (mut mgr, pt_base) = make_simple_pt_mgr();
 
@@ -1004,6 +1989,7 @@ mod tests {
             )
         }
         .unwrap();
+        assert_eq!(snapshot_a.snapshot_memory().layers().len(), 1);
 
         // Create second snapshot with pattern B
         let pattern_b = vec![0xBB; page_size::get()];
@@ -1071,5 +2057,391 @@ mod tests {
         assert_eq!(entry, 0);
         let error = reader.finish().unwrap_err().to_string();
         assert!(error.contains("accessed unbacked memory"), "{error}");
+    }
+
+    #[test]
+    fn capture_reuses_shared_pages_and_materializes_private_pages() {
+        let cfg = crate::sandbox::SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, 4096, 0x3000, None).unwrap();
+        let pt_base = layout.get_pt_base_gpa();
+        let scratch_offset = layout.get_scratch_size() / 2;
+        let scratch_gpa = hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size())
+            + scratch_offset as u64;
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+
+        let pt_buf = GuestPageTableBuffer::new(pt_base as usize);
+        // SAFETY: The page-aligned mappings are written serially to this local
+        // page-table buffer.
+        unsafe {
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: base,
+                    virt_base: base,
+                    len: PAGE_SIZE as u64,
+                    kind: MappingKind::Basic(BasicMapping {
+                        readable: true,
+                        writable: false,
+                        executable: true,
+                    }),
+                },
+            );
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: scratch_gpa,
+                    virt_base: base + (2 * PAGE_SIZE) as u64,
+                    len: PAGE_SIZE as u64,
+                    kind: MappingKind::Basic(BasicMapping {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    }),
+                },
+            );
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: scratch_gpa,
+                    virt_base: base + PAGE_SIZE as u64,
+                    len: PAGE_SIZE as u64,
+                    kind: MappingKind::Basic(BasicMapping {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    }),
+                },
+            );
+        }
+        super::map_specials(&pt_buf, layout.get_scratch_size());
+        let page_tables = pt_buf.into_bytes();
+        layout.ensure_page_tables_fit(page_tables.len()).unwrap();
+
+        let mut source_bytes = vec![0u8; 2 * PAGE_SIZE];
+        source_bytes[..PAGE_SIZE].fill(0x11);
+        source_bytes[PAGE_SIZE..2 * PAGE_SIZE].fill(0x22);
+        let storage = ReadonlySharedMemory::from_bytes(&source_bytes).unwrap();
+        let source = super::SnapshotMemory::from_flat(
+            storage,
+            base,
+            2 * PAGE_SIZE,
+            super::memory::page_tables_from_bytes(&page_tables),
+            hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size()),
+        )
+        .unwrap();
+        let source_blob = source.layers()[0].blob().clone();
+        let managed = SnapshotMemoryBacking::from_snapshot(Arc::new(source)).unwrap();
+        let scratch = ExclusiveSharedMemory::new(layout.get_scratch_size()).unwrap();
+        let manager = SandboxMemoryManager::new(layout, managed, scratch, super::NextAction::None);
+        let (manager, _) = manager.build().unwrap();
+        let reuses_source_layers = manager.shared_mem.reusable_layers().is_some();
+        #[cfg(gdb)]
+        manager
+            .shared_mem
+            .write_snapshot_gpa(base, &[0x44; PAGE_SIZE])
+            .unwrap();
+        let mut source_page = [0u8; PAGE_SIZE];
+        manager
+            .shared_mem
+            .read_snapshot_gpa(base, &mut source_page)
+            .unwrap();
+        manager
+            .scratch_mem
+            .copy_from_slice(&vec![0x33; PAGE_SIZE], scratch_offset)
+            .unwrap();
+
+        // SAFETY: No dynamic regions are supplied.
+        let captured = unsafe {
+            super::Snapshot::new(
+                &manager.shared_mem,
+                &manager.scratch_mem,
+                manager.layout,
+                LoadInfo::dummy(),
+                Vec::new(),
+                &[pt_base],
+                0,
+                default_sregs(),
+                #[cfg(target_arch = "x86_64")]
+                Vec::new(),
+                super::NextAction::None,
+                0,
+                1,
+                HostFunctionDetails::default(),
+                None,
+            )
+        }
+        .unwrap();
+
+        let layers = captured.snapshot_memory().layers();
+        let delta_gpa = if reuses_source_layers {
+            assert_eq!(layers.len(), 2);
+            assert!(std::sync::Arc::ptr_eq(layers[0].blob(), &source_blob));
+            assert_eq!(layers[0].live_data_ranges().len(), 1);
+            assert_eq!(layers[0].live_data_ranges()[0], 0..PAGE_SIZE);
+            assert_eq!(layers[1].blob().data_gpa_range().len(), PAGE_SIZE);
+            assert_eq!(
+                layers[1].blob().data_gpa_range().gpa_start(),
+                base + (2 * PAGE_SIZE) as u64
+            );
+            base + (2 * PAGE_SIZE) as u64
+        } else {
+            assert_eq!(layers.len(), 1);
+            assert!(!std::sync::Arc::ptr_eq(layers[0].blob(), &source_blob));
+            assert_eq!(layers[0].blob().data_gpa_range().len(), 2 * PAGE_SIZE);
+            assert_eq!(layers[0].blob().data_gpa_range().gpa_start(), base);
+            base + PAGE_SIZE as u64
+        };
+        assert_eq!(
+            captured
+                .snapshot_memory()
+                .resolve(base + PAGE_SIZE as u64, PAGE_SIZE)
+                .is_none(),
+            reuses_source_layers
+        );
+
+        // SAFETY: `captured` is immutable for the duration of this walk.
+        let mappings = unsafe { vmem::virt_to_phys(&captured, base, 3 * PAGE_SIZE as u64) }
+            .collect::<Vec<_>>();
+        assert_eq!(mappings.len(), 3);
+        assert_eq!(mappings[0].phys_base, base);
+        assert_eq!(mappings[1].phys_base, delta_gpa);
+        assert_eq!(mappings[2].phys_base, mappings[1].phys_base);
+        assert_eq!(
+            mappings[0].kind,
+            MappingKind::Basic(BasicMapping {
+                readable: true,
+                writable: false,
+                executable: true,
+            })
+        );
+        assert_eq!(
+            mappings[1].kind,
+            MappingKind::Cow(hyperlight_common::vmem::CowMapping {
+                readable: true,
+                executable: false,
+            })
+        );
+        let (delta_layer, delta_offset) = captured
+            .snapshot_memory()
+            .resolve(mappings[1].phys_base, PAGE_SIZE)
+            .unwrap();
+        assert_eq!(
+            layers[delta_layer].blob().memory().as_slice()[delta_offset..delta_offset + PAGE_SIZE],
+            [0x33; PAGE_SIZE]
+        );
+        let (retained_layer, retained_offset) =
+            captured.snapshot_memory().resolve(base, PAGE_SIZE).unwrap();
+        assert_eq!(
+            layers[retained_layer].blob().memory().as_slice()
+                [retained_offset..retained_offset + PAGE_SIZE],
+            source_page
+        );
+        if reuses_source_layers {
+            assert!(
+                captured
+                    .snapshot_memory()
+                    .resolve(base + PAGE_SIZE as u64, PAGE_SIZE)
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                layers[0].blob().memory().as_slice()[PAGE_SIZE..2 * PAGE_SIZE],
+                [0x33; PAGE_SIZE]
+            );
+        }
+    }
+
+    #[test]
+    fn capture_rejects_leaf_into_page_table_tail() {
+        let cfg = crate::sandbox::SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, 4096, 0x3000, None).unwrap();
+        let pt_base = layout.get_pt_base_gpa();
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+        let pt_buf = GuestPageTableBuffer::new(pt_base as usize);
+        // SAFETY: The page-aligned mapping is written to a local page-table
+        // buffer with no concurrent access.
+        unsafe {
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: base + PAGE_SIZE as u64,
+                    virt_base: base,
+                    len: PAGE_SIZE as u64,
+                    kind: MappingKind::Basic(BasicMapping {
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                    }),
+                },
+            );
+        }
+        super::map_specials(&pt_buf, layout.get_scratch_size());
+        let page_tables = pt_buf.into_bytes();
+        layout.ensure_page_tables_fit(page_tables.len()).unwrap();
+
+        let bytes = vec![0u8; PAGE_SIZE];
+        let source = super::SnapshotMemory::from_flat(
+            ReadonlySharedMemory::from_bytes(&bytes).unwrap(),
+            base,
+            PAGE_SIZE,
+            super::memory::page_tables_from_bytes(&page_tables),
+            hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size()),
+        )
+        .unwrap();
+        let manager = SandboxMemoryManager::new(
+            layout,
+            SnapshotMemoryBacking::from_snapshot(Arc::new(source)).unwrap(),
+            ExclusiveSharedMemory::new(layout.get_scratch_size()).unwrap(),
+            super::NextAction::None,
+        );
+        let (manager, _) = manager.build().unwrap();
+
+        // SAFETY: No dynamic regions are supplied.
+        let result = unsafe {
+            super::Snapshot::new(
+                &manager.shared_mem,
+                &manager.scratch_mem,
+                manager.layout,
+                LoadInfo::dummy(),
+                Vec::new(),
+                &[pt_base],
+                0,
+                default_sregs(),
+                #[cfg(target_arch = "x86_64")]
+                Vec::new(),
+                super::NextAction::None,
+                0,
+                1,
+                HostFunctionDetails::default(),
+                None,
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("capture unexpectedly accepted a page-table-tail leaf"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot leaf names unbacked GPA")
+        );
+    }
+
+    #[test]
+    fn capture_rejects_delta_exceeding_mapping_limit() {
+        let cfg = crate::sandbox::SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, 4096, 0x3000, None).unwrap();
+        let pt_base = layout.get_pt_base_gpa();
+        let scratch_offset = layout.get_scratch_size() / 2;
+        let scratch_gpa = hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size())
+            + scratch_offset as u64;
+        let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+
+        let pt_buf = GuestPageTableBuffer::new(pt_base as usize);
+        for index in 0..super::MAX_SNAPSHOT_MAPPINGS {
+            // SAFETY: The page-aligned mapping is written to a local page-table
+            // buffer with no concurrent access.
+            unsafe {
+                vmem::map(
+                    &pt_buf,
+                    Mapping {
+                        phys_base: base + (2 * index * PAGE_SIZE) as u64,
+                        virt_base: base + (index * PAGE_SIZE) as u64,
+                        len: PAGE_SIZE as u64,
+                        kind: MappingKind::Basic(BasicMapping {
+                            readable: true,
+                            writable: false,
+                            executable: false,
+                        }),
+                    },
+                );
+            }
+        }
+        // SAFETY: The page-aligned mapping is written to a local page-table
+        // buffer with no concurrent access.
+        unsafe {
+            vmem::map(
+                &pt_buf,
+                Mapping {
+                    phys_base: scratch_gpa,
+                    virt_base: base + (super::MAX_SNAPSHOT_MAPPINGS * PAGE_SIZE) as u64,
+                    len: PAGE_SIZE as u64,
+                    kind: MappingKind::Basic(BasicMapping {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    }),
+                },
+            );
+        }
+        super::map_specials(&pt_buf, layout.get_scratch_size());
+        let page_tables = pt_buf.into_bytes();
+        layout.ensure_page_tables_fit(page_tables.len()).unwrap();
+
+        let data_pages = 2 * super::MAX_SNAPSHOT_MAPPINGS - 1;
+        let data_len = data_pages * PAGE_SIZE;
+        let mut source_bytes = vec![0u8; data_len];
+        let live_data = (0..super::MAX_SNAPSHOT_MAPPINGS)
+            .map(|index| {
+                let start = 2 * index * PAGE_SIZE;
+                source_bytes[start..start + PAGE_SIZE].fill(index as u8);
+                start..start + PAGE_SIZE
+            })
+            .collect();
+        let storage = ReadonlySharedMemory::from_bytes(&source_bytes).unwrap();
+        let source_blob = std::sync::Arc::new(
+            super::SnapshotBlob::new(
+                storage,
+                base,
+                data_len,
+                hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size()),
+            )
+            .unwrap(),
+        );
+        let source_layer = super::SnapshotLayer::new(source_blob.clone(), live_data).unwrap();
+        let source = super::SnapshotMemory::new(
+            Box::new([source_layer]),
+            super::memory::page_tables_from_bytes(&page_tables),
+        )
+        .unwrap();
+        let managed = SnapshotMemoryBacking::from_snapshot(Arc::new(source)).unwrap();
+        let scratch = ExclusiveSharedMemory::new(layout.get_scratch_size()).unwrap();
+        let manager = SandboxMemoryManager::new(layout, managed, scratch, super::NextAction::None);
+        let (mut manager, _) = manager.build().unwrap();
+        manager
+            .scratch_mem
+            .copy_from_slice(&vec![0x55; PAGE_SIZE], scratch_offset)
+            .unwrap();
+
+        // SAFETY: No dynamic regions are supplied.
+        let result = unsafe {
+            manager.snapshot(
+                Vec::new(),
+                &[pt_base],
+                0,
+                default_sregs(),
+                #[cfg(target_arch = "x86_64")]
+                Vec::new(),
+                super::NextAction::None,
+                HostFunctionDetails::default(),
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("capture unexpectedly exceeded the mapping limit"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("mapping count 31 exceeds 30"));
+        assert_eq!(manager.snapshot_count, 0);
+        assert_eq!(manager.shared_mem.layers().len(), 1);
+        assert!(std::sync::Arc::ptr_eq(
+            manager.shared_mem.layers()[0].blob(),
+            &source_blob
+        ));
+        assert_eq!(
+            manager.scratch_mem.read::<u8>(scratch_offset).unwrap(),
+            0x55
+        );
     }
 }
