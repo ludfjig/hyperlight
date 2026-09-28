@@ -35,8 +35,8 @@ Four blob kinds per tag:
 * **config** (`application/vnd.hyperlight.snapshot.config.v3+json`). The
   snapshot descriptor: arch, hypervisor, CPU vendor, ABI version,
   resume address and captured registers, memory and transport layout,
-  registered host functions, and snapshot generation counter. Loaded
-  eagerly and fully parsed.
+  registered host functions, snapshot generation counter, and namespaced
+  application metadata. Loaded eagerly and fully parsed.
 * **layer / memory** (`application/vnd.hyperlight.snapshot.memory.v1`).
   The raw guest memory image, exactly `memory_size` bytes. mmap'd on
   restore.
@@ -50,6 +50,18 @@ The runtime queue protocol and canonical checkpoint are described in
 
 Blob filenames are the sha256 of the blob bytes, so identical blobs
 across tags are stored once.
+
+## Application metadata
+
+`Snapshot::with_metadata` creates a snapshot that shares the source snapshot's
+sandbox state and stores a serializable value under an application-owned
+namespace. `Snapshot::metadata` deserializes the value for that namespace.
+The source snapshot remains unchanged.
+
+Metadata is stored in the config blob as a JSON object with namespaces as
+keys. Snapshots without metadata omit the field. The loader treats a missing
+field as an empty map, so snapshots written before metadata support remain
+loadable. Metadata counts toward the config blob size limit.
 
 ## Transport framing
 

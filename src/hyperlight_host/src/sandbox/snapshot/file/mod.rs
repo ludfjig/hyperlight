@@ -654,6 +654,7 @@ impl Snapshot {
             memory_size: self.state.memory.mem_size() as u64,
             host_functions,
             snapshot_generation: self.state.snapshot_generation,
+            metadata: self.metadata.clone(),
         })
     }
 
@@ -972,6 +973,7 @@ impl Snapshot {
                 host_functions,
                 virtq: Some(virtq),
             }),
+            metadata: cfg.metadata,
         })
     }
 }

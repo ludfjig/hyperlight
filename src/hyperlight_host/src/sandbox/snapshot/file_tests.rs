@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use hyperlight_testing::{c_simple_guest_as_pathbuf, simple_guest_as_pathbuf};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -48,6 +49,12 @@ fn libc_rng_reseed_request(sandbox: &MultiUseSandbox) -> u64 {
 fn create_snapshot() -> Arc<Snapshot> {
     let mut sbox = create_test_sandbox();
     sbox.snapshot().unwrap()
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TestMetadata {
+    format_version: u32,
+    runtime: String,
 }
 
 /// `Result::unwrap_err` requires `T: Debug`, but `Snapshot` is not
@@ -143,6 +150,45 @@ fn from_snapshot_in_memory_pre_init() {
     assert_eq!(result, 0);
 }
 
+#[test]
+fn snapshot_metadata_is_immutable_and_shares_state() {
+    let snapshot = create_snapshot();
+    let metadata = TestMetadata {
+        format_version: 1,
+        runtime: "test".to_string(),
+    };
+
+    let with_metadata = snapshot
+        .with_metadata("snapshot-metadata-namespace-v1", &metadata)
+        .unwrap();
+
+    assert!(Arc::ptr_eq(&snapshot.state, &with_metadata.state));
+    assert_eq!(
+        snapshot
+            .metadata::<TestMetadata>("snapshot-metadata-namespace-v1")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        with_metadata
+            .metadata::<TestMetadata>("snapshot-metadata-namespace-v1")
+            .unwrap(),
+        Some(metadata)
+    );
+}
+
+#[test]
+fn snapshot_metadata_namespaces_are_independent() {
+    let snapshot = create_snapshot();
+    let first = snapshot.with_metadata("first", &1_u32).unwrap();
+    let second = first.with_metadata("second", &2_u32).unwrap();
+    let replaced = second.with_metadata("first", &3_u32).unwrap();
+
+    assert_eq!(second.metadata::<u32>("first").unwrap(), Some(1));
+    assert_eq!(replaced.metadata::<u32>("first").unwrap(), Some(3));
+    assert_eq!(replaced.metadata::<u32>("second").unwrap(), Some(2));
+}
+
 // Round-trip via OCI layout on disk.
 
 #[test]
@@ -161,6 +207,59 @@ fn round_trip_save_load_call() {
 
     let result: String = sbox2.call("Echo", "hello\n".to_string()).unwrap();
     assert_eq!(result, "hello\n");
+}
+
+#[test]
+fn snapshot_metadata_round_trip() {
+    let metadata = TestMetadata {
+        format_version: 1,
+        runtime: "test".to_string(),
+    };
+    let snapshot = create_snapshot()
+        .with_metadata("snapshot-metadata-namespace-v1", &metadata)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata");
+
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(find_config_blob(&path)).unwrap()).unwrap();
+    assert_eq!(
+        config["metadata"],
+        serde_json::json!({
+            "snapshot-metadata-namespace-v1": {
+                "format_version": 1,
+                "runtime": "test",
+            }
+        })
+    );
+    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+
+    assert_eq!(
+        loaded
+            .metadata::<TestMetadata>("snapshot-metadata-namespace-v1")
+            .unwrap(),
+        Some(metadata)
+    );
+}
+
+#[test]
+fn snapshot_without_metadata_omits_config_field() {
+    let snapshot = create_snapshot();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata");
+
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(find_config_blob(&path)).unwrap()).unwrap();
+    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+
+    assert!(config.get("metadata").is_none());
+    assert_eq!(loaded.metadata::<Value>("missing").unwrap(), None);
 }
 
 /// A pre-existing snapshot blob with the right length but wrong

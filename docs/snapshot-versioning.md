@@ -50,6 +50,9 @@ The config blob also records `hyperlight_version`, the `CARGO_PKG_VERSION`
 of the host crate at write time. This is informational only. The loader
 records it for diagnostics and does not gate loading on it.
 
+The optional `metadata` field stores application-owned values by namespace.
+Writers omit an empty map, and readers treat a missing field as empty.
+
 ## Compatibility cleanup
 
 Record compatibility paths here when a future hard snapshot break can remove

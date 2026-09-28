@@ -59,6 +59,8 @@ pub enum NextAction {
 /// An immutable snapshot of sandbox state.
 pub struct Snapshot {
     state: Arc<SnapshotState>,
+    // Stable key order keeps config bytes deterministic.
+    metadata: BTreeMap<String, serde_json::Value>,
 }
 
 /// Immutable sandbox state held by a snapshot.
@@ -425,6 +427,7 @@ impl Snapshot {
                 },
                 virtq: None,
             }),
+            metadata: BTreeMap::new(),
         })
     }
 
@@ -617,7 +620,95 @@ impl Snapshot {
                 host_functions,
                 virtq,
             }),
+            metadata: BTreeMap::new(),
         })
+    }
+
+    /// Deserializes the metadata stored under `namespace` as `T`.
+    ///
+    /// Returns `None` if the namespace has no metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON metadata cannot be deserialized as `T`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use hyperlight_host::sandbox::snapshot::Snapshot;
+    /// # use serde::{Deserialize, Serialize};
+    /// #
+    /// #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    /// struct Metadata {
+    ///     version: u32,
+    /// }
+    ///
+    /// # fn example(snapshot: Arc<Snapshot>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let snapshot =
+    ///     snapshot.with_metadata("snapshot-metadata-namespace-v1", &Metadata { version: 1 })?;
+    /// let metadata = snapshot
+    ///     .metadata::<Metadata>("snapshot-metadata-namespace-v1")?
+    ///     .expect("metadata should exist");
+    /// assert_eq!(metadata, Metadata { version: 1 });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn metadata<T>(&self, namespace: &str) -> Result<Option<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.metadata
+            .get(namespace)
+            .map(serde::Deserialize::deserialize)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Adds `metadata` to this snapshot and returns the result as a new
+    /// snapshot. Metadata already stored under `namespace` is replaced.
+    ///
+    /// This snapshot remains unchanged.
+    /// Metadata is saved and loaded with the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `metadata` cannot be serialized as JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use hyperlight_host::sandbox::snapshot::Snapshot;
+    /// # use serde::{Deserialize, Serialize};
+    /// #
+    /// #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    /// struct Metadata {
+    ///     version: u32,
+    /// }
+    ///
+    /// # fn example(snapshot: Arc<Snapshot>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let snapshot =
+    ///     snapshot.with_metadata("snapshot-metadata-namespace-v1", &Metadata { version: 1 })?;
+    /// let metadata = snapshot
+    ///     .metadata::<Metadata>("snapshot-metadata-namespace-v1")?
+    ///     .expect("metadata should exist");
+    /// assert_eq!(metadata, Metadata { version: 1 });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_metadata<T>(&self, namespace: impl Into<String>, metadata: &T) -> Result<Arc<Self>>
+    where
+        T: serde::Serialize,
+    {
+        let namespace = namespace.into();
+        let metadata = serde_json::to_value(metadata)?;
+        let mut metadata_by_namespace = self.metadata.clone();
+        metadata_by_namespace.insert(namespace, metadata);
+        Ok(Arc::new(Self {
+            state: Arc::clone(&self.state),
+            metadata: metadata_by_namespace,
+        }))
     }
 
     /// Generation number assigned to this snapshot when it was taken.

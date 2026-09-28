@@ -5,6 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Prerelease] - Unreleased
 
 ### Added
+* Namespaced application metadata on immutable snapshots.
 * Per-direction virtqueue configuration through `SandboxConfiguration` and
   `SandboxBuilder`, with allocations included in scratch sizing.
 * Shared virtqueue framing with a 12-byte `MsgHeader` and external byte values.

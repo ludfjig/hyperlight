@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025 The Hyperlight Authors.
 
+use std::collections::BTreeMap;
+
 use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ReturnType};
 use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
 use hyperlight_common::vmem::PAGE_SIZE;
@@ -199,6 +201,9 @@ pub(super) struct OciSnapshotConfig {
     /// `SCRATCH_TOP_SNAPSHOT_GENERATION_OFFSET` is continuous across
     /// save/load.
     pub(super) snapshot_generation: u64,
+    /// Application-owned metadata keyed by namespace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) metadata: BTreeMap<String, serde_json::Value>,
 }
 
 /// Sizes and permissions of the regions inside the snapshot blob,
@@ -852,6 +857,7 @@ mod tests {
             memory_size: PAGE_SIZE as u64,
             host_functions: Vec::new(),
             snapshot_generation: 0,
+            metadata: BTreeMap::new(),
         }
     }
 
