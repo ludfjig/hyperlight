@@ -48,6 +48,13 @@ Four blob kinds per tag:
 The runtime queue protocol and canonical checkpoint are described in
 [Virtqueue host and guest communication](./virtio-host-guest-communication.md).
 
+The loader also accepts config v4 with ABI 6. Its manifest holds one or
+more `application/vnd.hyperlight.snapshot.memory.v2` data layers, one
+`application/vnd.hyperlight.snapshot.page-tables.v1` layer, and one
+transport v1 layer, in that order. Config v4 records each data layer's
+guest physical range and live ranges, plus the page-table length.
+`Snapshot::save` continues to write config v3 with ABI 5.
+
 Blob filenames are the sha256 of the blob bytes, so identical blobs
 across tags are stored once.
 

@@ -10,15 +10,15 @@ pub(in crate::sandbox::snapshot) const MT_CONFIG_V2: &str =
     "application/vnd.hyperlight.snapshot.config.v2+json";
 pub(in crate::sandbox::snapshot) const MT_CONFIG_V3: &str =
     "application/vnd.hyperlight.snapshot.config.v3+json";
-#[allow(dead_code)]
 pub(in crate::sandbox::snapshot) const MT_CONFIG_V4: &str =
     "application/vnd.hyperlight.snapshot.config.v4+json";
 pub(in crate::sandbox::snapshot) const MT_CONFIG_CURRENT: &str = MT_CONFIG_V3;
 pub(in crate::sandbox::snapshot) const MT_SNAPSHOT_V1: &str =
     "application/vnd.hyperlight.snapshot.memory.v1";
-#[allow(dead_code)]
 pub(in crate::sandbox::snapshot) const MT_SNAPSHOT_V2: &str =
     "application/vnd.hyperlight.snapshot.memory.v2";
+pub(in crate::sandbox::snapshot) const MT_PAGE_TABLES_V1: &str =
+    "application/vnd.hyperlight.snapshot.page-tables.v1";
 pub(in crate::sandbox::snapshot) const MT_SNAPSHOT_CURRENT: &str = MT_SNAPSHOT_V1;
 pub(in crate::sandbox::snapshot) const MT_TRANSPORT_V1: &str =
     "application/vnd.hyperlight.snapshot.transport.v1";

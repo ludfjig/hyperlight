@@ -213,7 +213,6 @@ pub(super) struct OciSnapshotConfig {
 
 /// Layered OCI config. Manifest descriptors contain data layers in `layers`
 /// order, followed by a separate page-table blob and the transport blob.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OciSnapshotConfigV4 {
@@ -328,7 +327,6 @@ impl OciSnapshotLayer {
     }
 }
 
-#[allow(dead_code)]
 impl OciSnapshotConfigV4 {
     /// Sizes correspond to data descriptors; the page-table descriptor follows them.
     pub(super) fn validate_for_load(

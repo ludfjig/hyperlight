@@ -7,14 +7,20 @@
 
 use std::sync::Arc;
 
+use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind, PAGE_SIZE};
 use hyperlight_testing::{c_simple_guest_as_pathbuf, simple_guest_as_pathbuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::func::Registerable;
+use crate::mem::layout::SandboxMemoryLayout;
+use crate::mem::mgr::GuestPageTableBuffer;
 use crate::mem::shared_mem::SharedMemory;
-use crate::sandbox::snapshot::{OciDigest, OciReference, OciTag, Snapshot};
+use crate::sandbox::snapshot::memory::page_tables_from_bytes;
+use crate::sandbox::snapshot::{
+    NextAction, OciDigest, OciReference, OciTag, Snapshot, SnapshotLayer, SnapshotMemory,
+};
 use crate::{GuestBinary, HostFunctions, Sandbox, SandboxBuilder, UninitializedSandbox};
 
 fn create_test_sandbox() -> Sandbox {
@@ -258,6 +264,114 @@ fn snapshot_without_metadata_omits_config_field() {
 
     assert!(config.get("metadata").is_none());
     assert_eq!(loaded.metadata::<Value>("missing").unwrap(), None);
+}
+
+#[test]
+fn layered_loader_translates_required_guest_addresses() {
+    let mut snapshot = Arc::try_unwrap(create_snapshot()).ok().unwrap();
+    let NextAction::Call(entrypoint_gva) = snapshot.next_action() else {
+        panic!("captured snapshot must resume a call");
+    };
+    let peb_gva = snapshot.layout().peb_address() as u64;
+
+    // SAFETY: The snapshot owns immutable page tables for the walk.
+    let entrypoint_mapping = unsafe { vmem::virt_to_phys(&snapshot, entrypoint_gva, 1) }
+        .next()
+        .unwrap();
+    let entrypoint_page_gva = entrypoint_gva / PAGE_SIZE as u64 * PAGE_SIZE as u64;
+    let entrypoint_page_gpa = entrypoint_mapping.phys_base
+        + entrypoint_page_gva
+            .checked_sub(entrypoint_mapping.virt_base)
+            .unwrap();
+    assert_ne!(entrypoint_page_gpa, peb_gva);
+
+    let page_tables = GuestPageTableBuffer::new(snapshot.root_pt_gpa() as usize);
+    for mapping in [
+        Mapping {
+            phys_base: entrypoint_page_gpa,
+            virt_base: entrypoint_page_gva,
+            len: PAGE_SIZE as u64,
+            kind: entrypoint_mapping.kind,
+        },
+        Mapping {
+            phys_base: entrypoint_page_gpa,
+            virt_base: peb_gva,
+            len: PAGE_SIZE as u64,
+            kind: MappingKind::Basic(BasicMapping {
+                readable: true,
+                writable: false,
+                executable: false,
+            }),
+        },
+    ] {
+        // SAFETY: The mappings are page-aligned and the buffer is local.
+        unsafe { vmem::map(&page_tables, mapping) };
+    }
+
+    let host_page_size = page_size::get();
+    let layers = snapshot
+        .state
+        .memory
+        .layers()
+        .iter()
+        .map(|layer| {
+            let blob_start = layer.blob().data_gpa_range().gpa_start();
+            let Some(peb_offset) = peb_gva.checked_sub(blob_start).and_then(|offset| {
+                usize::try_from(offset)
+                    .ok()
+                    .filter(|offset| *offset < layer.blob().data_gpa_range().len())
+            }) else {
+                return Ok(layer.clone());
+            };
+            let hole_start = peb_offset / host_page_size * host_page_size;
+            let hole_end = hole_start + host_page_size;
+            let live_data = layer
+                .live_data_ranges()
+                .iter()
+                .flat_map(|range| {
+                    [
+                        range.start..range.end.min(hole_start),
+                        range.start.max(hole_end)..range.end,
+                    ]
+                })
+                .filter(|range| !range.is_empty())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            SnapshotLayer::new(layer.blob().clone(), live_data)
+        })
+        .collect::<crate::Result<Vec<_>>>()
+        .unwrap();
+    Arc::get_mut(&mut snapshot.state).unwrap().memory = Arc::new(
+        SnapshotMemory::new(
+            layers.into_boxed_slice(),
+            page_tables_from_bytes(&page_tables.into_bytes()),
+        )
+        .unwrap(),
+    );
+    assert!(snapshot.state.memory.resolve(peb_gva, 1).is_none());
+    assert!(
+        snapshot
+            .state
+            .memory
+            .resolve(entrypoint_page_gpa, 1)
+            .is_some()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+    make_layered_layout(&path, false);
+    let live_data = snapshot.state.memory.layers()[0]
+        .live_data_ranges()
+        .iter()
+        .map(|range| serde_json::json!({ "start": range.start, "end": range.end }))
+        .collect::<Vec<_>>();
+    rewrite_config(&path, |cfg| {
+        cfg["layers"][0]["live_data"] = Value::Array(live_data);
+    });
+    Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
 }
 
 /// A pre-existing snapshot blob with the right length but wrong
@@ -1870,6 +1984,188 @@ fn save_for_mutation() -> (tempfile::TempDir, std::path::PathBuf) {
         .save(&path, &OciTag::new("latest").unwrap())
         .unwrap();
     (dir, path)
+}
+
+fn write_layered_blob(path: &std::path::Path, bytes: &[u8], descriptor: &mut Value) {
+    let digest = sha256_hex(bytes);
+    std::fs::write(path.join("blobs").join("sha256").join(&digest), bytes).unwrap();
+    descriptor["digest"] = Value::from(format!("sha256:{digest}"));
+    descriptor["size"] = Value::from(bytes.len() as u64);
+}
+
+fn make_layered_layout(path: &std::path::Path, split_data: bool) {
+    let cfg: Value =
+        serde_json::from_slice(&std::fs::read(find_config_blob(path)).unwrap()).unwrap();
+    let image = std::fs::read(find_snapshot_blob(path)).unwrap();
+    let data_len = cfg["layout"]["snapshot_size"].as_u64().unwrap() as usize;
+    let pt_len = cfg["layout"]["pt_size"].as_u64().unwrap() as usize;
+    let page_size = page_size::get();
+    let boundary = if split_data {
+        (data_len / 2 / page_size) * page_size
+    } else {
+        data_len
+    };
+    assert!(boundary > 0 && boundary <= data_len);
+    let base = SandboxMemoryLayout::BASE_ADDRESS as u64;
+    let parts = [&image[..boundary], &image[boundary..data_len]];
+    let mut layers = Vec::new();
+    let mut data_descriptors = Vec::new();
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(manifest_path(path)).unwrap()).unwrap();
+    for (index, bytes) in parts.into_iter().enumerate() {
+        if bytes.is_empty() {
+            continue;
+        }
+        let start = if index == 0 { 0 } else { boundary };
+        layers.push(serde_json::json!({
+            "data": { "gpa_start": base + start as u64, "len": bytes.len() },
+            "live_data": [{ "start": 0, "end": bytes.len() }]
+        }));
+        let mut descriptor = manifest["layers"][0].clone();
+        descriptor["mediaType"] = Value::from(super::file::MT_SNAPSHOT_V2);
+        write_layered_blob(path, bytes, &mut descriptor);
+        data_descriptors.push(descriptor);
+    }
+    let mut page_tables = image[data_len..data_len + pt_len].to_vec();
+    page_tables.resize(pt_len.next_multiple_of(page_size), 0);
+    let mut pt_descriptor = manifest["layers"][0].clone();
+    pt_descriptor["mediaType"] = Value::from(super::file::MT_PAGE_TABLES_V1);
+    write_layered_blob(path, &page_tables, &mut pt_descriptor);
+    data_descriptors.push(pt_descriptor);
+    data_descriptors.push(manifest["layers"][1].clone());
+
+    rewrite_config(path, |cfg| {
+        cfg["abi_version"] = Value::from(6);
+        cfg["host_page_size"] = Value::from(page_size);
+        cfg["layers"] = Value::Array(layers);
+        cfg["page_table_len"] = Value::from(pt_len);
+        cfg.as_object_mut().unwrap().remove("memory_size");
+        let layout = cfg["layout"].as_object_mut().unwrap();
+        layout.remove("snapshot_size");
+        layout.remove("pt_size");
+    });
+    rewrite_manifest(path, |manifest| {
+        manifest["config"]["mediaType"] = Value::from(super::file::MT_CONFIG_V4);
+        manifest["artifactType"] = Value::from(super::file::MT_CONFIG_V4);
+        manifest["layers"] = Value::Array(data_descriptors);
+    });
+}
+
+#[test]
+fn layered_oci_load_restores_data_page_tables_and_transport() {
+    let (_dir, path) = save_for_mutation();
+    make_layered_layout(&path, true);
+    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+    assert_eq!(loaded.snapshot_memory().layers().len(), 2);
+    let mut sandbox =
+        Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
+    let result: String = sandbox.call("Echo", "layered".to_string()).unwrap();
+    assert_eq!(result, "layered");
+}
+
+#[test]
+fn layered_oci_load_preserves_metadata_and_code_base() {
+    let snapshot = create_snapshot().with_metadata("runtime", &1_u32).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    snapshot
+        .save(&path, &OciTag::new("latest").unwrap())
+        .unwrap();
+    make_layered_layout(&path, false);
+    let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
+    assert_eq!(loaded.metadata::<u32>("runtime").unwrap(), Some(1));
+    assert_eq!(
+        loaded.layout().get_guest_code_gva(),
+        snapshot.layout().get_guest_code_gva()
+    );
+}
+
+#[test]
+fn layered_oci_rejects_missing_descriptor() {
+    let (_dir, path) = save_for_mutation();
+    make_layered_layout(&path, false);
+    rewrite_manifest(&path, |manifest| {
+        manifest["layers"].as_array_mut().unwrap().remove(1);
+    });
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "page-table layer and one transport layer");
+}
+
+#[test]
+fn layered_oci_rejects_wrong_descriptor_media() {
+    for index in 0..3 {
+        let (_dir, path) = save_for_mutation();
+        make_layered_layout(&path, false);
+        rewrite_manifest(&path, |manifest| {
+            manifest["layers"][index]["mediaType"] = Value::from("application/vnd.example.other");
+        });
+        let err = unwrap_err_snapshot(Snapshot::checked_load(
+            &path,
+            OciTag::new("latest").unwrap(),
+        ));
+        assert_err_contains(err, "unexpected media type");
+    }
+}
+
+#[test]
+fn layered_oci_rejects_mismatched_storage_size() {
+    let (_dir, path) = save_for_mutation();
+    make_layered_layout(&path, false);
+    rewrite_manifest(&path, |manifest| {
+        manifest["layers"][1]["size"] = Value::from(0);
+    });
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "page-table size is invalid");
+}
+
+#[test]
+fn layered_oci_rejects_overlapping_data_layers() {
+    let (_dir, path) = save_for_mutation();
+    make_layered_layout(&path, true);
+    rewrite_config(&path, |cfg| {
+        cfg["layers"][1]["data"]["gpa_start"] = cfg["layers"][0]["data"]["gpa_start"].clone();
+    });
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "overlap");
+}
+
+#[test]
+fn layered_oci_rejects_mismatched_artifact_type() {
+    let (_dir, path) = save_for_mutation();
+    make_layered_layout(&path, false);
+    rewrite_manifest(&path, |manifest| {
+        manifest["artifactType"] = Value::from(super::file::MT_CONFIG_V3);
+    });
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "does not match config media type");
+}
+
+#[test]
+fn layered_oci_rejects_unmapped_entrypoint() {
+    let (_dir, path) = save_for_mutation();
+    make_layered_layout(&path, false);
+    rewrite_config(&path, |cfg| {
+        let page_size = page_size::get();
+        let data_len = cfg["layers"][0]["data"]["len"].as_u64().unwrap() as usize;
+        cfg["layers"][0]["live_data"][0]["start"] = Value::from(data_len - page_size);
+    });
+    let err = unwrap_err_snapshot(Snapshot::checked_load(
+        &path,
+        OciTag::new("latest").unwrap(),
+    ));
+    assert_err_contains(err, "no live entrypoint page");
 }
 
 fn assert_err_contains(err: crate::HyperlightError, needle: &str) {
