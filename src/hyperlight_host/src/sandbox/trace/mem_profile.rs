@@ -79,10 +79,9 @@ impl MemTraceInfo {
     fn unwind(
         &self,
         regs: &CommonRegisters,
-        mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
+        mem_mgr: &SandboxMemoryManager<HostSharedMemory>,
         root_pt: u64,
     ) -> Result<Vec<u64>> {
-        let code_gva = mem_mgr.layout.get_guest_code_gva() as u64;
         let mut memory = mem_mgr.guest_virtual_memory_reader(root_pt);
         let mut read_stack = |addr| {
             let mut buf: [u8; 8] = [0u8; 8];
@@ -99,7 +98,7 @@ impl MemTraceInfo {
             &mut *cache,
             &mut read_stack,
         );
-        iter.map(|f| Ok(f.address() - code_gva))
+        iter.map(|f| Ok(f.address() - mem_mgr.layout.get_guest_code_gva() as u64))
             .collect()
             .map_err(|e| new_error!("couldn't unwind: {}", e))
     }
@@ -134,7 +133,7 @@ impl MemTraceInfo {
     fn handle_trace(
         &self,
         regs: &CommonRegisters,
-        mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
+        mem_mgr: &SandboxMemoryManager<HostSharedMemory>,
         root_pt: u64,
         trace_identifier: TraceFrameType,
     ) -> std::result::Result<(), HandleOutbError> {
@@ -167,7 +166,7 @@ impl MemTraceInfo {
     pub(crate) fn handle_trace_mem_alloc(
         &self,
         regs: &CommonRegisters,
-        mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
+        mem_mgr: &SandboxMemoryManager<HostSharedMemory>,
         root_pt: u64,
     ) -> std::result::Result<(), HandleOutbError> {
         self.handle_trace(regs, mem_mgr, root_pt, TraceFrameType::MemAlloc)
@@ -177,7 +176,7 @@ impl MemTraceInfo {
     pub(crate) fn handle_trace_mem_free(
         &self,
         regs: &CommonRegisters,
-        mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
+        mem_mgr: &SandboxMemoryManager<HostSharedMemory>,
         root_pt: u64,
     ) -> std::result::Result<(), HandleOutbError> {
         self.handle_trace(regs, mem_mgr, root_pt, TraceFrameType::MemFree)

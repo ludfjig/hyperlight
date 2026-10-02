@@ -135,7 +135,7 @@ fn snapshots_and_restores_rings() {
 
     let captured = VirtqSnapshot::capture(&layout, &case.scratch).unwrap();
     let restored = host_scratch();
-    let allocator = layout.get_first_free_scratch_gpa();
+    let allocator = layout.get_pt_base_gpa();
     let allocator_offset = restored.mem_size() - SCRATCH_TOP_ALLOCATOR_OFFSET as usize;
 
     restored.write::<u64>(allocator_offset, allocator).unwrap();
@@ -288,12 +288,10 @@ fn restores_with_finalized_layout() {
     let layout = memory_layout();
     let snapshot = VirtqSnapshot::capture(&layout, &case.scratch).unwrap();
 
-    let mut grown_layout = layout;
-
+    let grown_layout = layout;
     grown_layout
-        .set_pt_size(layout.get_pt_size() + vmem::PAGE_SIZE)
+        .ensure_page_tables_fit(vmem::PAGE_SIZE)
         .unwrap();
-    grown_layout.set_snapshot_size(layout.snapshot_size() + page_size::get());
     let restored = host_scratch();
 
     snapshot.restore(&grown_layout, &restored).unwrap();

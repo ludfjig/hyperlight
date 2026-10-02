@@ -23,9 +23,8 @@ use super::regs::CommonRegisters;
 use crate::HyperlightError;
 use crate::hypervisor::regs::CommonFpu;
 use crate::hypervisor::virtual_machine::{HypervisorError, RegisterError, VirtualMachine};
-use crate::mem::layout::BaseGpaRegion;
 use crate::mem::memory_region::MemoryRegion;
-use crate::mem::mgr::SandboxMemoryManager;
+use crate::mem::mgr::{GuestBacking, GuestPhysicalMemoryView, SandboxMemoryManager};
 use crate::mem::shared_mem::HostSharedMemory;
 
 #[derive(Debug, Error)]
@@ -83,7 +82,11 @@ pub enum DebugMemoryAccessError {
 }
 
 impl<'a> DebugMemoryView<'a> {
-    pub(crate) fn new(
+    /// # Safety
+    /// Each region's host range must remain allocated and readable for the
+    /// returned view's lifetime. The vCPU and other writers must not mutate the
+    /// ranges while they are read.
+    pub(crate) unsafe fn new(
         mem_mgr: &'a SandboxMemoryManager<HostSharedMemory>,
         guest_mmap_regions: Vec<MemoryRegion>,
     ) -> Self {
@@ -110,13 +113,19 @@ impl<'a> DebugMemoryView<'a> {
         data: &mut [u8],
         gpa: u64,
     ) -> std::result::Result<(), DebugMemoryAccessError> {
-        self.mem_mgr
-            .layout
-            .resolve_gpa(gpa, &self.guest_mmap_regions)
-            .ok_or(DebugMemoryAccessError::TranslateGuestAddress(gpa))?
-            .with_memories(&self.mem_mgr.shared_mem, &self.mem_mgr.scratch_mem)
-            .copy_to_slice(data)
-            .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e)))
+        // SAFETY: DebugMemoryView::new requires the mappings to remain valid
+        // and unmodified while this view reads them.
+        unsafe {
+            GuestPhysicalMemoryView::with_dynamic(
+                &self.mem_mgr.shared_mem,
+                &self.mem_mgr.scratch_mem,
+                &self.guest_mmap_regions,
+                self.mem_mgr.layout,
+            )
+        }
+        .read(gpa, data)
+        .map(|_| ())
+        .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e)))
     }
 
     /// Writes memory from the guest's address space with a maximum length of a PAGE_SIZE
@@ -132,25 +141,31 @@ impl<'a> DebugMemoryView<'a> {
         data: &[u8],
         gpa: u64,
     ) -> std::result::Result<(), DebugMemoryAccessError> {
-        let resolved = self
-            .mem_mgr
-            .layout
-            .resolve_gpa(gpa, &self.guest_mmap_regions)
-            .ok_or(DebugMemoryAccessError::TranslateGuestAddress(gpa))?;
+        // SAFETY: DebugMemoryView::new requires the mappings to remain valid
+        // and unmodified while this view reads them.
+        let backing = unsafe {
+            GuestPhysicalMemoryView::with_dynamic(
+                &self.mem_mgr.shared_mem,
+                &self.mem_mgr.scratch_mem,
+                &self.guest_mmap_regions,
+                self.mem_mgr.layout,
+            )
+        }
+        .resolve(gpa, data.len())
+        .ok_or(DebugMemoryAccessError::TranslateGuestAddress(gpa))?;
 
         // We can only safely write (without causing UB in the host
         // process) if the address is in the scratch region
-        match resolved.base {
-            #[cfg(unshared_snapshot_mem)]
-            BaseGpaRegion::Snapshot(()) => self
+        match backing {
+            GuestBacking::Snapshot { .. } => self
                 .mem_mgr
                 .shared_mem
-                .copy_from_slice(data, resolved.offset)
-                .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e.into()))),
-            BaseGpaRegion::Scratch(()) => self
+                .write_snapshot_gpa(gpa, data)
+                .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e))),
+            GuestBacking::Scratch { offset } => self
                 .mem_mgr
                 .scratch_mem
-                .copy_from_slice(data, resolved.offset)
+                .copy_from_slice(data, offset)
                 .map_err(|e| DebugMemoryAccessError::CopyFailed(Box::new(e.into()))),
             _ => Err(DebugMemoryAccessError::WriteToReadOnly),
         }
@@ -424,7 +439,9 @@ mod tests {
             }
 
             fn access(&self) -> DebugMemoryView<'_> {
-                DebugMemoryView::new(&self.mem_mgr, vec![self.mmap_region.clone()])
+                // SAFETY: `self` owns the live mapping and remains borrowed for
+                // the returned view's lifetime. No vCPU uses this test mapping.
+                unsafe { DebugMemoryView::new(&self.mem_mgr, vec![self.mmap_region.clone()]) }
             }
 
             fn mmap_slice(&mut self) -> &mut [u8] {
@@ -503,7 +520,7 @@ mod tests {
         #[test]
         fn test_mem_access_write_single_byte() -> crate::Result<()> {
             let memory = TestMemory::new()?;
-            let scratch_gpa = memory.mem_mgr.layout.get_first_free_scratch_gpa();
+            let scratch_gpa = memory.mem_mgr.first_free_scratch_gpa();
 
             let write_data = [0xCCu8; 1];
             memory.access().write(&write_data, scratch_gpa).unwrap();
@@ -518,7 +535,7 @@ mod tests {
         #[test]
         fn test_mem_access_write_multiple_bytes() -> crate::Result<()> {
             let memory = TestMemory::new()?;
-            let scratch_gpa = memory.mem_mgr.layout.get_first_free_scratch_gpa();
+            let scratch_gpa = memory.mem_mgr.first_free_scratch_gpa();
 
             let write_data = [0xAAu8; 16];
             memory.access().write(&write_data, scratch_gpa).unwrap();
