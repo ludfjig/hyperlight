@@ -41,7 +41,7 @@ pub mod dispatch {
 
 mod exception;
 
-pub(crate) use hyperlight_guest::mrs;
+pub(crate) use hyperlight_guest::{mrs, msr};
 
 unsafe fn init_vbar() {
     unsafe {
