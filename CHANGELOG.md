@@ -23,6 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `sandbox::initialized_multi_use` remains as a deprecated public path.
 * C guests may omit `c_guest_dispatch_function` when they do not need custom
   fallback dispatch.
+* **Breaking:** OCI snapshots use config v4 and ABI 6. Data layers and page
+  tables are stored as separate blobs, followed by the transport layer.
+  Config v3 snapshots remain loadable.
 * Support overriding the guest log level when building or restoring initialized
   snapshots.
 * `Snapshot::save` now writes the guest memory blob sparsely, skipping all-zero

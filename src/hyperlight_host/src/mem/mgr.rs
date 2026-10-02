@@ -1209,7 +1209,8 @@ impl SandboxMemoryManager<HostSharedMemory> {
         root_pt: u64,
     ) -> Result<Vec<u8>> {
         let mut result = vec![0; len];
-        self.guest_virtual_memory_reader(root_pt).read(gva, &mut result)?;
+        self.guest_virtual_memory_reader(root_pt)
+            .read(gva, &mut result)?;
         Ok(result)
     }
 }
@@ -1224,8 +1225,7 @@ mod tests {
         MsgHeader, SIZE_PREFIX_LEN, size_prefix_payload_len, size_prefixed_len,
     };
     use hyperlight_common::virtq::DescFlags;
-    use hyperlight_common::vmem::PAGE_SIZE;
-    use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind};
+    use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind, PAGE_SIZE};
     use hyperlight_testing::sandbox_sizes::{LARGE_HEAP_SIZE, MEDIUM_HEAP_SIZE, SMALL_HEAP_SIZE};
     #[cfg(target_arch = "x86_64")]
     use hyperlight_testing::simple_guest_as_pathbuf;
@@ -1693,7 +1693,10 @@ mod tests {
         let (manager, _) = manager.build().unwrap();
         manager
             .scratch_mem
-            .copy_from_slice(&vec![0x33; PAGE_SIZE], (scratch_gpa - scratch_base) as usize)
+            .copy_from_slice(
+                &vec![0x33; PAGE_SIZE],
+                (scratch_gpa - scratch_base) as usize,
+            )
             .unwrap();
         (manager, pt_base, base)
     }

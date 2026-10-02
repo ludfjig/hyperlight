@@ -140,6 +140,10 @@ impl SnapshotPageTables {
         &self.memory.as_slice()[..self.len]
     }
 
+    pub(crate) fn storage_bytes(&self) -> &[u8] {
+        self.memory.as_slice()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }

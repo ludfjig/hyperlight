@@ -14,25 +14,32 @@ mod transport;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
 use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
-use hyperlight_common::vmem::PAGE_SIZE;
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageIndex, ImageIndexBuilder, ImageManifest,
     ImageManifestBuilder, MediaType, SCHEMA_VERSION,
 };
 
-use self::config::{Arch, CpuVendor, HostFunction, Hypervisor, MemoryLayout, OciSnapshotConfig};
+use self::config::{
+    Arch, CpuVendor, HostFunction, Hypervisor, MemoryLayoutV4, OciSnapshotConfig,
+    OciSnapshotConfigV4, OciSnapshotLayer,
+};
 use self::digest::{Digest256, oci_digest, parse_oci_digest, verify_blob_bytes, verify_blob_file};
 use self::fsutil::{put_blob, put_blob_if_absent, read_bounded, replace_file_atomic};
 use self::media_types::{
     ANNOTATION_ARCH, ANNOTATION_CPU, ANNOTATION_HYPERVISOR, ANNOTATION_REF_NAME,
 };
 pub(super) use self::media_types::{
-    MT_CONFIG_CURRENT, MT_CONFIG_V1, MT_CONFIG_V2, MT_CONFIG_V3, MT_SNAPSHOT_CURRENT,
-    MT_SNAPSHOT_V1, MT_TRANSPORT_CURRENT, MT_TRANSPORT_V1, SNAPSHOT_ABI_VERSION,
+    MT_CONFIG_CURRENT, MT_CONFIG_V1, MT_CONFIG_V2, MT_CONFIG_V3, MT_CONFIG_V4, MT_PAGE_TABLES_V1,
+    MT_SNAPSHOT_CURRENT, MT_SNAPSHOT_V1, MT_SNAPSHOT_V2, MT_TRANSPORT_CURRENT, MT_TRANSPORT_V1,
+    SNAPSHOT_ABI_VERSION,
 };
 use self::reference::{OciDigest, OciReference, OciTag};
-use super::{NextAction, Snapshot, SnapshotBlob};
+use super::memory::SnapshotLayer;
+use super::{
+    NextAction, Snapshot, SnapshotBlob, SnapshotMemory, SnapshotPageTables, SnapshotState,
+};
 use crate::mem::layout::SandboxMemoryLayout;
 use crate::mem::memory_region::MemoryRegionFlags;
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
@@ -287,42 +294,6 @@ fn load_blob(
 }
 
 impl Snapshot {
-    fn v1_blob(&self) -> crate::Result<&SnapshotBlob> {
-        let [layer] = self.state.memory.layers() else {
-            return Err(crate::new_error!(
-                "OCI v1 snapshots require exactly one memory layer"
-            ));
-        };
-        Ok(layer.blob())
-    }
-
-    fn v1_memory_size(&self) -> crate::Result<usize> {
-        self.state
-            .memory
-            .gpa_span_len()
-            .checked_add(self.state.memory.page_table_len())
-            .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
-            .ok_or_else(|| crate::new_error!("snapshot memory size overflows"))
-    }
-
-    fn v1_memory_image(&self) -> crate::Result<Vec<u8>> {
-        let data_len = self.state.memory.gpa_span_len();
-        let mut image = vec![0u8; self.v1_memory_size()?];
-        let data = self
-            .v1_blob()?
-            .memory()
-            .as_slice()
-            .get(..data_len)
-            .ok_or_else(|| crate::new_error!("snapshot data range is out of bounds"))?;
-        image[..data_len].copy_from_slice(data);
-        let page_tables = self.state.memory.page_tables().bytes();
-        let page_table_end = data_len
-            .checked_add(page_tables.len())
-            .ok_or_else(|| crate::new_error!("snapshot page-table range overflows"))?;
-        image[data_len..page_table_end].copy_from_slice(page_tables);
-        Ok(image)
-    }
-
     /// Save this snapshot into an OCI Image Layout directory on disk.
     /// The saved snapshot can be loaded later with
     /// [`Snapshot::load`].
@@ -531,27 +502,44 @@ impl Snapshot {
         &self,
         dir: &Path,
         tag: &OciTag,
-        cfg: &OciSnapshotConfig,
+        cfg: &OciSnapshotConfigV4,
         cfg_bytes: &[u8],
     ) -> crate::Result<Descriptor> {
-        let memory = self.v1_memory_image()?;
-        let memory_bytes = memory.as_slice();
-        let memory_size = memory_bytes.len();
-        if memory_size == 0 || !memory_size.is_multiple_of(PAGE_SIZE) {
-            return Err(crate::new_error!(
-                "snapshot memory size {} must be a non-zero multiple of PAGE_SIZE",
-                memory_size
-            ));
-        }
-
         let blobs_dir = dir.join("blobs").join("sha256");
         std::fs::create_dir_all(&blobs_dir).map_err(|e| {
             crate::new_error!("failed to create OCI blobs dir {:?}: {}", blobs_dir, e)
         })?;
 
-        // Snapshot blob: the raw memory bytes.
-        let snapshot_digest = Digest256::from_bytes(memory_bytes);
-        put_blob_if_absent(&blobs_dir, &snapshot_digest, memory_bytes)?;
+        let mut descriptors = self
+            .state
+            .memory
+            .layers()
+            .iter()
+            .map(|layer| {
+                let bytes = layer.blob().memory().as_slice();
+                let digest = Digest256::from_bytes(bytes);
+                put_blob_if_absent(&blobs_dir, &digest, bytes)?;
+                DescriptorBuilder::default()
+                    .media_type(MediaType::Other(MT_SNAPSHOT_CURRENT.to_string()))
+                    .digest(oci_digest(&digest)?)
+                    .size(bytes.len() as u64)
+                    .build()
+                    .map_err(|e| crate::new_error!("failed to build snapshot descriptor: {}", e))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        let page_tables = self.state.memory.page_tables();
+        let page_table_bytes = page_tables.storage_bytes();
+        let page_table_digest = Digest256::from_bytes(page_table_bytes);
+        put_blob_if_absent(&blobs_dir, &page_table_digest, page_table_bytes)?;
+        descriptors.push(
+            DescriptorBuilder::default()
+                .media_type(MediaType::Other(MT_PAGE_TABLES_V1.to_string()))
+                .digest(oci_digest(&page_table_digest)?)
+                .size(page_table_bytes.len() as u64)
+                .build()
+                .map_err(|e| crate::new_error!("failed to build page-table descriptor: {}", e))?,
+        );
 
         // Transport blob: the canonical ring image omitted from memory.
         let transport = self.state.virtq.as_ref().ok_or_else(|| {
@@ -560,6 +548,14 @@ impl Snapshot {
         let transport_bytes = transport::encode(transport)?;
         let transport_digest = Digest256::from_bytes(&transport_bytes);
         put_blob(&blobs_dir, &transport_digest, &transport_bytes)?;
+        descriptors.push(
+            DescriptorBuilder::default()
+                .media_type(MediaType::Other(MT_TRANSPORT_CURRENT.to_string()))
+                .digest(oci_digest(&transport_digest)?)
+                .size(transport_bytes.len() as u64)
+                .build()
+                .map_err(|e| crate::new_error!("failed to build transport descriptor: {}", e))?,
+        );
 
         // Config blob.
         let cfg_digest = Digest256::from_bytes(cfg_bytes);
@@ -572,18 +568,6 @@ impl Snapshot {
             .size(cfg_bytes.len() as u64)
             .build()
             .map_err(|e| crate::new_error!("failed to build config descriptor: {}", e))?;
-        let snapshot_descriptor = DescriptorBuilder::default()
-            .media_type(MediaType::Other(MT_SNAPSHOT_CURRENT.to_string()))
-            .digest(oci_digest(&snapshot_digest)?)
-            .size(memory_size as u64)
-            .build()
-            .map_err(|e| crate::new_error!("failed to build snapshot descriptor: {}", e))?;
-        let transport_descriptor = DescriptorBuilder::default()
-            .media_type(MediaType::Other(MT_TRANSPORT_CURRENT.to_string()))
-            .digest(oci_digest(&transport_digest)?)
-            .size(transport_bytes.len() as u64)
-            .build()
-            .map_err(|e| crate::new_error!("failed to build transport descriptor: {}", e))?;
         // `artifactType` is set equal to `config.mediaType` per OCI
         // image-spec "Guidelines for Artifact Usage". Registries
         // surface this on the distribution-spec referrers API. Tools
@@ -593,7 +577,7 @@ impl Snapshot {
             .media_type(MediaType::ImageManifest)
             .artifact_type(MediaType::Other(MT_CONFIG_CURRENT.to_string()))
             .config(config_descriptor)
-            .layers(vec![snapshot_descriptor, transport_descriptor])
+            .layers(descriptors)
             .build()
             .map_err(|e| crate::new_error!("failed to build OCI manifest: {}", e))?;
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -622,7 +606,7 @@ impl Snapshot {
             .map_err(|e| crate::new_error!("failed to build manifest descriptor: {}", e))
     }
 
-    fn build_config(&self) -> crate::Result<OciSnapshotConfig> {
+    fn build_config(&self) -> crate::Result<OciSnapshotConfigV4> {
         let (entrypoint_addr, sregs) = match (self.state.next_action, self.state.sregs.as_ref()) {
             (NextAction::Call(addr), Some(sregs)) => (addr, sregs),
             (NextAction::Call(_), None) => {
@@ -655,13 +639,14 @@ impl Snapshot {
         };
 
         let l = &self.state.layout;
-        Ok(OciSnapshotConfig {
+        Ok(OciSnapshotConfigV4 {
             hyperlight_version: env!("CARGO_PKG_VERSION").to_string(),
             arch: Arch::current(),
             abi_version: SNAPSHOT_ABI_VERSION,
             hypervisor: Hypervisor::current()
                 .ok_or_else(|| crate::new_error!("no hypervisor available to tag snapshot"))?,
             cpu_vendor: CpuVendor::current(),
+            host_page_size: page_size::get(),
             stack_top_gva: self.state.stack_top_gva,
             entrypoint_addr,
             original_entrypoint_addr: self.state.original_entrypoint,
@@ -673,7 +658,7 @@ impl Snapshot {
                 .as_ref()
                 .ok_or_else(|| crate::new_error!("snapshot has no MSR state"))?
                 .clone(),
-            layout: MemoryLayout {
+            layout: MemoryLayoutV4 {
                 heap_size: l.heap_size(),
                 code_size: l.code_size(),
                 code_virt_base: l.get_guest_code_gva() as u64,
@@ -686,10 +671,15 @@ impl Snapshot {
                 h2g_buffer_size: l.get_h2g_buffer_size(),
                 g2h_pool_pages: l.get_g2h_pool_pages(),
                 h2g_pool_pages: l.get_h2g_pool_pages(),
-                snapshot_size: self.state.memory.gpa_span_len(),
-                pt_size: Some(self.state.memory.page_table_len()),
             },
-            memory_size: self.v1_memory_size()? as u64,
+            layers: self
+                .state
+                .memory
+                .layers()
+                .iter()
+                .map(OciSnapshotLayer::from)
+                .collect(),
+            page_table_len: self.state.memory.page_table_len(),
             host_functions,
             snapshot_generation: self.state.snapshot_generation,
             metadata: self.metadata.clone(),
@@ -812,7 +802,7 @@ impl Snapshot {
         // Loader dispatch on config media type.
         let cfg_media = cfg_desc.media_type().to_string();
         match cfg_media.as_str() {
-            MT_CONFIG_V3 => {}
+            MT_CONFIG_V3 | MT_CONFIG_V4 => {}
             MT_CONFIG_V1 | MT_CONFIG_V2 => {
                 return Err(crate::new_error!(
                     "snapshot config media type {:?} is incompatible with snapshot ABI {}",
@@ -822,9 +812,10 @@ impl Snapshot {
             }
             other => {
                 return Err(crate::new_error!(
-                    "unexpected config media type {:?} (supported: {:?})",
+                    "unexpected config media type {:?} (supported: {:?}, {:?})",
                     other,
-                    MT_CONFIG_V3
+                    MT_CONFIG_V3,
+                    MT_CONFIG_V4
                 ));
             }
         }
@@ -849,6 +840,9 @@ impl Snapshot {
                     cfg_media
                 ));
             }
+        }
+        if cfg_media == MT_CONFIG_V4 {
+            return Self::load_layered(&blobs_dir, &manifest, verify_blobs);
         }
         let layers = manifest.layers();
         if layers.len() != 2 {
@@ -1019,5 +1013,206 @@ impl Snapshot {
             }),
             metadata: cfg.metadata,
         })
+    }
+
+    fn load_layered(
+        blobs_dir: &Path,
+        manifest: &ImageManifest,
+        verify_blobs: bool,
+    ) -> crate::Result<Self> {
+        let cfg_bytes = load_blob(
+            "config",
+            blobs_dir,
+            manifest.config(),
+            MAX_JSON_BLOB_SIZE,
+            verify_blobs,
+        )?;
+        let cfg: OciSnapshotConfigV4 = serde_json::from_slice(&cfg_bytes)
+            .map_err(|e| crate::new_error!("failed to parse Hyperlight config JSON: {}", e))?;
+        let descriptors = manifest.layers();
+        if descriptors.len() != cfg.layers.len().saturating_add(2) {
+            return Err(crate::new_error!(
+                "expected {} data layers, one page-table layer and one transport layer, found {}",
+                cfg.layers.len(),
+                descriptors.len()
+            ));
+        }
+        let (data_descriptors, tail) = descriptors.split_at(cfg.layers.len());
+        let [page_table_desc, transport_desc] = tail else {
+            return Err(crate::new_error!("invalid layered snapshot descriptors"));
+        };
+        for (index, desc) in data_descriptors.iter().enumerate() {
+            if desc.media_type().to_string() != MT_SNAPSHOT_V2 {
+                return Err(crate::new_error!(
+                    "data layer {} has unexpected media type {:?} (expected {:?})",
+                    index,
+                    desc.media_type().to_string(),
+                    MT_SNAPSHOT_V2
+                ));
+            }
+        }
+        if page_table_desc.media_type().to_string() != MT_PAGE_TABLES_V1 {
+            return Err(crate::new_error!(
+                "page-table layer has unexpected media type {:?} (expected {:?})",
+                page_table_desc.media_type().to_string(),
+                MT_PAGE_TABLES_V1
+            ));
+        }
+        if transport_desc.media_type().to_string() != MT_TRANSPORT_V1 {
+            return Err(crate::new_error!(
+                "transport layer has unexpected media type {:?} (expected {:?})",
+                transport_desc.media_type().to_string(),
+                MT_TRANSPORT_V1
+            ));
+        }
+        let data_sizes = data_descriptors
+            .iter()
+            .map(|desc| usize::try_from(desc.size()).map_err(Into::into))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let page_table_size = usize::try_from(page_table_desc.size())?;
+        cfg.validate_for_load(&data_sizes, page_table_size)?;
+
+        let mut sbox_cfg = crate::sandbox::SandboxConfiguration::default();
+        sbox_cfg.set_heap_size(cfg.layout.heap_size as u64);
+        sbox_cfg.set_scratch_size(cfg.layout.scratch_size);
+        sbox_cfg.set_g2h_queue_size(cfg.layout.g2h_queue_size);
+        sbox_cfg.set_h2g_queue_size(cfg.layout.h2g_queue_size);
+        sbox_cfg.set_g2h_buffer_size(cfg.layout.g2h_buffer_size);
+        sbox_cfg.set_h2g_buffer_size(cfg.layout.h2g_buffer_size);
+        sbox_cfg.set_g2h_pool_pages(cfg.layout.g2h_pool_pages);
+        sbox_cfg.set_h2g_pool_pages(cfg.layout.h2g_pool_pages);
+        let init_data_perms = match cfg.layout.init_data_permissions {
+            None => None,
+            Some(bits) => Some(MemoryRegionFlags::from_bits(bits).ok_or_else(|| {
+                crate::new_error!(
+                    "snapshot init_data_permissions {:#x} contains unknown flag bits",
+                    bits
+                )
+            })?),
+        };
+        let mut layout = SandboxMemoryLayout::new(
+            sbox_cfg,
+            cfg.layout.code_size,
+            cfg.layout.init_data_size,
+            init_data_perms,
+        )?;
+        let code_gva = if cfg.layout.code_virt_base == 0 {
+            layout.get_guest_code_gpa() as u64
+        } else {
+            cfg.layout.code_virt_base
+        };
+        layout.set_code_gva(code_gva)?;
+        layout.ensure_page_tables_fit(cfg.page_table_len)?;
+
+        let scratch_base = hyperlight_common::layout::scratch_base_gpa(layout.get_scratch_size());
+        let mut snapshot_layers = Vec::with_capacity(cfg.layers.len());
+        for ((layer, desc), size) in cfg.layers.iter().zip(data_descriptors).zip(data_sizes) {
+            let file = open_snapshot_blob(blobs_dir, desc, size as u64, verify_blobs)?;
+            let storage = ReadonlySharedMemory::from_file(&file)?;
+            if storage.mem_size() != size {
+                return Err(crate::new_error!(
+                    "mapped snapshot data size changed during loading"
+                ));
+            }
+            let blob = Arc::new(SnapshotBlob::new(
+                storage,
+                layer.data.gpa_start,
+                layer.data.len,
+                scratch_base,
+            )?);
+            let live_data = layer
+                .live_data
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect::<Vec<std::ops::Range<usize>>>()
+                .into_boxed_slice();
+            snapshot_layers.push(SnapshotLayer::new(blob, live_data)?);
+        }
+        let page_table_file = open_snapshot_blob(
+            blobs_dir,
+            page_table_desc,
+            page_table_size as u64,
+            verify_blobs,
+        )?;
+        let page_table_storage = ReadonlySharedMemory::from_file(&page_table_file)?;
+        if page_table_storage.mem_size() != page_table_size {
+            return Err(crate::new_error!(
+                "mapped snapshot page tables changed size during loading"
+            ));
+        }
+        let page_tables = Arc::new(SnapshotPageTables::new(
+            page_table_storage,
+            cfg.page_table_len,
+        )?);
+        let memory = Arc::new(SnapshotMemory::new(
+            snapshot_layers.into_boxed_slice(),
+            page_tables,
+        )?);
+        let required_memory_size = layout.get_memory_size()?;
+        if memory.gpa_span_len() < required_memory_size {
+            return Err(crate::new_error!(
+                "snapshot GPA span ({}) is smaller than the layout size ({})",
+                memory.gpa_span_len(),
+                required_memory_size
+            ));
+        }
+        let required_gvas = [
+            ("entrypoint", cfg.entrypoint_addr),
+            ("PEB", layout.peb_address() as u64),
+        ];
+        let transport_bytes = load_blob(
+            "transport",
+            blobs_dir,
+            transport_desc,
+            transport::MAX_BLOB_SIZE,
+            verify_blobs,
+        )?;
+        let virtq = transport::decode(&layout, &transport_bytes)?;
+        let host_funcs_vec: Vec<HostFunctionDefinition> =
+            cfg.host_functions.into_iter().map(Into::into).collect();
+        let host_functions = HostFunctionDetails {
+            host_functions: (!host_funcs_vec.is_empty()).then_some(host_funcs_vec),
+        };
+        let snapshot = Snapshot {
+            state: Arc::new(SnapshotState {
+                layout,
+                memory,
+                load_info: crate::mem::exe::LoadInfo::dummy(),
+                stack_top_gva: cfg.stack_top_gva,
+                sregs: Some(cfg.sregs),
+                #[cfg(target_arch = "x86_64")]
+                msrs: Some(cfg.msrs),
+                next_action: NextAction::Call(cfg.entrypoint_addr),
+                original_entrypoint: cfg.original_entrypoint_addr,
+                snapshot_generation: cfg.snapshot_generation,
+                host_functions,
+                virtq: Some(virtq),
+            }),
+            metadata: cfg.metadata,
+        };
+        for (name, gva) in required_gvas {
+            // SAFETY: The snapshot owns immutable page tables for the walk.
+            let mapping = unsafe { hyperlight_common::vmem::virt_to_phys(&snapshot, gva, 1) }
+                .next()
+                .ok_or_else(|| {
+                    crate::new_error!("snapshot has no mapped {} page at {:#x}", name, gva)
+                })?;
+            let offset = gva
+                .checked_sub(mapping.virt_base)
+                .ok_or_else(|| crate::new_error!("snapshot {} mapping starts after GVA", name))?;
+            let gpa = mapping
+                .phys_base
+                .checked_add(offset)
+                .ok_or_else(|| crate::new_error!("snapshot {} GPA overflows", name))?;
+            if snapshot.state.memory.resolve(gpa, 1).is_none() {
+                return Err(crate::new_error!(
+                    "snapshot has no live {} page at {:#x}",
+                    name,
+                    gpa
+                ));
+            }
+        }
+        Ok(snapshot)
     }
 }

@@ -509,10 +509,14 @@ impl Snapshot {
         let mut roots = HashSet::with_capacity(root_pt_gpas.len());
         for &root in root_pt_gpas {
             if !root.is_multiple_of(PAGE_SIZE as u64) || !roots.insert(root) {
-                return Err(crate::new_error!("snapshot page-table root is invalid: {root:#x}"));
+                return Err(crate::new_error!(
+                    "snapshot page-table root is invalid: {root:#x}"
+                ));
             }
             if memory_view.resolve(root, PAGE_SIZE).is_none() {
-                return Err(crate::new_error!("snapshot page-table root is unbacked: {root:#x}"));
+                return Err(crate::new_error!(
+                    "snapshot page-table root is unbacked: {root:#x}"
+                ));
             }
         }
         let (memory, pt_data) = {
