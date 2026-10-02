@@ -503,8 +503,14 @@ impl GuestPageTableBuffer {
     /// `phys_base`. The returned buffer's current root is `phys_base`;
     /// additional roots can be obtained by calling `alloc_table`.
     pub(crate) fn new(phys_base: usize) -> Self {
+        Self::with_capacity(phys_base, PAGE_TABLE_SIZE)
+    }
+
+    pub(crate) fn with_capacity(phys_base: usize, capacity: usize) -> Self {
+        let mut buffer = Vec::with_capacity(capacity.max(PAGE_TABLE_SIZE));
+        buffer.resize(PAGE_TABLE_SIZE, 0);
         GuestPageTableBuffer {
-            buffer: std::cell::RefCell::new(vec![0u8; PAGE_TABLE_SIZE]),
+            buffer: std::cell::RefCell::new(buffer),
             phys_base,
             root: std::cell::Cell::new(phys_base as u64),
         }
@@ -950,6 +956,17 @@ impl SandboxMemoryManager<HostSharedMemory> {
         // Carry the guest ELF entry point across restore so crashdumps
         // report the restored image's entry.
         self.original_entrypoint = snapshot.original_entrypoint();
+    }
+
+    /// Installs memory produced by a capture without restoring runtime state.
+    pub(crate) fn install_captured_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+    ) -> Result<SnapshotMemoryBacking<GuestSharedMemory>> {
+        let gsnapshot = self.replace_snapshot_memory(snapshot)?;
+        self.apply_snapshot_metadata(snapshot);
+        self.update_snapshot_scratch_bookkeeping()?;
+        Ok(gsnapshot)
     }
 
     /// Restore base memory after the caller checks snapshot compatibility.
