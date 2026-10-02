@@ -825,7 +825,24 @@ impl HyperlightVm {
         #[cfg(feature = "mem_profile")]
         {
             let regs = self.vm.regs().map_err(HandleIoError::GetRegs)?;
-            handle_outb(mem_mgr, host_funcs, port, val, &regs, &mut self.trace_info)?;
+            let root_pt = if matches!(
+                port.try_into(),
+                Ok(hyperlight_common::outb::OutBAction::TraceMemoryAlloc
+                    | hyperlight_common::outb::OutBAction::TraceMemoryFree)
+            ) {
+                self.get_root_pt().ok()
+            } else {
+                None
+            };
+            handle_outb(
+                mem_mgr,
+                host_funcs,
+                port,
+                val,
+                &regs,
+                &mut self.trace_info,
+                root_pt,
+            )?;
         }
 
         #[cfg(not(feature = "mem_profile"))]

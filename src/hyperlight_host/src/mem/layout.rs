@@ -134,11 +134,7 @@ impl<'a> ResolvedGpa<&'a [u8], &'a [u8]> {
 /// copy guest bytes out without caring which concrete memory type they
 /// hold.
 ///
-/// This trait only exists in builds that actually read guest memory
-/// through it — see the `readable_shared_mem` cfg alias in `build.rs`
-/// for the exact conditions (the `gdb` debug path and the
-/// shared-snapshot `mem_profile` path). In every other configuration it
-/// is compiled out entirely, so there is no dead code to `#[allow]`.
+/// Used by the debugger's resolved memory reads.
 #[cfg(readable_shared_mem)]
 pub(crate) trait ReadableSharedMemory {
     fn copy_to_slice(&self, slice: &mut [u8], offset: usize) -> Result<()>;

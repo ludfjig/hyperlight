@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   assembly and extraction without flattening.
 
 ### Changed
+* Guest-memory reads propagate page-table failures and bound snapshot walks.
+  Memory profiling follows guest page tables to read copy-on-write stacks.
 * `Sandbox` is the primary initialized sandbox type. `MultiUseSandbox` remains
   as a deprecated alias.
 * `Sandbox` lives in the private `sandbox::initialized` module and is reached

@@ -5,7 +5,8 @@ mod file;
 mod file_tests;
 mod tripwires;
 
-use std::collections::{BTreeMap, HashMap};
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) use file::host_cpu_vendor_golden_tag;
@@ -32,6 +33,7 @@ use crate::sandbox::SandboxConfiguration;
 use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
 
 const PTE_SIZE: usize = size_of::<vmem::PageTableEntry>();
+const MAX_SNAPSHOT_PAGE_TABLE_READS: usize = 2 * (SandboxMemoryLayout::MAX_MEMORY_SIZE / PAGE_SIZE);
 
 /// Presently, a snapshot can be of a preinitialised sandbox, which
 /// still needs an initialise function called in order to determine
@@ -134,11 +136,16 @@ impl core::convert::AsRef<Snapshot> for Snapshot {
 impl hyperlight_common::vmem::TableReadOps for Snapshot {
     type TableAddr = u64;
     fn entry_addr(addr: u64, offset: u64) -> u64 {
-        addr + offset
+        addr.saturating_add(offset)
     }
     unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
-        let addr = addr as usize;
-        let Some(pte_bytes) = self.state.memory.as_slice().get(addr..addr + PTE_SIZE) else {
+        let Ok(addr) = usize::try_from(addr) else {
+            return 0;
+        };
+        let Some(end) = addr.checked_add(PTE_SIZE) else {
+            return 0;
+        };
+        let Some(pte_bytes) = self.state.memory.as_slice().get(addr..end) else {
             // Attacker-controlled data pointed out-of-bounds. We'll
             // default to returning 0 in this case, which, for most
             // architectures (including x86-64 and arm64, the ones we
@@ -177,6 +184,8 @@ pub(crate) struct SharedMemoryPageTableBuffer<'a> {
     scratch: &'a [u8],
     layout: SandboxMemoryLayout,
     root: u64,
+    reads: Cell<usize>,
+    failure: Cell<Option<&'static str>>,
 }
 impl<'a> SharedMemoryPageTableBuffer<'a> {
     pub(crate) fn new(
@@ -190,21 +199,41 @@ impl<'a> SharedMemoryPageTableBuffer<'a> {
             scratch,
             layout,
             root,
+            reads: Cell::new(0),
+            failure: Cell::new(None),
+        }
+    }
+
+    pub(crate) fn finish(&self) -> Result<()> {
+        match self.failure.get() {
+            Some(failure) => Err(crate::new_error!("{}", failure)),
+            None => Ok(()),
         }
     }
 }
 impl<'a> hyperlight_common::vmem::TableReadOps for SharedMemoryPageTableBuffer<'a> {
     type TableAddr = u64;
     fn entry_addr(addr: u64, offset: u64) -> u64 {
-        addr + offset
+        addr.saturating_add(offset)
     }
     unsafe fn read_entry(&self, addr: u64) -> vmem::PageTableEntry {
+        if self.failure.get().is_some() {
+            return 0;
+        }
+        let reads = self.reads.get();
+        if reads >= MAX_SNAPSHOT_PAGE_TABLE_READS {
+            self.failure
+                .set(Some("snapshot page-table walk limit exceeded"));
+            return 0;
+        }
+        self.reads.set(reads + 1);
         let memoff = access_gpa(self.snap, self.scratch, self.layout, addr);
-        let Some(pte_bytes) = memoff.and_then(|(mem, off)| mem.get(off..off + PTE_SIZE)) else {
-            // Attacker-controlled data pointed out-of-bounds. We'll
-            // default to returning 0 in this case, which, for most
-            // architectures (including x86-64 and arm64, the ones we
-            // care about presently) will be a not-present entry.
+        let Some(pte_bytes) = memoff.and_then(|(mem, off)| {
+            let end = off.checked_add(PTE_SIZE)?;
+            mem.get(off..end)
+        }) else {
+            self.failure
+                .set(Some("snapshot page-table walk accessed unbacked memory"));
             return 0;
         };
         // The `get()` above ensures exactly PTE_SIZE bytes.
@@ -457,10 +486,32 @@ impl Snapshot {
         host_functions: HostFunctionDetails,
         virtq: Option<VirtqSnapshot>,
     ) -> Result<Self> {
+        if root_pt_gpas.is_empty() {
+            return Err(crate::new_error!("snapshot has no page-table roots"));
+        }
+        let mut roots_seen = HashSet::new();
+        for &root in root_pt_gpas {
+            if !root.is_multiple_of(PAGE_SIZE as u64) {
+                return Err(crate::new_error!("snapshot page-table root is not aligned"));
+            }
+            if !roots_seen.insert(root) {
+                return Err(crate::new_error!("snapshot page-table root is repeated"));
+            }
+        }
         let mut phys_seen = HashMap::<u64, usize>::new();
         let scratch_gva = scratch_base_gva(layout.get_scratch_size());
         let memory = shared_mem.with_contents(|snap_c| {
             scratch_mem.with_contents(|scratch_c| {
+                for &root in root_pt_gpas {
+                    let backed = access_gpa(snap_c, scratch_c, layout, root)
+                        .and_then(|(memory, offset)| {
+                            memory.get(offset..offset.checked_add(PAGE_SIZE)?)
+                        })
+                        .is_some();
+                    if !backed {
+                        return Err(crate::new_error!("snapshot page-table root is not backed"));
+                    }
+                }
                 // Phase 1: walk every PT root together. This detects
                 // aliased intermediate tables (e.g. Nanvix's kernel-
                 // half PTs, which multiple process PDs share by
@@ -471,12 +522,8 @@ impl Snapshot {
                 // `root_pt_gpas` order — which is also the topological
                 // order of the `AnotherSpace` references — so
                 // processing in iteration order is safe.
-                let op = SharedMemoryPageTableBuffer::new(
-                    snap_c,
-                    scratch_c,
-                    layout,
-                    root_pt_gpas.first().copied().unwrap_or(0),
-                );
+                let op =
+                    SharedMemoryPageTableBuffer::new(snap_c, scratch_c, layout, root_pt_gpas[0]);
                 let walk = unsafe {
                     vmem::walk_va_spaces(
                         &op,
@@ -485,6 +532,7 @@ impl Snapshot {
                         hyperlight_common::layout::SCRATCH_TOP_GVA as u64,
                     )
                 };
+                op.finish()?;
 
                 // Phase 2: rebuild each space's page tables, compacting
                 // `ThisSpace` leaves into a dense snapshot blob and
@@ -551,7 +599,9 @@ impl Snapshot {
                                             mapping.phys_base,
                                         )
                                     }) else {
-                                        continue;
+                                        return Err(crate::new_error!(
+                                            "snapshot leaf page is not backed"
+                                        ));
                                     };
                                     Some(*phys_seen.entry(mapping.phys_base).or_insert_with(|| {
                                         let new_offset = snapshot_memory.len();
@@ -955,5 +1005,73 @@ mod tests {
         mgr.shared_mem
             .with_contents(|contents| assert_eq!(&contents[0..pattern_b.len()], &pattern_b[..]))
             .unwrap();
+    }
+
+    #[test]
+    fn page_table_reader_reports_unbacked_memory() {
+        let cfg = crate::sandbox::SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, PAGE_SIZE, 0, None).unwrap();
+        let reader = super::SharedMemoryPageTableBuffer::new(&[], &[], layout, 0);
+
+        // SAFETY: The reader bounds access to its borrowed slices.
+        let entry = unsafe { vmem::TableReadOps::read_entry(&reader, u64::MAX) };
+
+        assert_eq!(entry, 0);
+        assert!(
+            reader
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("unbacked")
+        );
+        assert_eq!(
+            <super::SharedMemoryPageTableBuffer<'_> as vmem::TableReadOps>::entry_addr(u64::MAX, 8,),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn page_table_reader_reports_exhausted_budget() {
+        let cfg = crate::sandbox::SandboxConfiguration::default();
+        let layout = SandboxMemoryLayout::new(cfg, PAGE_SIZE, 0, None).unwrap();
+        let reader = super::SharedMemoryPageTableBuffer::new(&[], &[], layout, 0);
+        reader.reads.set(super::MAX_SNAPSHOT_PAGE_TABLE_READS);
+
+        // SAFETY: The reader refuses reads after its budget is exhausted.
+        let entry = unsafe { vmem::TableReadOps::read_entry(&reader, 0) };
+
+        assert_eq!(entry, 0);
+        assert!(reader.finish().unwrap_err().to_string().contains("limit"));
+    }
+
+    #[test]
+    fn capture_rejects_invalid_page_table_roots() {
+        let (mut manager, root) = make_simple_pt_mgr();
+        for roots in [
+            Vec::new(),
+            vec![root + 1],
+            vec![root, root],
+            vec![u64::MAX - (PAGE_SIZE as u64 - 1)],
+        ] {
+            let result = super::Snapshot::new(
+                &mut manager.shared_mem,
+                &mut manager.scratch_mem,
+                manager.layout,
+                LoadInfo::dummy(),
+                Vec::new(),
+                &roots,
+                0,
+                default_sregs(),
+                #[cfg(target_arch = "x86_64")]
+                Vec::new(),
+                super::NextAction::None,
+                0,
+                1,
+                HostFunctionDetails::default(),
+                None,
+            );
+            assert!(result.is_err(), "invalid roots accepted: {roots:?}");
+            assert_eq!(manager.snapshot_count, 0);
+        }
     }
 }
