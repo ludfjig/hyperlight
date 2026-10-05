@@ -160,10 +160,12 @@ code-checks-like-ci config=default-target hypervisor="kvm":
     just test-compilation-no-default-features debug
     just test-compilation-no-default-features release
 
-build-guests-like-ci config=default-target hypervisor="kvm":
+build-guests-like-ci config=default-target:
     @# Build and move Rust guests
     just build-rust-guests {{config}}
     just move-rust-guests {{config}}
+    just build-rust-guests-non-pie {{config}}
+    just move-rust-guests-non-pie {{config}}
 
     @# Build c guests
     just build-c-guests {{config}}
@@ -217,7 +219,7 @@ like-ci config=default-target hypervisor="kvm":
     just code-checks-like-ci {{config}} {{hypervisor}}
 
     @# .github/workflows/dep_build_guests.yml
-    just build-guests-like-ci {{config}} {{hypervisor}}
+    just build-guests-like-ci {{config}}
 
     @# .github/workflows/dep_build_test.yml
     just build-test-like-ci {{config}} {{hypervisor}}

@@ -62,6 +62,7 @@ jobs:
         with:
           path: |
             src/tests/rust_guests/target/sysroot
+            src/tests/rust_guests/target-non-pie/sysroot
           key: sysroot-linux-${{ matrix.config }}-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Rust cache
@@ -83,6 +84,11 @@ jobs:
         run: |
           just build-rust-guests ${{ matrix.config }}
           just move-rust-guests ${{ matrix.config }}
+
+      - name: Build non-PIE Rust guests
+        run: |
+          just build-rust-guests-non-pie ${{ matrix.config }}
+          just move-rust-guests-non-pie ${{ matrix.config }}
 
       - name: Build C guests
         run: |
