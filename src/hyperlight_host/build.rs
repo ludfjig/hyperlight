@@ -159,7 +159,7 @@ fn main() -> Result<()> {
         print_debug: { all(feature = "print_debug", debug_assertions) },
         // the gdb feature (only temporarily!) needs to use
         // writable/un-shared snapshot memories.
-        unshared_snapshot_mem: { feature = "gdb" },
+        unshared_snapshot_mem: { gdb },
         // The `ReadableSharedMemory` trait in `mem::layout` is only
         // needed in two situations:
         //   1. The `gdb` debug path reads guest memory through it
