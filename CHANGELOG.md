@@ -61,6 +61,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and return roots with `Ok(roots)`.
 * Related snapshots share immutable memory layers. This reduces capture time
   and memory use.
+* KVM: deleting a memory slot flushes only that slot's guest mappings on Linux
+  6.12 and later. This speeds up the first guest call after a snapshot,
+  restore, or unmap changes memory slots.
 * **Breaking:** `Sandbox::snapshot` installs the captured snapshot into the
   sandbox and removes `map_region` and `map_file_cow` regions. Pages of these
   regions that the guest has not mapped into its page tables are lost.
