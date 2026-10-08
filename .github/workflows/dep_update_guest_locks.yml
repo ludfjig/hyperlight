@@ -56,10 +56,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fix cargo home permissions
-        run: |
-          sudo chown -R $(id -u):$(id -g) /opt/cargo || true
-
       - name: Update guest Cargo.lock
         working-directory: src/tests/rust_guests
         run: cargo fetch
