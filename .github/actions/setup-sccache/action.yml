@@ -12,3 +12,8 @@ runs:
       run: |
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        # Write the cache only on main. Other refs read it, since their
+        # entries serve only that ref and evict the ones main shares.
+        if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+          echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV"
+        fi
