@@ -306,24 +306,54 @@ fn reproduce(args: &BenchReportArgs, repo: &str, candidate: &Origin, baseline: &
 fn thresholds(
     args: &BenchReportArgs,
     config: Option<&BenchConfig>,
-) -> criterion_markdown::ChangeThresholds {
-    let from_config = |read: fn(&BenchConfig) -> Option<f64>| config.and_then(read);
-    let mut thresholds = criterion_markdown::ChangeThresholds::default();
+) -> criterion_markdown::Thresholds {
+    let config = config.map(|config| &config.thresholds);
+    let mut thresholds = criterion_markdown::Thresholds::default();
 
-    if let Some(ratio) = args.improvement.or_else(|| from_config(|c| c.improvement)) {
+    if let Some(ratio) = args
+        .improvement
+        .or_else(|| config.and_then(|thresholds| thresholds.improvement))
+    {
         thresholds = thresholds.improvement_ratio(ratio);
     }
     if let Some(ratio) = args
         .strong_improvement
-        .or_else(|| from_config(|c| c.strong_improvement))
+        .or_else(|| config.and_then(|thresholds| thresholds.strong_improvement))
     {
         thresholds = thresholds.strong_improvement_ratio(ratio);
     }
-    if let Some(ratio) = args.regression.or_else(|| from_config(|c| c.regression)) {
+    if let Some(ratio) = args
+        .regression
+        .or_else(|| config.and_then(|thresholds| thresholds.regression))
+    {
         thresholds = thresholds.regression_ratio(ratio);
     }
 
     thresholds
+}
+
+/// Change indicators selected by the config file, then the renderer.
+fn emojis(config: Option<&BenchConfig>) -> criterion_markdown::Emojis {
+    let mut emojis = criterion_markdown::Emojis::default();
+    let Some(config) = config else {
+        return emojis;
+    };
+    let config = &config.thresholds.emojis;
+
+    if let Some(emoji) = &config.regression {
+        emojis = emojis.regression(emoji);
+    }
+    if let Some(emoji) = &config.stable {
+        emojis = emojis.stable(emoji);
+    }
+    if let Some(emoji) = &config.improvement {
+        emojis = emojis.improvement(emoji);
+    }
+    if let Some(emoji) = &config.strong_improvement {
+        emojis = emojis.strong_improvement(emoji);
+    }
+
+    emojis
 }
 
 /// Say which commits the report covers, so a reader can tell what they are
@@ -483,7 +513,7 @@ fn describe(label: &str) -> String {
 async fn report(
     args: &BenchReportArgs,
     config: Option<&BenchConfig>,
-    thresholds: criterion_markdown::ChangeThresholds,
+    thresholds: criterion_markdown::Thresholds,
     summary_limit: Option<usize>,
     dir: &Path,
     baseline_root: Option<&Path>,
@@ -497,7 +527,8 @@ async fn report(
 
     let mut renderer = criterion_markdown::Renderer::new(dir)
         .benchmarks(benchmarks)
-        .change_thresholds(thresholds);
+        .thresholds(thresholds)
+        .emojis(emojis(config));
 
     if let Some(limit) = summary_limit {
         renderer = renderer.summary_limit(limit);
@@ -556,6 +587,35 @@ async fn discover_benchmarks(args: &BenchReportArgs, dir: &Path) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_selects_report_emojis() {
+        let path =
+            std::env::temp_dir().join(format!("hl-report-emojis-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+            [thresholds.emojis]
+            regression = "🔴"
+            stable = "⚪"
+            improvement = "🟢"
+            strong_improvement = "🔥"
+            "#,
+        )
+        .unwrap();
+        let config = BenchConfig::load(&path).unwrap();
+
+        assert_eq!(
+            emojis(Some(&config)),
+            criterion_markdown::Emojis::default()
+                .regression("🔴")
+                .stable("⚪")
+                .improvement("🟢")
+                .strong_improvement("🔥")
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// A run that measured its own baseline says which commit that was, so the
     /// report names it without another set of results to read.

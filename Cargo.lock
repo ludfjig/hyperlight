@@ -673,9 +673,9 @@ dependencies = [
 
 [[package]]
 name = "criterion-markdown"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d6e13f76f7a56c31550cfa23e2c9d4f312afe96f51667c244a6402695b672e8"
+checksum = "04a71ec3e7be23ef7802da672ac1ba2a5be5e686ee8050b8b70eb43de4457bcf"
 dependencies = [
  "anyhow",
  "serde",

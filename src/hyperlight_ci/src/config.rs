@@ -16,12 +16,32 @@ struct ConfigFile {
     allowlist: Vec<String>,
     #[serde(default)]
     denylist: Vec<String>,
-    improvement: Option<f64>,
-    strong_improvement: Option<f64>,
-    regression: Option<f64>,
+    #[serde(default)]
+    thresholds: ThresholdConfig,
     repo: Option<String>,
     summary_limit: Option<usize>,
     reproduce: Option<bool>,
+}
+
+/// Change indicators selected by the benchmark report config.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmojiConfig {
+    pub regression: Option<String>,
+    pub stable: Option<String>,
+    pub improvement: Option<String>,
+    pub strong_improvement: Option<String>,
+}
+
+/// Change thresholds and their report indicators.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThresholdConfig {
+    pub improvement: Option<f64>,
+    pub strong_improvement: Option<f64>,
+    pub regression: Option<f64>,
+    #[serde(default)]
+    pub emojis: EmojiConfig,
 }
 
 /// Benchmark id patterns selecting which results are reported.
@@ -29,10 +49,7 @@ struct ConfigFile {
 pub struct BenchConfig {
     allow: RegexSet,
     deny: RegexSet,
-    /// Where a change is worth reporting, when the file says.
-    pub improvement: Option<f64>,
-    pub strong_improvement: Option<f64>,
-    pub regression: Option<f64>,
+    pub thresholds: ThresholdConfig,
     /// Which repository the runs belong to.
     pub repo: Option<String>,
     /// How many changes to call out before the tables.
@@ -56,9 +73,7 @@ impl BenchConfig {
         Ok(Self {
             allow: RegexSet::new(&file.allowlist)?,
             deny: RegexSet::new(&file.denylist)?,
-            improvement: file.improvement,
-            strong_improvement: file.strong_improvement,
-            regression: file.regression,
+            thresholds: file.thresholds,
             repo: file.repo,
             summary_limit: file.summary_limit,
             reproduce: file.reproduce,
@@ -124,20 +139,21 @@ mod tests {
 
     #[test]
     fn reads_the_thresholds_when_given() {
-        let config = BenchConfig::parse("improvement = 1.5\nregression = 0.5").unwrap();
+        let config =
+            BenchConfig::parse("[thresholds]\nimprovement = 1.5\nregression = 0.5").unwrap();
 
-        assert_eq!(config.improvement, Some(1.5));
-        assert_eq!(config.regression, Some(0.5));
-        assert_eq!(config.strong_improvement, None);
+        assert_eq!(config.thresholds.improvement, Some(1.5));
+        assert_eq!(config.thresholds.regression, Some(0.5));
+        assert_eq!(config.thresholds.strong_improvement, None);
     }
 
     #[test]
     fn leaves_the_thresholds_alone_when_absent() {
         let config = BenchConfig::parse(r#"allowlist = ["^sandboxes/"]"#).unwrap();
 
-        assert_eq!(config.improvement, None);
-        assert_eq!(config.strong_improvement, None);
-        assert_eq!(config.regression, None);
+        assert_eq!(config.thresholds.improvement, None);
+        assert_eq!(config.thresholds.strong_improvement, None);
+        assert_eq!(config.thresholds.regression, None);
     }
 
     #[test]
