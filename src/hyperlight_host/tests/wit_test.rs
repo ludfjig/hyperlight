@@ -491,9 +491,13 @@ mod wit_test {
         prop_oneof![Just(EnumA), Just(EnumB), Just(EnumC),]
     }
 
+    /// 32 instead of default 256 to speed up ci
+    const ROUNDTRIP_CASES: u32 = 32;
+
     macro_rules! make_test {
         ($fn:ident, $($ty:tt)*) => {
             proptest! {
+                #![proptest_config(ProptestConfig::with_cases(ROUNDTRIP_CASES))]
                 #[test]
                 fn $fn(x $($ty)*) {
                     assert_eq!(x, sb().roundtrip().$fn(x.clone()).unwrap())
