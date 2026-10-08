@@ -31,6 +31,14 @@ on:
         description: CPU architecture for the build, X64 or arm64 (passed from caller matrix)
         required: true
         type: string
+      baseline_ref:
+        description: >-
+          Commit to measure these results against. When set, its benchmarks run
+          first on this machine, so the comparison reflects the change rather
+          than the difference between two runners.
+        required: false
+        type: string
+        default: ""
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
@@ -57,6 +65,9 @@ jobs:
         || '["self-hosted", "Linux", "arm64", "kvm"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The baseline pass checks out another commit, which needs its history.
+          fetch-depth: ${{ inputs.baseline_ref == '' && 1 || 0 }}
 
       - uses: hyperlight-dev/ci-setup-workflow@2f4142ba17cf573af44fc1e1f1ffc743daded5b3  # v1.10.0
         with:
@@ -90,17 +101,44 @@ jobs:
           name: c-guests-${{ inputs.arch }}-release
           path: src/tests/c_guests/bin/release/
 
+      - name: Download baseline Rust guests
+        if: inputs.baseline_ref != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: rust-guests-${{ inputs.arch }}-release-baseline
+          path: ${{ runner.temp }}/baseline-guests/rust/
+
+      - name: Download baseline C guests
+        if: inputs.baseline_ref != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: c-guests-${{ inputs.arch }}-release-baseline
+          path: ${{ runner.temp }}/baseline-guests/c/
+
+      # Both commits are measured on this machine, so the comparison reflects
+      # them rather than the difference between two runners. The branch point
+      # is read off the merge this run validates, so on anything else there is
+      # no second parent and the comparison would measure the wrong commit.
       - name: Build
         run: just build release
 
       - name: Run benchmarks
-        run: just bench-ci main
+        run: |
+          if [ -n "${{ inputs.baseline_ref }}" ]; then
+            git rev-parse --verify --quiet HEAD^2 >/dev/null || {
+              echo "::error::HEAD is not a merge, so ${{ inputs.baseline_ref }} is not the branch point"
+              exit 1
+            }
+            just bench-against ${{ inputs.baseline_ref }} "$RUNNER_TEMP/baseline-guests"
+          else
+            just bench-ci main
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: benchmarks_${{ runner.os }}_${{ inputs.hypervisor }}_${{ inputs.cpu_vendor }}
           path: ./target/criterion/
           if-no-files-found: error
-          # The longest GitHub keeps an artifact, so that a pull request can be
-          # compared against the branch point it was built from.
+          # The longest GitHub keeps an artifact, so that a run stays readable
+          # for as long as the history it contributes to.
           retention-days: 90

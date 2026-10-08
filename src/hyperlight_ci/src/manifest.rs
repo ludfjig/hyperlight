@@ -26,6 +26,10 @@ pub(crate) struct Manifest {
     timestamp: u64,
     pub host: Host,
     pub benchmarks: Vec<String>,
+    /// The commit measured alongside this run, for a comparison that needs no
+    /// results from anywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,7 +48,7 @@ pub(crate) struct Host {
 }
 
 /// Where criterion keeps its results.
-fn criterion_dir() -> PathBuf {
+pub(crate) fn criterion_dir() -> PathBuf {
     env::var_os("CRITERION_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target").join("criterion"))
@@ -104,8 +108,12 @@ fn hypervisor() -> Option<String> {
     None
 }
 
-/// Record `benchmarks` as the contents of the run about to start.
-pub(crate) fn write(benchmarks: impl IntoIterator<Item = String>) -> Result<()> {
+/// Record `benchmarks` as the contents of the run about to start, and
+/// `baseline` as the commit it was measured against.
+pub(crate) fn write(
+    benchmarks: impl IntoIterator<Item = String>,
+    baseline: Option<String>,
+) -> Result<()> {
     let (cpu_vendor, cpu_model) = cpu_vendor_and_model();
     let mut benchmarks: Vec<String> = benchmarks.into_iter().collect();
     benchmarks.sort();
@@ -124,6 +132,7 @@ pub(crate) fn write(benchmarks: impl IntoIterator<Item = String>) -> Result<()> 
             hypervisor: hypervisor(),
         },
         benchmarks,
+        baseline,
     };
 
     let dir = criterion_dir();

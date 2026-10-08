@@ -66,6 +66,26 @@ jobs:
       arch: ${{ matrix.arch }}
       config: ${{ matrix.config }}
 
+  # Guests for the commit the pull request branched from, so the benchmarks
+  # can measure both sides on one machine. Only the configuration the
+  # benchmark suite loads is needed.
+  build-baseline-guests:
+    needs: [docs-pr, update-guest-locks]
+    # Required because update-guest-locks is skipped on non-dependabot PRs,
+    # and a skipped dependency transitively skips all downstream jobs.
+    # See: https://github.com/actions/runner/issues/2205
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/dep_build_guests.yml
+    secrets: inherit
+    with:
+      docs_only: ${{ needs.docs-pr.outputs.docs-only }}
+      arch: X64
+      config: release
+      # The checkout is the merge this run validates, so where its two
+      # parents branched apart is where the pull request did.
+      ref: HEAD^1...HEAD^2
+      artifact_suffix: -baseline
+
   # Code checks (fmt, clippy, MSRV) - runs in parallel with build-guests
   code-checks:
     needs: [docs-pr, update-guest-locks]
@@ -232,6 +252,7 @@ jobs:
     needs:
       - docs-pr
       - build-guests
+      - build-baseline-guests
     # Required because update-guest-locks is skipped on non-dependabot PRs,
     # and a skipped dependency transitively skips all downstream jobs.
     # See: https://github.com/actions/runner/issues/2205
@@ -249,10 +270,11 @@ jobs:
       hypervisor: ${{ matrix.hypervisor }}
       cpu_vendor: ${{ matrix.cpu_vendor }}
       arch: ${{ matrix.arch }}
+      baseline_ref: HEAD^1...HEAD^2
 
-  # Report every configuration the run measured against the branch point the
-  # pull request was built from, for the hyperlight-gh-bot to post as a PR
-  # comment. Only runs for PRs (not merge groups) with code changes.
+  # Report every configuration the run measured against the commit the pull
+  # request branched from, for the hyperlight-gh-bot to post as a PR comment.
+  # Only runs for PRs (not merge groups) with code changes.
   benchmark-comment:
     name: post-benchmark-comment
     needs:
@@ -277,9 +299,10 @@ jobs:
         run: |
           echo '## Benchmark Results' > pr-comment.md
           echo '' >> pr-comment.md
+          # No baseline is named: each run measured the branch point alongside
+          # the pull request, so the comparison it carries is the one to read.
           cargo ci bench-report --config-file bench_report.toml --reproduce \
-            --candidate run:${{ github.run_id }} \
-            --baseline base-of:${{ github.event.pull_request.number }} >> pr-comment.md
+            --candidate run:${{ github.run_id }} >> pr-comment.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -314,6 +337,7 @@ jobs:
       - docs-pr
       - update-guest-locks
       - build-guests
+      - build-baseline-guests
       - code-checks
       - check-golden-label
       - build-test

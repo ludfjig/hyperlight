@@ -18,7 +18,7 @@ use crate::{manifest, remote};
 const RUN_CACHE: &str = "target/ci-runs";
 
 /// Whose runs a report reads, when nothing else says.
-const DEFAULT_REPO: &str = "hyperlight-dev/hyperlight";
+pub(crate) const DEFAULT_REPO: &str = "hyperlight-dev/hyperlight";
 
 /// Where results come from, either a criterion directory or CI.
 #[derive(Clone)]
@@ -151,8 +151,8 @@ pub struct BenchReportArgs {
     pub candidate: Source,
 
     /// Results to compare against, in the same forms as the candidate. Defaults
-    /// to where a pull request branched, and otherwise to the previous run held
-    /// in the reported directory.
+    /// to the baseline the reported results carry, which a pull request run
+    /// measures alongside them.
     #[arg(long, value_name = "SOURCE")]
     pub baseline: Option<Source>,
 
@@ -218,12 +218,10 @@ pub async fn run(args: BenchReportArgs) -> Result<()> {
 
     let candidate = resolve(&args.candidate, &repo)?;
 
-    // Nothing within a pull request's results says what they mean, so they are
-    // measured against the branch point they were built from.
-    let source = args.baseline.clone().or(match &args.candidate {
-        Source::PullRequest(pull_request) => Some(Source::BaseOf(*pull_request)),
-        _ => None,
-    });
+    // A run measures the commit a pull request branched from alongside the
+    // pull request itself, so its results carry the comparison with them and
+    // a baseline is only read when one is named.
+    let source = args.baseline.clone();
 
     let mut baseline = Origin {
         commit: None,
@@ -336,8 +334,15 @@ fn measured(repo: &str, candidate: &Origin, baseline: &Origin) -> Option<String>
         format!("[`{short}`](https://github.com/{repo}/commit/{sha})")
     };
 
+    // A run that measured its own baseline recorded which commit that was, so
+    // the report names it without a second set of results to read it from.
+    let carried = candidate
+        .inputs
+        .iter()
+        .find_map(|input| manifest::read(&input.dir).ok().flatten()?.baseline);
+
     let mut lines = format!("Measured commit: {}", candidate.commit.as_ref().map(link)?);
-    if let Some(baseline) = baseline.commit.as_ref().map(link) {
+    if let Some(baseline) = baseline.commit.as_ref().or(carried.as_ref()).map(link) {
         lines.push_str(&format!("\nBaseline commit: {baseline}"));
     }
     lines.push_str("\n\n");
@@ -551,6 +556,44 @@ async fn discover_benchmarks(args: &BenchReportArgs, dir: &Path) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run that measured its own baseline says which commit that was, so the
+    /// report names it without another set of results to read.
+    #[test]
+    fn the_baseline_a_run_carries_is_named() {
+        let dir = std::env::temp_dir().join(format!("hl-carried-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("benchmarks.json"),
+            r#"{"timestamp":0,"host":{"os":"linux","arch":"x86_64"},
+                "benchmarks":[],"baseline":"b".repeat(40)}"#
+                .replace("\"b\".repeat(40)", &format!("\"{}\"", "b".repeat(40))),
+        )
+        .unwrap();
+
+        let candidate = Origin {
+            commit: Some("a".repeat(40)),
+            pinned: String::new(),
+            inputs: vec![Input {
+                label: None,
+                dir: dir.clone(),
+                host: None,
+            }],
+        };
+        let empty = Origin {
+            commit: None,
+            pinned: String::new(),
+            inputs: Vec::new(),
+        };
+
+        let header = measured("o/r", &candidate, &empty).expect("a measured commit is named");
+
+        assert!(header.contains("Measured commit"), "{header}");
+        assert!(header.contains("Baseline commit"), "{header}");
+        assert!(header.contains(&"b".repeat(12)), "{header}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn names_a_configuration_after_its_artifact() {

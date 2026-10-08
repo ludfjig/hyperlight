@@ -462,6 +462,10 @@ tar-static-lib: (build-rust-capi "release") (build-rust-capi "debug")
 bench-ci baseline features="":
     cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --verbose --save-baseline {{ baseline }}
 
+# Measure a commit and the current tree on this machine, and compare them
+bench-against commit guests features="":
+    cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --baseline-ref {{ commit }} --baseline-guests {{ guests }} --verbose
+
 bench features="":
     cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --verbose
 

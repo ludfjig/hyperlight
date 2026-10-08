@@ -18,6 +18,18 @@ on:
         description: Build configuration (debug or release)
         required: true
         type: string
+      ref:
+        description: >-
+          Commit to build the guests from, as a revision git resolves against
+          the checkout. Defaults to the triggering ref.
+        required: false
+        type: string
+        default: ""
+      artifact_suffix:
+        description: Appended to the artifact names, to keep separate builds apart.
+        required: false
+        type: string
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,15 +47,32 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.BUILD_GUESTS_JOB_TIMEOUT || '15') }}
     # Spread load across vendor pools: AMD when run_id ends in 0,2,4,6,8, Intel otherwise.
     runs-on: ${{ fromJson(inputs.arch == 'X64'
-        && format('["self-hosted", "Linux", "X64", "1ES.Pool=hld-kvm-{0}", "JobId=build-guests-{1}-{2}-{3}-{4}"]',
+        && format('["self-hosted", "Linux", "X64", "1ES.Pool=hld-kvm-{0}", "JobId=build-guests-{1}{5}-{2}-{3}-{4}"]',
             (endsWith(github.run_id, '0') || endsWith(github.run_id, '2') || endsWith(github.run_id, '4') || endsWith(github.run_id, '6') || endsWith(github.run_id, '8')) && 'amd' || 'intel',
             inputs.config,
             github.run_id,
             github.run_number,
-            github.run_attempt)
+            github.run_attempt,
+            inputs.artifact_suffix)
         || '["self-hosted", "Linux", "arm64"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Resolving a revision needs the history it names.
+          fetch-depth: ${{ inputs.ref == '' && 1 || 0 }}
+
+      # The checkout is the merge a pull request's validation builds, so where
+      # its two parents branched apart is where the pull request did. On
+      # anything but a merge there is no second parent to read, which would
+      # build guests for the wrong commit without saying so.
+      - name: Check out the commit to build from
+        if: inputs.ref != ''
+        run: |
+          git rev-parse --verify --quiet HEAD^2 >/dev/null || {
+            echo "::error::HEAD is not a merge, so ${{ inputs.ref }} is not the branch point"
+            exit 1
+          }
+          git checkout --detach ${{ inputs.ref }}
 
       - uses: hyperlight-dev/ci-setup-workflow@2f4142ba17cf573af44fc1e1f1ffc743daded5b3  # v1.10.0
         with:
@@ -103,7 +132,7 @@ jobs:
       - name: Upload Rust guests
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: rust-guests-${{ inputs.arch }}-${{ inputs.config }}
+          name: rust-guests-${{ inputs.arch }}-${{ inputs.config }}${{ inputs.artifact_suffix }}
           path: |
             src/tests/rust_guests/bin/${{ inputs.config }}/
           retention-days: 1
@@ -112,7 +141,7 @@ jobs:
       - name: Upload C guests
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: c-guests-${{ inputs.arch }}-${{ inputs.config }}
+          name: c-guests-${{ inputs.arch }}-${{ inputs.config }}${{ inputs.artifact_suffix }}
           path: src/tests/c_guests/bin/${{ inputs.config }}/
           retention-days: 1
           if-no-files-found: error

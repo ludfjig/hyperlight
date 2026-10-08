@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025 The Hyperlight Authors.
 mod ballast;
+mod baseline;
 mod bench;
 mod bench_report;
 mod config;
