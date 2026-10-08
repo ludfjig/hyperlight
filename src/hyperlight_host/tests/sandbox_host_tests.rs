@@ -37,7 +37,11 @@ fn pass_byte_array() {
 fn fragmented_control_round_trip_releases_buffers() {
     // The control body exceeds the four inline segment slots.
     let input = "x".repeat(5 * SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE);
-    with_all_sandboxes(|mut sbox| {
+    with_all_guests(|path| {
+        let mut sbox = SandboxBuilder::from_file(path)
+            .heap_size(256 * 1024)
+            .build()
+            .unwrap();
         let output: String = sbox.call("Echo", input.clone()).unwrap();
         assert_eq!(output, input);
 

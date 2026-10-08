@@ -20,7 +20,7 @@ use core::alloc::Layout;
 use core::ffi::c_char;
 use core::hint::black_box;
 #[cfg(target_arch = "x86_64")]
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
@@ -60,6 +60,10 @@ const TEST_R9_MODIFIED_VALUE: u64 = 0xBADC0FFEE;
 const TEST_R10_VALUE: u64 = 0xDEADBEEF;
 #[cfg(target_arch = "x86_64")]
 const RFLAGS_DF: u64 = 1 << 10;
+#[cfg(target_arch = "x86_64")]
+static MSR_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+static MSR_PROBE_FAULTED: AtomicBool = AtomicBool::new(false);
 
 #[guest_function("SetStatic")]
 fn set_static() -> i32 {
@@ -1263,6 +1267,81 @@ fn read_msr(msr: u32) -> u64 {
         );
     }
     ((read_edx as u64) << 32) | (read_eax as u64)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn msr_probe_gp_handler(
+    exception_number: u64,
+    exception_info: *mut ExceptionInfo,
+    _context: *mut Context,
+    _page_fault_address: u64,
+) -> bool {
+    if exception_number != 13 || !MSR_PROBE_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+
+    // SAFETY: The exception frame and faulting RIP are valid while the handler runs.
+    let (rip, opcode) = unsafe {
+        let rip = core::ptr::read_volatile(&(*exception_info).rip);
+        (rip, core::ptr::read_volatile(rip as *const [u8; 2]))
+    };
+    if opcode != [0x0F, 0x32] {
+        return false;
+    }
+
+    MSR_PROBE_FAULTED.store(true, Ordering::Release);
+    // SAFETY: RDMSR is two bytes. Resuming after it skips the expected fault.
+    unsafe {
+        core::ptr::write_volatile(&mut (*exception_info).rip, rip + 2);
+    }
+    true
+}
+
+#[guest_function("ProbeReadableMSRs")]
+#[cfg(target_arch = "x86_64")]
+fn probe_readable_msrs(start: u32, count: u32) -> Vec<u8> {
+    const MAX_MSRS_PER_PROBE: u32 = 4096;
+    const GP_VECTOR: usize = 13;
+
+    assert!(count <= MAX_MSRS_PER_PROBE);
+    let mut readable = vec![0u8; count.div_ceil(8) as usize];
+    let handler = &hyperlight_guest_bin::exception::arch::HANDLERS[GP_VECTOR];
+
+    // Touch the atomics before installing the handler so it cannot page fault
+    // while handling an MSR fault on the exception stack.
+    MSR_PROBE_FAULTED.store(false, Ordering::Relaxed);
+    MSR_PROBE_ACTIVE.store(false, Ordering::Relaxed);
+    handler
+        .compare_exchange(
+            0,
+            msr_probe_gp_handler as *const () as usize as u64,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("general protection handler already installed");
+    MSR_PROBE_ACTIVE.store(true, Ordering::Release);
+
+    for offset in 0..count {
+        MSR_PROBE_FAULTED.store(false, Ordering::Release);
+        // SAFETY: The test guest runs at CPL0. The temporary #GP handler skips
+        // unsupported RDMSR instructions and records their indices.
+        unsafe {
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") start.wrapping_add(offset),
+                lateout("eax") _,
+                lateout("edx") _,
+                options(nostack)
+            );
+        }
+        if !MSR_PROBE_FAULTED.load(Ordering::Acquire) {
+            readable[offset as usize / 8] |= 1 << (offset % 8);
+        }
+    }
+
+    MSR_PROBE_ACTIVE.store(false, Ordering::Release);
+    handler.store(0, Ordering::Release);
+    readable
 }
 
 #[guest_function("IncrementActiveSsp")]

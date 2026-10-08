@@ -4136,6 +4136,42 @@ mod tests {
         }
 
         #[test]
+        #[cfg(kvm)]
+        fn batched_msr_probe_recovers_from_denied_reads() {
+            use crate::hypervisor::virtual_machine::{HypervisorType, get_available_hypervisor};
+
+            if !matches!(get_available_hypervisor(), Some(HypervisorType::Kvm)) {
+                return;
+            }
+
+            const KVM_CUSTOM_MSR: u32 = 0x4B56_4D00;
+            let mut sbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+                .guest_msrs(&[KERNEL_GS_BASE])
+                .unwrap()
+                .build()
+                .unwrap();
+
+            assert_eq!(
+                sbox.call::<Vec<u8>>("ProbeReadableMSRs", (0u32, 4096u32))
+                    .unwrap()
+                    .len(),
+                512
+            );
+            assert_eq!(
+                sbox.call::<Vec<u8>>("ProbeReadableMSRs", (KERNEL_GS_BASE, 1u32))
+                    .unwrap(),
+                vec![1]
+            );
+            assert_eq!(
+                sbox.call::<Vec<u8>>("ProbeReadableMSRs", (KVM_CUSTOM_MSR, 1u32))
+                    .unwrap(),
+                vec![0]
+            );
+            assert!(!sbox.status().is_poisoned());
+            sbox.call::<u64>("ReadMSR", KERNEL_GS_BASE).unwrap();
+        }
+
+        #[test]
         #[cfg(target_arch = "x86_64")]
         fn nested_virtualization_is_hidden_from_guest() {
             let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
@@ -4686,21 +4722,32 @@ mod tests {
             // Collect all free-running leaks for one diagnostic.
             let mut free_running_leaked: Vec<u32> = Vec::new();
 
+            const PROBE_CHUNK_SIZE: u32 = 4096;
             // Architectural and low model-specific indices.
             let low = 0x0000_0000u32..=0x0000_1FFF;
             // Hyper-V synthetic indices.
             let hyperv_synthetic = 0x4000_0000u32..=0x4000_1FFF;
             // Extended and AMD model-specific indices.
             let extended = 0xC000_0000u32..=0xC001_FFFF;
-            let windows = low.chain(hyperv_synthetic).chain(extended);
-            for msr in windows {
-                let original: u64 = match sbox.call("ReadMSR", msr) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        sbox.restore(baseline.clone()).unwrap();
-                        continue;
-                    }
-                };
+
+            let mut readable_msrs = Vec::new();
+            for window in [low, hyperv_synthetic, extended] {
+                let window_end = *window.end();
+                for chunk_start in window.step_by(PROBE_CHUNK_SIZE as usize) {
+                    let chunk_len = PROBE_CHUNK_SIZE.min(window_end - chunk_start + 1);
+                    let bitmap: Vec<u8> = sbox
+                        .call("ProbeReadableMSRs", (chunk_start, chunk_len))
+                        .unwrap();
+                    assert_eq!(bitmap.len(), chunk_len.div_ceil(8) as usize);
+                    readable_msrs.extend((0..chunk_len).filter_map(|offset| {
+                        let byte = bitmap[offset as usize / 8];
+                        (byte & (1 << (offset % 8)) != 0).then_some(chunk_start + offset)
+                    }));
+                }
+            }
+
+            for msr in readable_msrs {
+                let original: u64 = sbox.call("ReadMSR", msr).unwrap();
                 readable += 1;
 
                 // A large jump distinguishes reset from normal counter progress.
