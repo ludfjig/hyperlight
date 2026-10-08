@@ -61,6 +61,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   architecture-independent exception handling hooks. The new
   interfaces are significantly more liminited, but more portable; they
   will be extended in the future.
+* MSHV: vCPU creation reads the partition's XSAVE format once. This removes
+  one hypercall from every restore.
 
 ### Removed
 * `RunPool` and the run-specific `AllocError::InvalidAlign` variant.

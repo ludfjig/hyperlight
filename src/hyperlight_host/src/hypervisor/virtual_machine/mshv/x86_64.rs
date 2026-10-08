@@ -48,7 +48,7 @@ use crate::hypervisor::virtual_machine::XSAVE_BUFFER_SIZE;
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::TimerThread;
 use crate::hypervisor::virtual_machine::{
     CreateVmError, MapMemoryError, RegisterError, RunVcpuError, UnmapMemoryError, VirtualMachine,
-    VmExit, XSAVE_MIN_SIZE,
+    VmExit,
 };
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 #[cfg(feature = "trace_guest")]
@@ -155,6 +155,8 @@ pub(crate) struct MshvVm {
     #[cfg(not(feature = "hw-interrupts"))]
     vm_fd: VmFd,
     vcpu_fd: VcpuFd,
+    /// XCOMP_BV from the XSAVE header. Fixed for the life of the partition.
+    xcomp_bv: [u8; 8],
     /// Handle to the background timer (if started).
     #[cfg(feature = "hw-interrupts")]
     timer: Option<TimerThread>,
@@ -209,12 +211,19 @@ impl MshvVm {
         #[cfg(feature = "hw-interrupts")]
         Self::init_lapic(&vcpu_fd)?;
 
+        let xsave = vcpu_fd
+            .get_xsave()
+            .map_err(|e| CreateVmError::InitializeVm(e.into()))?;
+        let mut xcomp_bv = [0u8; 8];
+        xcomp_bv.copy_from_slice(&xsave.buffer[520..528]);
+
         Ok(Self {
             #[cfg(feature = "hw-interrupts")]
             vm_fd: Arc::new(vm_fd),
             #[cfg(not(feature = "hw-interrupts"))]
             vm_fd,
             vcpu_fd,
+            xcomp_bv,
             #[cfg(feature = "hw-interrupts")]
             timer: None,
         })
@@ -569,22 +578,10 @@ impl VirtualMachine for MshvVm {
     }
 
     fn reset_xsave(&self) -> std::result::Result<(), RegisterError> {
-        let current_xsave = self
-            .vcpu_fd
-            .get_xsave()
-            .map_err(|e| RegisterError::GetXsave(e.into()))?;
-        if current_xsave.buffer.len() < XSAVE_MIN_SIZE {
-            // Minimum: 512 legacy + 64 header
-            return Err(RegisterError::XsaveSizeMismatch {
-                expected: XSAVE_MIN_SIZE as u32,
-                actual: current_xsave.buffer.len() as u32,
-            });
-        }
-
         let mut buf = XSave::default(); // default is zeroed 4KB buffer
 
         // Copy XCOMP_BV (offset 520-527) - preserves feature mask + compacted bit
-        buf.buffer[520..528].copy_from_slice(&current_xsave.buffer[520..528]);
+        buf.buffer[520..528].copy_from_slice(&self.xcomp_bv);
 
         // XSAVE area layout from Intel SDM Vol. 1 Section 13.4.1:
         // - Bytes 0-1: FCW (x87 FPU Control Word)

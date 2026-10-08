@@ -110,9 +110,9 @@ pub(crate) enum HypervisorType {
 }
 
 /// Minimum XSAVE buffer size: 512 bytes legacy region + 64 bytes header.
-/// Only used by MSHV and WHP which use compacted XSAVE format and need to
+/// Only used by WHP which uses compacted XSAVE format and needs to
 /// validate buffer size before accessing XCOMP_BV.
-#[cfg(all(target_arch = "x86_64", any(mshv3, target_os = "windows")))]
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub(crate) const XSAVE_MIN_SIZE: usize = 576;
 
 /// Standard XSAVE buffer size (4KB) used by KVM and MSHV.
