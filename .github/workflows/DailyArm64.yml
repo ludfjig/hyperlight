@@ -37,6 +37,15 @@ jobs:
       arch: arm64
       config: ${{ matrix.config }}
 
+  # Miri on aarch64, which the build-and-test matrix no longer carries. It
+  # reads no guest binaries, so it waits for nothing and reports even when the
+  # guests fail to build.
+  miri:
+    uses: ./.github/workflows/dep_miri.yml
+    secrets: inherit
+    with:
+      arch: arm64
+
   # Full aarch64 build-and-test. full_aarch64: "true" re-enables the
   # single-driver steps that are skipped on PRs.
   build-test:
@@ -100,8 +109,8 @@ jobs:
   # `gh issue create` call will fail.
   notify-failure:
     runs-on: ubuntu-latest
-    needs: [build-guests, build-test, run-examples, fuzzing]
-    if: always() && (needs.build-guests.result == 'failure' || needs.build-test.result == 'failure' || needs.run-examples.result == 'failure' || needs.fuzzing.result == 'failure')
+    needs: [build-guests, miri, build-test, run-examples, fuzzing]
+    if: always() && (needs.build-guests.result == 'failure' || needs.miri.result == 'failure' || needs.build-test.result == 'failure' || needs.run-examples.result == 'failure' || needs.fuzzing.result == 'failure')
     permissions:
       # Job-level permissions replace (not merge with) the workflow-level grant,
       # so contents:read must be re-declared for actions/checkout to work.

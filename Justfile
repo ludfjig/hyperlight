@@ -344,10 +344,14 @@ miri-jobs := env('MIRI_JOBS', num_cpus())
 ensure-cargo-nextest:
     {{ if os() == "windows" { "if (-not (cargo nextest --version 2>$null)) { cargo install --locked cargo-nextest }" } else { "cargo nextest --version >/dev/null 2>&1 || cargo install --locked cargo-nextest" } }}
 
-miri-tests: (ensure-cargo-nextest)
+# The pinned nightly and Miri, which a runner carries only if its image does
+ensure-nightly-miri:
+    rustup toolchain list | grep -q '^{{nightly-toolchain}}' || rustup toolchain install {{nightly-toolchain}}
+    rustup +{{nightly-toolchain}} component list | grep -q 'miri.*installed' || rustup component add miri --toolchain {{nightly-toolchain}}
+
+miri-tests: (ensure-cargo-nextest) (ensure-nightly-miri)
     @# A Miri interpreter is single-threaded, so libtest's --test-threads cannot
     @# use more than one core. Nextest spawns one Miri process per test.
-    rustup +{{nightly-toolchain}} component list | grep -q "miri.*installed" || rustup component add miri --toolchain {{nightly-toolchain}}
     # We can add more as needed
     cargo +{{nightly-toolchain}} miri nextest run -p hyperlight-common -F trace_guest -j {{miri-jobs}}
     cargo +{{nightly-toolchain}} miri nextest run -p hyperlight-host --lib -E 'test(/mem::shared_mem::tests/)' -j {{miri-jobs}}

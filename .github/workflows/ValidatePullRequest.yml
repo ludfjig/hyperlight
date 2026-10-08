@@ -205,6 +205,25 @@ jobs:
       config: ${{ matrix.config }}
       should_regen_goldens: ${{ needs.check-golden-label.outputs.should_regen_goldens }}
 
+  # Miri interprets rather than executing, so it reaches no hypervisor and only
+  # the architecture it compiles for changes what it covers. One job each is
+  # what the build-and-test matrix used to repeat ten times over.
+  miri:
+    needs: [docs-pr, update-guest-locks]
+    # Required because update-guest-locks is skipped on non-dependabot PRs,
+    # and a skipped dependency transitively skips all downstream jobs.
+    # See: https://github.com/actions/runner/issues/2205
+    if: ${{ !cancelled() && !failure() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [X64, arm64]
+    uses: ./.github/workflows/dep_miri.yml
+    secrets: inherit
+    with:
+      docs_only: ${{ needs.docs-pr.outputs.docs-only }}
+      arch: ${{ matrix.arch }}
+
   # Run examples - needs guest artifacts, runs in parallel with build-test
   run-examples:
     needs:
@@ -347,6 +366,7 @@ jobs:
       - update-guest-locks
       - build-guests
       - build-baseline-guests
+      - miri
       - code-checks
       - check-golden-label
       - build-test

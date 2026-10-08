@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+# Reusable workflow to run the Miri tests for a single architecture.
+#
+# Miri interprets rather than executing, so it never reaches a hypervisor and
+# nothing it does depends on which one the runner offers. It runs on the hosted
+# runners for that reason. The only axis its results depend on is the target it
+# compiles for, so one job per architecture covers what the whole
+# build-and-test matrix used to repeat.
+#
+# `just miri-tests` takes no arguments. Should it ever take a profile or a
+# feature, that becomes another axis and this matrix has to grow with it.
+
+name: Miri
+
+on:
+  workflow_call:
+    inputs:
+      docs_only:
+        description: Skip building if docs only
+        required: false
+        type: string
+        default: "false"
+      arch:
+        description: CPU architecture for the run, X64 or arm64 (passed from caller matrix)
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  miri:
+    if: ${{ inputs.docs_only == 'false' }}
+    timeout-minutes: ${{ fromJSON(vars.MIRI_JOB_TIMEOUT || '30') }}
+    # Miri asks nothing of a runner beyond its architecture, so it runs on the
+    # hosted ones and leaves the hypervisor pools to the jobs that need them.
+    runs-on: ${{ inputs.arch == 'X64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The shared setup reads /dev/kvm to report what the runner offers, which
+      # a hosted one need not have. Miri wants a toolchain and two tools, so it
+      # asks for those rather than everything a hypervisor job needs.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # master
+        with:
+          toolchain: "1.94"
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29  # v2.87.21
+        with:
+          tool: just,cargo-nextest
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: "${{ inputs.arch }}-Linux-miri"
+          cache-on-failure: "true"
+          # Only save on main as caches are not shared across branches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Miri reads no guest binaries: it covers hyperlight-common and the
+      # shared memory tests, neither of which loads one.
+      - name: Run Miri tests
+        run: env -u RUSTC_WRAPPER just miri-tests

@@ -29,8 +29,8 @@ on:
       full_aarch64:
         description: >-
           When "true", also run the single-driver tests on aarch64. PRs leave
-          this "false" so the aarch64 runner builds and runs Miri and the default
-          Rust tests; the daily schedule (DailyArm64.yml) sets it "true". This
+          this "false" so the aarch64 runner builds and runs the default Rust
+          tests; the daily schedule (DailyArm64.yml) sets it "true". This
           input only affects aarch64: it does not change X64, where those tests
           already run on Linux and are skipped on Windows regardless.
         required: false
@@ -133,18 +133,6 @@ jobs:
 
       - name: Build
         run: just build ${{ inputs.config }}
-
-      - name: Install cargo-nextest
-        if: runner.os == 'Linux'
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29  # v2.87.21
-        with:
-          tool: cargo-nextest
-
-      - name: Run Miri tests
-        # Linux on both architectures. arch/aarch64 carries no tests of its own
-        # yet, so aarch64 covers a subset until some land.
-        if: runner.os == 'Linux'
-        run: env -u RUSTC_WRAPPER just miri-tests
 
       - name: Run Rust tests
         run: |
