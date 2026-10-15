@@ -2,8 +2,9 @@
 
 name: Weekly MSHV 6.18
 
-# Runs the mshv3 tests, examples and benchmarks on the Azure Linux 3 pools with
-# the MSHV 6.18 kernel. PRs test only the default mshv3 pools.
+# Runs the mshv3 tests and examples on the Azure Linux 3 pools with the MSHV
+# 6.18 kernel. PRs test only the default mshv3 pools. DailyBenchmarks.yml
+# benchmarks these pools.
 
 on:
   # TODO: remove before merging. Runs this workflow on its own PR.
@@ -66,27 +67,13 @@ jobs:
       arch: X64
       config: ${{ matrix.config }}
 
-  benchmarks:
-    needs: build-guests
-    strategy:
-      fail-fast: false
-      matrix:
-        cpu_vendor: [amd, intel]
-    uses: ./.github/workflows/dep_benchmarks.yml
-    secrets: inherit
-    with:
-      hypervisor: mshv3
-      mshv_kernel: "6.18"
-      cpu_vendor: ${{ matrix.cpu_vendor }}
-      arch: X64
-
   # The first label is the de-duplication key used by notify-ci-failure.sh, so
   # these failures share one release-blocking issue. That label must exist in
   # the repo or `gh issue create` fails.
   notify-failure:
     runs-on: ubuntu-latest
-    needs: [build-guests, build-test, run-examples, benchmarks]
-    if: always() && github.event_name != 'pull_request' && (needs.build-guests.result == 'failure' || needs.build-test.result == 'failure' || needs.run-examples.result == 'failure' || needs.benchmarks.result == 'failure')
+    needs: [build-guests, build-test, run-examples]
+    if: always() && github.event_name != 'pull_request' && (needs.build-guests.result == 'failure' || needs.build-test.result == 'failure' || needs.run-examples.result == 'failure')
     permissions:
       # Job-level permissions replace the workflow-level grant, so checkout needs contents:read here.
       contents: read

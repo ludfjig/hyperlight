@@ -38,11 +38,27 @@ jobs:
       cpu_vendor: ${{ matrix.cpu_vendor }}
       arch: ${{ matrix.arch }}
 
+  # mshv3 on the MSHV 6.18 kernel pools. A separate job, so a failure here
+  # cannot cancel the matrix above.
+  benchmarks-mshv-6-18:
+    needs: [build-guests]
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu_vendor: [amd, intel]
+    uses: ./.github/workflows/dep_benchmarks.yml
+    secrets: inherit
+    with:
+      hypervisor: mshv3
+      mshv_kernel: "6.18"
+      cpu_vendor: ${{ matrix.cpu_vendor }}
+      arch: X64
+
   # File a GitHub issue if any job fails.
   notify-failure:
     runs-on: ubuntu-latest
-    needs: [build-guests, benchmarks]
-    if: always() && (needs.build-guests.result == 'failure' || needs.benchmarks.result == 'failure')
+    needs: [build-guests, benchmarks, benchmarks-mshv-6-18]
+    if: always() && (needs.build-guests.result == 'failure' || needs.benchmarks.result == 'failure' || needs.benchmarks-mshv-6-18.result == 'failure')
     permissions:
       issues: write
     steps:
