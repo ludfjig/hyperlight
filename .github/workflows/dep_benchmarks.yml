@@ -31,6 +31,11 @@ on:
         description: CPU architecture for the build, X64 or arm64 (passed from caller matrix)
         required: true
         type: string
+      mshv_kernel:
+        description: MSHV kernel of the Azure Linux 3 pool, for example 6.18. Empty selects the default mshv3 pool.
+        required: false
+        type: string
+        default: ""
       baseline_ref:
         description: >-
           Commit to measure these results against. When set, its benchmarks run
@@ -57,7 +62,7 @@ jobs:
     runs-on: ${{ fromJson(inputs.arch == 'X64'
         && format('["self-hosted", "{0}", "X64", "1ES.Pool=hld-{1}-{2}", "JobId=run-benchmarks-{3}-{4}-{5}"]',
             inputs.hypervisor == 'hyperv-ws2025' && 'Windows' || 'Linux',
-            inputs.hypervisor == 'hyperv-ws2025' && 'win2025' || inputs.hypervisor == 'mshv3' && 'azlinux3-mshv' || inputs.hypervisor,
+            inputs.hypervisor == 'hyperv-ws2025' && 'win2025' || inputs.hypervisor == 'mshv3' && format('azlinux3-mshv{0}', inputs.mshv_kernel != '' && format('-{0}', inputs.mshv_kernel) || '') || inputs.hypervisor,
             inputs.cpu_vendor,
             github.run_id,
             github.run_number,
