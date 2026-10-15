@@ -7,10 +7,6 @@ name: Weekly MSHV 6.18
 # benchmarks these pools.
 
 on:
-  # TODO: remove before merging. Runs this workflow on its own PR.
-  pull_request:
-    paths:
-      - '.github/workflows/WeeklyMshv618.yml'
   schedule:
     - cron: '0 3 * * 1' # Runs at 03:00 UTC every Monday
   workflow_dispatch: # Allow manual triggering
