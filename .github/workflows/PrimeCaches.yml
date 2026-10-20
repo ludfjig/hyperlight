@@ -1,13 +1,16 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 
-# Builds on main to populate the GitHub Actions cache for all Swatinem/rust-cache
-# shared-keys used by PR workflows. Caches saved on `refs/heads/main` are
-# restorable from every PR via the base-branch fallback. PR workflows are
-# configured with `save-if: github.ref == 'refs/heads/main'`, so they only ever
-# read from this cache.
+# The only workflow that writes the Rust caches pull requests restore. Entries
+# saved on main are restorable from every pull request. Every other workflow
+# only reads them.
 #
-# No tests are run here. The goal is just to populate dependency build artifacts
-# so that PR jobs start warm.
+# Each job looks up the entry for its current lockfiles and toolchain. If it
+# is missing, the job builds from a cold target and saves. rust-cache keeps
+# every dependency version it restores, so a build on a restored entry would
+# grow it with each lockfile change. Tests build but do not run.
+#
+# Keys hash lockfiles and toolchains, not build commands. Bump `prefix-key` in
+# every rust-cache step after changing what a job here builds.
 
 name: Prime Caches
 
@@ -15,6 +18,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+
+# A new run replaces a pending one and never cancels the running one, so the
+# newest commit always saves.
+concurrency:
+  group: prime-caches-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,11 +49,14 @@ jobs:
     with:
       arch: ${{ matrix.arch }}
       config: ${{ matrix.config }}
+      prime_cache: true
 
   # Populate v0-rust-code-checks-{linux,windows} caches.
   code-checks:
     uses: ./.github/workflows/dep_code_checks.yml
     secrets: inherit
+    with:
+      prime_cache: true
 
   # Populate the host caches (key {arch}-{os}-{hypervisor}-{config}) used by
   # dep_build_test.yml. Linux is primed once per hypervisor because the kvm
@@ -102,14 +114,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Keep the steps before this one in sync with dep_build_test.yml. The key
+      # hashes the installed toolchains and the Rust and C build env vars.
       - name: Rust cache
+        id: rust-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: "${{ matrix.arch }}-${{ runner.os }}-${{ matrix.hypervisor }}-${{ matrix.config }}"
-          cache-on-failure: "true"
-          # Only save on main as caches are not shared across branches.
-          # https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          lookup-only: true
 
       - name: Build host and tests
+        if: steps.rust-cache.outputs.cache-hit != 'true'
         run: just prime-caches ${{ matrix.config }}
