@@ -69,4 +69,4 @@ jobs:
       # Miri reads no guest binaries: it covers hyperlight-common and the
       # shared memory tests, neither of which loads one.
       - name: Run Miri tests
-        run: env -u RUSTC_WRAPPER just miri-tests
+        run: just miri-tests
