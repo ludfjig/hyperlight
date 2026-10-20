@@ -76,12 +76,10 @@ build-and-move-rust-guests: (build-rust-guests "debug") (move-rust-guests "debug
 build-and-move-c-guests: (build-c-guests "debug") (move-c-guests "debug") (build-c-guests "release") (move-c-guests "release")
 
 # Build non-PIE variants of rust guests for testing ELF VA mapping.
-# Phase 1 builds the sysroot without RUSTFLAGS (avoids RUSTFLAGS leaking
-# into the sysroot wrapper build in cargo-hyperlight).
-# Phase 2 uses plain cargo with --sysroot and non-PIE link flags.
-build-rust-guests-non-pie target=default-target: (ensure-cargo-hyperlight)
-    cd src/tests/rust_guests/simpleguest && cargo hyperlight build --target-dir ../target-non-pie --profile={{ if target == "debug" { "dev" } else { target } }}
-    {{ if os() == "windows" { "$env:RUSTC_BOOTSTRAP=1; $env:RUSTFLAGS='--sysroot=' + (Resolve-Path src/tests/rust_guests/target-non-pie/sysroot).Path + ' -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint';" } else { "" } }} cd src/tests/rust_guests/simpleguest && {{ if os() == "windows" { "" } else { "RUSTC_BOOTSTRAP=1 RUSTFLAGS=\"--sysroot=$(cd .. && pwd)/target-non-pie/sysroot -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint\"" } }} cargo build --target {{ hyperlight-target }} --target-dir ../target-non-pie/build --profile={{ if target == "debug" { "dev" } else { target } }}
+# Uses plain cargo with non-PIE link flags and the sysroot of the PIE build.
+# cargo-hyperlight would leak these RUSTFLAGS into its sysroot wrapper build.
+build-rust-guests-non-pie target=default-target: (build-rust-guests target)
+    {{ if os() == "windows" { "$env:RUSTC_BOOTSTRAP=1; $env:RUSTFLAGS='--sysroot=' + (Resolve-Path src/tests/rust_guests/target/sysroot).Path + ' -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint';" } else { "" } }} cd src/tests/rust_guests/simpleguest && {{ if os() == "windows" { "" } else { "RUSTC_BOOTSTRAP=1 RUSTFLAGS=\"--sysroot=$(cd .. && pwd)/target/sysroot -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint\"" } }} cargo build --target {{ hyperlight-target }} --target-dir ../target-non-pie/build --profile={{ if target == "debug" { "dev" } else { target } }}
 
 non_pie_guests_target := "src/tests/rust_guests/target-non-pie/build/" + hyperlight-target
 

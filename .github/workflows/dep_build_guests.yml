@@ -87,9 +87,7 @@ jobs:
         id: sysroot-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: |
-            src/tests/rust_guests/target/sysroot
-            src/tests/rust_guests/target-non-pie/sysroot
+          path: src/tests/rust_guests/target/sysroot
           key: sysroot-linux-${{ inputs.arch }}-${{ inputs.config }}-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Rust cache
@@ -101,8 +99,8 @@ jobs:
           # https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache
           save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
-            . -> target
             src/tests/rust_guests -> target
+            src/tests/rust_guests -> target-non-pie/build
 
       - name: Install cargo-hyperlight
         run: just ensure-cargo-hyperlight
@@ -146,7 +144,5 @@ jobs:
         if: ${{ github.ref == 'refs/heads/main' && steps.sysroot-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: |
-            src/tests/rust_guests/target/sysroot
-            src/tests/rust_guests/target-non-pie/sysroot
+          path: src/tests/rust_guests/target/sysroot
           key: ${{ steps.sysroot-cache.outputs.cache-primary-key }}
