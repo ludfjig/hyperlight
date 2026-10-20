@@ -465,8 +465,8 @@ bench-ci baseline features="":
     cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --verbose --save-baseline {{ baseline }}
 
 # Measure a commit and the current tree on this machine, and compare them
-bench-against commit guests features="":
-    cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --baseline-ref {{ commit }} --baseline-guests {{ guests }} --verbose
+bench-against commit guests features="" baseline_target_dir="":
+    cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --baseline-ref {{ commit }} --baseline-guests {{ guests }} {{ if baseline_target_dir == "" {''} else { "--baseline-target-dir " + baseline_target_dir } }} --verbose
 
 bench features="":
     cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --verbose

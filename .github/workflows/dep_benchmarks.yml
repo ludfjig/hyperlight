@@ -113,6 +113,13 @@ jobs:
           name: c-guests-${{ inputs.arch }}-release-baseline
           path: ${{ runner.temp }}/baseline-guests/c/
 
+      # The baseline builds in its own target directory. Cargo fingerprints
+      # path dependencies by mtime and workspace path, so two checkouts cannot
+      # share one. A copy of the restored cache gives it the dependencies.
+      - name: Seed baseline target directory
+        if: inputs.baseline_ref != ''
+        run: if [ -d target ]; then cp -a target "$RUNNER_TEMP/baseline-target"; fi
+
       # Both commits are measured on this machine, so the comparison reflects
       # them rather than the difference between two runners. The branch point
       # is read off the merge this run validates, so on anything else there is
@@ -127,7 +134,7 @@ jobs:
               echo "::error::HEAD is not a merge, so ${{ inputs.baseline_ref }} is not the branch point"
               exit 1
             }
-            just bench-against ${{ inputs.baseline_ref }} "$RUNNER_TEMP/baseline-guests"
+            just bench-against ${{ inputs.baseline_ref }} "$RUNNER_TEMP/baseline-guests" "" "$RUNNER_TEMP/baseline-target"
           else
             just bench-ci main
           fi
