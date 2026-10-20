@@ -137,3 +137,31 @@ jobs:
       - name: Build host and tests
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: just prime-caches ${{ matrix.config }}
+
+  # Rust keys end in a toolchain hash and a lockfile hash. Sysroot keys end in
+  # one hash. Each change leaves the old entry behind. Keep the newest entry
+  # per key and delete the rest to stay under the repository cache quota.
+  cleanup:
+    needs: [guests, code-checks, fuzz, host]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete superseded caches
+        run: |
+          # Filter by key prefix. The listing caps at 1000 entries.
+          for prefix in v0-rust- sysroot-; do
+            gh cache list --ref "$GITHUB_REF" --key "$prefix" --limit 1000 --json id,key,createdAt
+          done | jq -s -r '
+            add
+            | group_by(.key | if startswith("sysroot-") then sub("-[^-]*$"; "") else sub("-[^-]*-[^-]*$"; "") end)
+            | map(sort_by(.createdAt) | reverse | .[1:][])
+            | .[] | "\(.id) \(.key)"' |
+          while read -r id key; do
+            echo "Deleting $key"
+            gh cache delete "$id" || echo "::warning::Failed to delete $key"
+          done
