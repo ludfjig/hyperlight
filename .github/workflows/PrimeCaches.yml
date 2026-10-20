@@ -58,6 +58,17 @@ jobs:
     with:
       prime_cache: true
 
+  # Populate the fuzz cache (key fuzz-{arch}) with every fuzz target.
+  fuzz:
+    uses: ./.github/workflows/dep_fuzzing.yml
+    secrets: inherit
+    with:
+      prime_cache: true
+      arch: X64
+      target: all
+      max_total_time: 0
+      timeout_minutes: 30
+
   # Populate the host caches (key {arch}-{os}-{hypervisor}-{config}) used by
   # dep_build_test.yml. Linux is primed once per hypervisor because the kvm
   # pools run Ubuntu and the mshv3 pools run Azure Linux 3, and we want each

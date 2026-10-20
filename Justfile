@@ -548,6 +548,10 @@ fuzz-trace-cmin fuzz-target="fuzz_guest_trace":
 build-trace-fuzzers:
     cargo +{{nightly-toolchain}} fuzz build fuzz_guest_trace --features trace
 
+# Builds every fuzz target with the flags `just fuzz` uses
+build-fuzz-targets:
+    targets="$(cargo +{{nightly-toolchain}} fuzz list)" && [ -n "$targets" ] && for t in $targets; do case "$t" in *trace*) f="--features trace" ;; *) f="" ;; esac; cargo +{{nightly-toolchain}} fuzz build "$t" --release $f || exit 1; done
+
 ####################
 ### COVERAGE #######
 ####################
