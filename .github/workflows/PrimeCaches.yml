@@ -51,7 +51,7 @@ jobs:
       config: ${{ matrix.config }}
       prime_cache: true
 
-  # Populate v0-rust-code-checks-{linux,windows} caches.
+  # Populate v1-rust-code-checks-{linux,windows} caches.
   code-checks:
     uses: ./.github/workflows/dep_code_checks.yml
     secrets: inherit
@@ -131,6 +131,7 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
+          prefix-key: v1-rust
           shared-key: "${{ matrix.arch }}-${{ runner.os }}-${{ matrix.hypervisor }}-${{ matrix.config }}"
           lookup-only: true
 
@@ -154,7 +155,7 @@ jobs:
       - name: Delete superseded caches
         run: |
           # Filter by key prefix. The listing caps at 1000 entries.
-          for prefix in v0-rust- sysroot-; do
+          for prefix in v1-rust- sysroot-; do
             gh cache list --ref "$GITHUB_REF" --key "$prefix" --limit 1000 --json id,key,createdAt
           done | jq -s -r '
             add
