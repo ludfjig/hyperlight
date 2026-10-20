@@ -246,6 +246,20 @@ like-ci config=default-target hypervisor="kvm":
 # runs all tests
 test target=default-target features="": (test-unit target features) (test-isolated target features) (test-integration target features) (test-doc target features) (test-tools target)
 
+# Cargo launches test binaries through the runner in this variable, for example
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER.
+no-run-runner-var := "CARGO_TARGET_" + uppercase(arch()) + (if os() == "windows" { "_PC_WINDOWS_MSVC" } else if os() == "macos" { "_APPLE_DARWIN" } else { "_UNKNOWN_LINUX_GNU" }) + "_RUNNER"
+# Cargo runs `<runner> <binary> <args>`. Both forms exit 0 and ignore the rest.
+no-run-runner := if os() == "windows" { "cmd /c rem" } else { "true" }
+
+# Builds what `just test` and `cargo ci` compile, to fill the CI cache.
+# Tests build but do not run. Doctests are skipped because rustdoc compiles
+# them when they run.
+prime-caches target=default-target:
+    just build {{ target }}
+    cargo build -p hyperlight-ci
+    {{ set-env-command }}{{ no-run-runner-var }}='{{ no-run-runner }}'; just test-unit {{ target }} && just test-isolated {{ target }} && just test-integration {{ target }} && just test-tools {{ target }}
+
 # runs the tests of the tools this repository builds for itself, which sit
 # outside the default members the other recipes select
 test-tools target=default-target:

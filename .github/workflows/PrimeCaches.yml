@@ -49,8 +49,8 @@ jobs:
   # Populate the host caches (key {arch}-{os}-{hypervisor}-{config}) used by
   # dep_build_test.yml. Linux is primed once per hypervisor because the kvm
   # pools run Ubuntu and the mshv3 pools run Azure Linux 3, and we want each
-  # distro to restore a cache produced under its own libc. Only the host
-  # dependency graph is built here, no tests are run.
+  # distro to restore a cache produced under its own libc. The host, its tests
+  # and hyperlight-ci are built here. No tests run.
   host:
     strategy:
       fail-fast: false
@@ -111,5 +111,5 @@ jobs:
           # https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build host
-        run: just build ${{ matrix.config }}
+      - name: Build host and tests
+        run: just prime-caches ${{ matrix.config }}
