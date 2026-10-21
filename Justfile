@@ -76,12 +76,10 @@ build-and-move-rust-guests: (build-rust-guests "debug") (move-rust-guests "debug
 build-and-move-c-guests: (build-c-guests "debug") (move-c-guests "debug") (build-c-guests "release") (move-c-guests "release")
 
 # Build non-PIE variants of rust guests for testing ELF VA mapping.
-# Phase 1 builds the sysroot without RUSTFLAGS (avoids RUSTFLAGS leaking
-# into the sysroot wrapper build in cargo-hyperlight).
-# Phase 2 uses plain cargo with --sysroot and non-PIE link flags.
-build-rust-guests-non-pie target=default-target: (ensure-cargo-hyperlight)
-    cd src/tests/rust_guests/simpleguest && cargo hyperlight build --target-dir ../target-non-pie --profile={{ if target == "debug" { "dev" } else { target } }}
-    {{ if os() == "windows" { "$env:RUSTC_BOOTSTRAP=1; $env:RUSTFLAGS='--sysroot=' + (Resolve-Path src/tests/rust_guests/target-non-pie/sysroot).Path + ' -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint';" } else { "" } }} cd src/tests/rust_guests/simpleguest && {{ if os() == "windows" { "" } else { "RUSTC_BOOTSTRAP=1 RUSTFLAGS=\"--sysroot=$(cd .. && pwd)/target-non-pie/sysroot -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint\"" } }} cargo build --target {{ hyperlight-target }} --target-dir ../target-non-pie/build --profile={{ if target == "debug" { "dev" } else { target } }}
+# Uses plain cargo with non-PIE link flags and the sysroot of the PIE build.
+# cargo-hyperlight would leak these RUSTFLAGS into its sysroot wrapper build.
+build-rust-guests-non-pie target=default-target: (build-rust-guests target)
+    {{ if os() == "windows" { "$env:RUSTC_BOOTSTRAP=1; $env:RUSTFLAGS='--sysroot=' + (Resolve-Path src/tests/rust_guests/target/sysroot).Path + ' -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint';" } else { "" } }} cd src/tests/rust_guests/simpleguest && {{ if os() == "windows" { "" } else { "RUSTC_BOOTSTRAP=1 RUSTFLAGS=\"--sysroot=$(cd .. && pwd)/target/sysroot -C relocation-model=static -C link-args=--no-pie -C link-args=--image-base=0x1000000 --cfg=hyperlight --check-cfg=cfg(hyperlight) -Clink-args=-eentrypoint\"" } }} cargo build --target {{ hyperlight-target }} --target-dir ../target-non-pie/build --profile={{ if target == "debug" { "dev" } else { target } }}
 
 non_pie_guests_target := "src/tests/rust_guests/target-non-pie/build/" + hyperlight-target
 
@@ -247,6 +245,20 @@ like-ci config=default-target hypervisor="kvm":
 
 # runs all tests
 test target=default-target features="": (test-unit target features) (test-isolated target features) (test-integration target features) (test-doc target features) (test-tools target)
+
+# Cargo launches test binaries through the runner in this variable, for example
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER.
+no-run-runner-var := "CARGO_TARGET_" + uppercase(arch()) + (if os() == "windows" { "_PC_WINDOWS_MSVC" } else if os() == "macos" { "_APPLE_DARWIN" } else { "_UNKNOWN_LINUX_GNU" }) + "_RUNNER"
+# Cargo runs `<runner> <binary> <args>`. Both forms exit 0 and ignore the rest.
+no-run-runner := if os() == "windows" { "cmd /c rem" } else { "true" }
+
+# Builds what `just test` and `cargo ci` compile, to fill the CI cache.
+# Tests build but do not run. Doctests are skipped because rustdoc compiles
+# them when they run.
+prime-caches target=default-target:
+    just build {{ target }}
+    cargo build -p hyperlight-ci
+    {{ set-env-command }}{{ no-run-runner-var }}='{{ no-run-runner }}'; just test-unit {{ target }} && just test-isolated {{ target }} && just test-integration {{ target }} && just test-tools {{ target }}
 
 # runs the tests of the tools this repository builds for itself, which sit
 # outside the default members the other recipes select
@@ -467,8 +479,8 @@ bench-ci baseline features="":
     cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --verbose --save-baseline {{ baseline }}
 
 # Measure a commit and the current tree on this machine, and compare them
-bench-against commit guests features="":
-    cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --baseline-ref {{ commit }} --baseline-guests {{ guests }} --verbose
+bench-against commit guests features="" baseline_target_dir="":
+    cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --baseline-ref {{ commit }} --baseline-guests {{ guests }} {{ if baseline_target_dir == "" {''} else { "--baseline-target-dir " + baseline_target_dir } }} --verbose
 
 bench features="":
     cargo ci bench {{ if features == "" {''} else { "--features " + features } }} --verbose
@@ -535,6 +547,10 @@ fuzz-trace-cmin fuzz-target="fuzz_guest_trace":
 
 build-trace-fuzzers:
     cargo +{{nightly-toolchain}} fuzz build fuzz_guest_trace --features trace
+
+# Builds every fuzz target with the flags `just fuzz` uses
+build-fuzz-targets:
+    targets="$(cargo +{{nightly-toolchain}} fuzz list)" && [ -n "$targets" ] && for t in $targets; do case "$t" in *trace*) f="--features trace" ;; *) f="" ;; esac; cargo +{{nightly-toolchain}} fuzz build "$t" --release $f || exit 1; done
 
 ####################
 ### COVERAGE #######

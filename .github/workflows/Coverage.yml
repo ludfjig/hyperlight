@@ -44,18 +44,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-        with:
-          shared-key: "${{ runner.os }}-debug"
-          cache-on-failure: "true"
-          # Only save on main as caches are not shared across branches.
-          # https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Set up sccache
-        uses: ./.github/actions/setup-sccache
-
       - name: Build guest binaries
         run: just guests
 
