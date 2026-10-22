@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025 The Hyperlight Authors.
-use core::f64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -16,6 +15,14 @@ use crate::common::{
     with_all_guests, with_all_sandboxes, with_c_sandbox, with_c_sandbox_from,
     with_rust_uninit_sandbox, with_rust_uninit_sandbox_cfg,
 };
+
+#[test]
+fn libc_stubs_handle_empty_writes_and_clock_outputs() {
+    with_c_sandbox(|mut sandbox| {
+        let result: i32 = sandbox.call("CheckLibcStubs", ()).unwrap();
+        assert_eq!(result, 0);
+    });
+}
 
 #[test]
 fn pass_byte_array() {
