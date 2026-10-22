@@ -5,8 +5,6 @@ use tracing::{Span, instrument};
 
 use super::SandboxConfiguration;
 use super::snapshot::NextAction;
-#[cfg(any(crashdump, gdb))]
-use super::uninitialized::SandboxRuntimeConfig;
 use crate::hypervisor::hyperlight_vm::{HyperlightVm, HyperlightVmError};
 use crate::mem::exe::LoadInfo;
 use crate::mem::mgr::SandboxMemoryManager;
@@ -35,8 +33,6 @@ pub(super) fn initialize_sandbox(u_sbox: UninitializedSandbox) -> Result<Sandbox
         &u_sbox.config,
         u_sbox.stack_top_gva,
         page_size as usize,
-        #[cfg(any(crashdump, gdb))]
-        u_sbox.rt_cfg,
         u_sbox.load_info,
     )?;
 
@@ -106,12 +102,11 @@ pub(crate) fn set_up_hypervisor_partition(
     #[cfg_attr(target_os = "windows", allow(unused_variables))] config: &SandboxConfiguration,
     stack_top_gva: u64,
     page_size: usize,
-    #[cfg(any(crashdump, gdb))] rt_cfg: SandboxRuntimeConfig,
     _load_info: LoadInfo,
 ) -> Result<HyperlightVm> {
     // Create gdb thread if gdb is enabled and the configuration is provided
     #[cfg(gdb)]
-    let gdb_conn = if let Some(DebugInfo { port }) = rt_cfg.debug_info {
+    let gdb_conn = if let Some(DebugInfo { port }) = config.get_guest_debug_info() {
         use crate::hypervisor::gdb::create_gdb_thread;
 
         let gdb_conn = create_gdb_thread(port);
@@ -133,21 +128,6 @@ pub(crate) fn set_up_hypervisor_partition(
     #[cfg(feature = "mem_profile")]
     let trace_info = MemTraceInfo::new(_load_info.info)?;
 
-    // Store the original entry point address in the runtime config for core dumps.
-    // This is needed because `next_action` transitions from `Initialise(addr)` to
-    // `Call(dispatch_addr)` after guest initialisation, losing the original value
-    // that GDB needs to compute the PIE binary's load offset. The manager carries
-    // it across that transition (and across snapshot save/restore), so it is
-    // correct for both the evolve path and `Sandbox::from_snapshot`.
-    #[cfg(crashdump)]
-    let rt_cfg = {
-        let mut rt_cfg = rt_cfg;
-        if mgr.original_entrypoint != 0 {
-            rt_cfg.entry_point = Some(mgr.original_entrypoint);
-        }
-        rt_cfg
-    };
-
     Ok(HyperlightVm::new(
         mgr.shared_mem,
         mgr.scratch_mem,
@@ -158,8 +138,6 @@ pub(crate) fn set_up_hypervisor_partition(
         config,
         #[cfg(gdb)]
         gdb_conn,
-        #[cfg(crashdump)]
-        rt_cfg,
         #[cfg(feature = "mem_profile")]
         trace_info,
     )

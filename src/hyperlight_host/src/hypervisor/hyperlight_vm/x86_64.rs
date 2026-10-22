@@ -44,8 +44,6 @@ use crate::sandbox::host_funcs::FunctionRegistry;
 use crate::sandbox::snapshot::NextAction;
 #[cfg(feature = "mem_profile")]
 use crate::sandbox::trace::MemTraceInfo;
-#[cfg(crashdump)]
-use crate::sandbox::uninitialized::SandboxRuntimeConfig;
 
 #[cfg(gdb)]
 type BoxedVm = Box<dyn DebuggableVm>;
@@ -65,7 +63,6 @@ impl HyperlightVm {
         page_size: usize,
         #[cfg_attr(target_os = "windows", allow(unused_variables))] config: &SandboxConfiguration,
         #[cfg(gdb)] gdb_conn: Option<DebugCommChannel<DebugResponse, DebugMsg>>,
-        #[cfg(crashdump)] rt_cfg: SandboxRuntimeConfig,
         #[cfg(feature = "mem_profile")] trace_info: MemTraceInfo,
     ) -> std::result::Result<Self, CreateHyperlightVmError> {
         let mut vm: BoxedVm = match get_available_hypervisor() {
@@ -136,7 +133,7 @@ impl HyperlightVm {
             #[cfg(feature = "mem_profile")]
             trace_info,
             #[cfg(crashdump)]
-            rt_cfg,
+            guest_core_dump: config.get_guest_core_dump(),
             msr_reset,
         };
 
@@ -521,7 +518,7 @@ impl HyperlightVm {
         mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
     ) -> std::result::Result<Option<crate::hypervisor::crashdump::CrashDumpContext>, CrashDumpError>
     {
-        if self.rt_cfg.guest_core_dump {
+        if self.guest_core_dump {
             let mut regs = [0; 27];
 
             let vcpu_regs = self.vm.regs()?;
@@ -557,17 +554,12 @@ impl HyperlightVm {
             regs[25] = sregs.fs.selector as u64; // fs
             regs[26] = sregs.gs.selector as u64; // gs
 
-            // Use the stored entry point address from the runtime config.
-            // This is the original entry point (load_addr + ELF entry offset)
-            // which GDB needs for AT_ENTRY to compute the PIE load offset.
-            // We cannot use self.next_action here because it transitions from
-            // Initialise(addr) to Call(dispatch_addr) after guest init.
-            let initialise = self.rt_cfg.entry_point.unwrap_or_else(|| {
-                tracing::warn!(
-                    "entry_point was never set in SandboxRuntimeConfig; AT_ENTRY will be 0"
-                );
-                0
-            });
+            // GDB derives the PIE load offset from AT_ENTRY. `next_action`
+            // holds the dispatch address after init, so use the ELF entry.
+            let entry = mem_mgr.original_entrypoint;
+            if entry == 0 {
+                tracing::warn!("Guest entry point is unknown; AT_ENTRY will be 0");
+            }
             let mmap_regions: Vec<MemoryRegion> = self.get_mapped_regions().cloned().collect();
             let root_pt = self.get_root_pt()?;
 
@@ -579,8 +571,7 @@ impl HyperlightVm {
                 regions,
                 regs,
                 xsave.to_vec(),
-                initialise,
-                self.rt_cfg.binary_path.clone(),
+                entry,
             )))
         } else {
             Ok(None)
@@ -880,8 +871,6 @@ mod tests {
     use crate::mem::shared_mem::{ExclusiveSharedMemory, ReadonlySharedMemory};
     use crate::sandbox::SandboxConfiguration;
     use crate::sandbox::host_funcs::FunctionRegistry;
-    #[cfg(any(crashdump, gdb))]
-    use crate::sandbox::uninitialized::SandboxRuntimeConfig;
     use crate::sandbox::uninitialized_evolve::set_up_hypervisor_partition;
 
     /// Test context holding an initialized VM with memory manager.
@@ -1472,8 +1461,6 @@ mod tests {
     /// both `hyperlight_vm()` and `create_test_vm_context()`.
     fn create_test_vm_context(code: &[u8]) -> TestVmContext {
         let config: SandboxConfiguration = Default::default();
-        #[cfg(any(crashdump, gdb))]
-        let rt_cfg: SandboxRuntimeConfig = Default::default();
 
         let (layout, pt_bytes) = create_test_layout(code.len());
 
@@ -1506,8 +1493,6 @@ mod tests {
             &config,
             stack_top_gva,
             page_size::get(),
-            #[cfg(any(crashdump, gdb))]
-            rt_cfg,
             crate::mem::exe::LoadInfo::dummy(),
         )
         .unwrap();

@@ -22,25 +22,6 @@ use crate::mem::shared_mem::{ExclusiveSharedMemory, SharedMemory};
 use crate::sandbox::SandboxConfiguration;
 use crate::{Result, Sandbox, new_error};
 
-#[cfg(any(crashdump, gdb))]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct SandboxRuntimeConfig {
-    #[cfg(crashdump)]
-    pub(crate) binary_path: Option<PathBuf>,
-    #[cfg(gdb)]
-    pub(crate) debug_info: Option<super::config::DebugInfo>,
-    #[cfg(crashdump)]
-    pub(crate) guest_core_dump: bool,
-    /// The original entry point address of the loaded guest binary
-    /// (load_addr + ELF entry offset). Used for AT_ENTRY in core dumps
-    /// so GDB can compute the correct load offset for PIE binaries.
-    ///
-    /// `None` until resolved from the snapshot's `NextAction::Initialise`
-    /// in `set_up_hypervisor_partition`.
-    #[cfg(crashdump)]
-    pub(crate) entry_point: Option<u64>,
-}
-
 /// A preliminary sandbox that represents allocated memory and registered host functions,
 /// but has not yet created the underlying virtual machine.
 ///
@@ -58,8 +39,6 @@ pub struct UninitializedSandbox {
     /// The memory manager for the sandbox.
     pub(crate) mgr: SandboxMemoryManager<ExclusiveSharedMemory>,
     pub(crate) config: SandboxConfiguration,
-    #[cfg(any(crashdump, gdb))]
-    pub(crate) rt_cfg: SandboxRuntimeConfig,
     pub(crate) load_info: crate::mem::exe::LoadInfo,
     // This is needed to convey the stack pointer between the snapshot
     // and the HyperlightVm creation
@@ -162,11 +141,7 @@ impl UninitializedSandbox {
     // `InterruptHandler` on Linux.
     //
     // This is ok for now as this is not a public function
-    fn from_snapshot(
-        snapshot: Arc<Snapshot>,
-        cfg: Option<SandboxConfiguration>,
-        #[cfg(crashdump)] binary_path: Option<PathBuf>,
-    ) -> Result<Self> {
+    fn from_snapshot(snapshot: Arc<Snapshot>, cfg: Option<SandboxConfiguration>) -> Result<Self> {
         #[cfg(feature = "build-metadata")]
         log_build_details();
 
@@ -175,28 +150,6 @@ impl UninitializedSandbox {
         check_windows_version()?;
 
         let sandbox_cfg = cfg.unwrap_or_default();
-
-        #[cfg(any(crashdump, gdb))]
-        let rt_cfg = {
-            #[cfg(crashdump)]
-            let guest_core_dump = sandbox_cfg.get_guest_core_dump();
-
-            #[cfg(gdb)]
-            let debug_info = sandbox_cfg.get_guest_debug_info();
-
-            SandboxRuntimeConfig {
-                #[cfg(crashdump)]
-                binary_path,
-                #[cfg(gdb)]
-                debug_info,
-                #[cfg(crashdump)]
-                guest_core_dump,
-                // entry_point is set later in set_up_hypervisor_partition
-                // once the entrypoint is resolved from the snapshot
-                #[cfg(crashdump)]
-                entry_point: None,
-            }
-        };
 
         let mem_mgr_wrapper =
             SandboxMemoryManager::<ExclusiveSharedMemory>::from_snapshot(snapshot.as_ref())?;
@@ -207,8 +160,6 @@ impl UninitializedSandbox {
             host_funcs,
             mgr: mem_mgr_wrapper,
             config: sandbox_cfg,
-            #[cfg(any(crashdump, gdb))]
-            rt_cfg,
             load_info: snapshot.load_info(),
             stack_top_gva: snapshot.stack_top_gva(),
             pending_file_mappings: Vec::new(),
@@ -235,19 +186,8 @@ impl UninitializedSandbox {
         cfg: Option<SandboxConfiguration>,
     ) -> Result<Self> {
         let cfg = cfg.unwrap_or_default();
-        let env = env.into();
-        #[cfg(crashdump)]
-        let binary_path = match &env.guest_binary {
-            GuestBinary::FilePath(path) => Some(path.clone()),
-            GuestBinary::Buffer(_) => None,
-        };
         let snapshot = Snapshot::from_env(env, cfg)?;
-        Self::from_snapshot(
-            Arc::new(snapshot),
-            Some(cfg),
-            #[cfg(crashdump)]
-            binary_path,
-        )
+        Self::from_snapshot(Arc::new(snapshot), Some(cfg))
     }
 
     /// Creates and initializes the virtual machine, transforming this into a ready-to-use sandbox.
@@ -1128,22 +1068,12 @@ mod tests {
             );
 
             // Create first sandbox from snapshot
-            let sandbox1 = UninitializedSandbox::from_snapshot(
-                snapshot.clone(),
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create first sandbox from snapshot");
+            let sandbox1 = UninitializedSandbox::from_snapshot(snapshot.clone(), None)
+                .expect("Failed to create first sandbox from snapshot");
 
             // Create second sandbox from same snapshot
-            let sandbox2 = UninitializedSandbox::from_snapshot(
-                snapshot.clone(),
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create second sandbox from snapshot");
+            let sandbox2 = UninitializedSandbox::from_snapshot(snapshot.clone(), None)
+                .expect("Failed to create second sandbox from snapshot");
 
             // Both should be able to evolve independently
             let _evolved1 = sandbox1.evolve().expect("Failed to evolve sandbox1");
@@ -1162,13 +1092,8 @@ mod tests {
                     .expect("Failed to create snapshot with custom heap size"),
             );
 
-            let sandbox = UninitializedSandbox::from_snapshot(
-                snapshot,
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox from snapshot with custom heap");
+            let sandbox = UninitializedSandbox::from_snapshot(snapshot, None)
+                .expect("Failed to create sandbox from snapshot with custom heap");
 
             let _evolved = sandbox.evolve().expect("Failed to evolve sandbox");
         }
@@ -1185,13 +1110,8 @@ mod tests {
                     .expect("Failed to create snapshot with custom stack size"),
             );
 
-            let sandbox = UninitializedSandbox::from_snapshot(
-                snapshot,
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox from snapshot with custom stack");
+            let sandbox = UninitializedSandbox::from_snapshot(snapshot, None)
+                .expect("Failed to create sandbox from snapshot with custom stack");
 
             let _evolved = sandbox.evolve().expect("Failed to evolve sandbox");
         }
@@ -1210,27 +1130,12 @@ mod tests {
             );
 
             // Create multiple sandboxes from the same snapshot
-            let sandbox1 = UninitializedSandbox::from_snapshot(
-                snapshot.clone(),
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox1 from fully customized snapshot");
-            let sandbox2 = UninitializedSandbox::from_snapshot(
-                snapshot.clone(),
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox2 from fully customized snapshot");
-            let sandbox3 = UninitializedSandbox::from_snapshot(
-                snapshot.clone(),
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox3 from fully customized snapshot");
+            let sandbox1 = UninitializedSandbox::from_snapshot(snapshot.clone(), None)
+                .expect("Failed to create sandbox1 from fully customized snapshot");
+            let sandbox2 = UninitializedSandbox::from_snapshot(snapshot.clone(), None)
+                .expect("Failed to create sandbox2 from fully customized snapshot");
+            let sandbox3 = UninitializedSandbox::from_snapshot(snapshot.clone(), None)
+                .expect("Failed to create sandbox3 from fully customized snapshot");
 
             let _evolved1 = sandbox1.evolve().expect("Failed to evolve sandbox1");
             let _evolved2 = sandbox2.evolve().expect("Failed to evolve sandbox2");
@@ -1246,13 +1151,8 @@ mod tests {
                     .expect("Failed to create snapshot from buffer"),
             );
 
-            let sandbox = UninitializedSandbox::from_snapshot(
-                snapshot,
-                None,
-                #[cfg(crashdump)]
-                None,
-            )
-            .expect("Failed to create sandbox from buffer-based snapshot");
+            let sandbox = UninitializedSandbox::from_snapshot(snapshot, None)
+                .expect("Failed to create sandbox from buffer-based snapshot");
 
             let _evolved = sandbox.evolve().expect("Failed to evolve sandbox");
         }
@@ -1265,13 +1165,8 @@ mod tests {
                 Snapshot::from_env(env, Default::default()).expect("Failed to create snapshot"),
             );
 
-            let mut sandbox = UninitializedSandbox::from_snapshot(
-                snapshot,
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox from snapshot");
+            let mut sandbox = UninitializedSandbox::from_snapshot(snapshot, None)
+                .expect("Failed to create sandbox from snapshot");
 
             // Register a custom host function
             sandbox
@@ -1307,13 +1202,8 @@ mod tests {
                     .expect("Failed to create snapshot with init data"),
             );
 
-            let sandbox = UninitializedSandbox::from_snapshot(
-                snapshot,
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create sandbox from snapshot with init data");
+            let sandbox = UninitializedSandbox::from_snapshot(snapshot, None)
+                .expect("Failed to create sandbox from snapshot with init data");
 
             let _evolved = sandbox.evolve().expect("Failed to evolve sandbox");
         }
@@ -1325,26 +1215,16 @@ mod tests {
                 Snapshot::from_env(env, Default::default())
                     .expect("Failed to create snapshot with default config"),
             );
-            let orig_sandbox = UninitializedSandbox::from_snapshot(
-                orig_snapshot,
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create orig_sandbox");
+            let orig_sandbox = UninitializedSandbox::from_snapshot(orig_snapshot, None)
+                .expect("Failed to create orig_sandbox");
             let mut initialized_sandbox = orig_sandbox
                 .evolve()
                 .expect("Failed to evolve orig_sandbox");
             let new_snapshot = initialized_sandbox
                 .snapshot()
                 .expect("Failed to create new_snapshot");
-            let new_sandbox = UninitializedSandbox::from_snapshot(
-                new_snapshot,
-                None,
-                #[cfg(crashdump)]
-                Some(binary_path.clone()),
-            )
-            .expect("Failed to create new_sandbox");
+            let new_sandbox = UninitializedSandbox::from_snapshot(new_snapshot, None)
+                .expect("Failed to create new_sandbox");
             let _evolved = new_sandbox.evolve().expect("Failed to evolve new_sandbox");
         }
     }

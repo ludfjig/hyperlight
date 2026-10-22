@@ -287,32 +287,8 @@ impl Sandbox {
         #[cfg(target_os = "linux")]
         crate::signal_handlers::setup_signal_handlers(&config)?;
 
-        // Runtime config for the restored sandbox. `guest_core_dump`
-        // (crashdump) and `guest_debug_info` (gdb) come from the caller's
-        // config. `binary_path` stays `None`. `set_up_hypervisor_partition`
-        // fills `entry_point` from the manager's entry point so crashdumps
-        // carry the correct `AT_ENTRY`.
-        #[cfg(any(crashdump, gdb))]
-        let rt_cfg = crate::sandbox::uninitialized::SandboxRuntimeConfig {
-            #[cfg(crashdump)]
-            binary_path: None,
-            #[cfg(gdb)]
-            debug_info: config.get_guest_debug_info(),
-            #[cfg(crashdump)]
-            guest_core_dump: config.get_guest_core_dump(),
-            #[cfg(crashdump)]
-            entry_point: None,
-        };
-
-        let mut vm = set_up_hypervisor_partition(
-            gshm,
-            &config,
-            stack_top_gva,
-            page_size,
-            #[cfg(any(crashdump, gdb))]
-            rt_cfg,
-            load_info,
-        )?;
+        let mut vm =
+            set_up_hypervisor_partition(gshm, &config, stack_top_gva, page_size, load_info)?;
 
         let seed = {
             let mut rng = rand::rng();
@@ -670,14 +646,6 @@ impl Sandbox {
 
         self.vm.set_stack_top(snapshot.stack_top_gva());
         self.vm.set_next_action(snapshot.next_action());
-        // Carry the guest ELF entry point across restore so a later
-        // crashdump fills `AT_ENTRY` from the restored image.
-        #[cfg(crashdump)]
-        {
-            self.vm
-                .set_crashdump_entry_point(snapshot.original_entrypoint());
-            self.vm.clear_crashdump_binary_path();
-        }
 
         self.mem_mgr
             .request_libc_rng_reseed(rand::random::<u32>())?;

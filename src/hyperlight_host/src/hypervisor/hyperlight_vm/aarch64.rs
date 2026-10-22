@@ -37,8 +37,6 @@ use crate::sandbox::host_funcs::FunctionRegistry;
 use crate::sandbox::snapshot::NextAction;
 #[cfg(feature = "mem_profile")]
 use crate::sandbox::trace::MemTraceInfo;
-#[cfg(crashdump)]
-use crate::sandbox::uninitialized::SandboxRuntimeConfig;
 
 impl HyperlightVm {
     #[allow(clippy::too_many_arguments)]
@@ -52,7 +50,6 @@ impl HyperlightVm {
         page_size: usize,
         #[cfg_attr(target_os = "windows", allow(unused_variables))] config: &SandboxConfiguration,
         #[cfg(gdb)] _gdb_conn: Option<DebugCommChannel<DebugResponse, DebugMsg>>,
-        #[cfg(crashdump)] _rt_cfg: SandboxRuntimeConfig,
         #[cfg(feature = "mem_profile")] _trace_info: MemTraceInfo,
     ) -> std::result::Result<Self, CreateHyperlightVmError> {
         // TODO: support gdb on aarch64
