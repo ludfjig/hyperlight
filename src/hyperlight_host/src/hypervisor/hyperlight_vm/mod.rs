@@ -44,8 +44,6 @@ use crate::sandbox::outb::{HandleOutbError, handle_outb};
 use crate::sandbox::snapshot::NextAction;
 #[cfg(feature = "mem_profile")]
 use crate::sandbox::trace::MemTraceInfo;
-#[cfg(crashdump)]
-use crate::sandbox::uninitialized::SandboxRuntimeConfig;
 
 /// Get the logging level filter to pass to the guest entrypoint
 ///
@@ -399,7 +397,7 @@ pub(crate) struct HyperlightVm {
     #[cfg(feature = "mem_profile")]
     pub(super) trace_info: MemTraceInfo,
     #[cfg(crashdump)]
-    pub(super) rt_cfg: SandboxRuntimeConfig,
+    pub(super) guest_core_dump: bool,
     /// MSRs restored on snapshot restore.
     #[cfg(target_arch = "x86_64")]
     pub(super) msr_reset: crate::hypervisor::regs::MsrResetState,
@@ -574,18 +572,6 @@ impl HyperlightVm {
     /// Set the next action to perform when the sandbox resumes
     pub(crate) fn set_next_action(&mut self, next_action: NextAction) {
         self.next_action = next_action
-    }
-
-    /// Set the guest ELF entry point used to fill `AT_ENTRY` in
-    /// crashdumps.
-    #[cfg(crashdump)]
-    pub(crate) fn set_crashdump_entry_point(&mut self, entry_point: u64) {
-        self.rt_cfg.entry_point = Some(entry_point);
-    }
-
-    #[cfg(crashdump)]
-    pub(crate) fn clear_crashdump_binary_path(&mut self) {
-        self.rt_cfg.binary_path = None;
     }
 
     pub(crate) fn interrupt_handle(&self) -> Arc<dyn InterruptHandle> {
@@ -786,7 +772,7 @@ impl HyperlightVm {
             }
             Err(e) => {
                 #[cfg(crashdump)]
-                if self.rt_cfg.guest_core_dump {
+                if self.guest_core_dump {
                     crate::hypervisor::crashdump::generate_crashdump(self, mem_mgr, None)
                         .map_err(|e| RunVmError::CrashdumpGeneration(Box::new(e)))?;
                 }

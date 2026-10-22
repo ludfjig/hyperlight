@@ -470,8 +470,6 @@ pub(crate) mod tests {
     use hyperlight_testing::dummy_guest_as_pathbuf;
 
     use crate::sandbox::uninitialized::GuestBinary;
-    #[cfg(any(crashdump, gdb))]
-    use crate::sandbox::uninitialized::SandboxRuntimeConfig;
     use crate::sandbox::uninitialized_evolve::set_up_hypervisor_partition;
     use crate::sandbox::{SandboxConfiguration, UninitializedSandbox};
     use crate::{Result, is_hypervisor_present};
@@ -489,8 +487,6 @@ pub(crate) mod tests {
         let filename = dummy_guest_as_pathbuf();
 
         let config: SandboxConfiguration = Default::default();
-        #[cfg(any(crashdump, gdb))]
-        let rt_cfg: SandboxRuntimeConfig = Default::default();
         let sandbox =
             UninitializedSandbox::new(GuestBinary::FilePath(filename.clone()), Some(config))?;
         let (mut mem_mgr, gshm) = sandbox.mgr.build().unwrap();
@@ -502,8 +498,6 @@ pub(crate) mod tests {
             &config,
             exn_stack_top_gva,
             page_size::get(),
-            #[cfg(any(crashdump, gdb))]
-            rt_cfg,
             sandbox.load_info,
         )?;
 
