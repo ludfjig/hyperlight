@@ -2,8 +2,6 @@
 // Copyright 2025 The Hyperlight Authors.
 
 use anyhow::{Context, Result};
-#[cfg(feature = "build-metadata")]
-use built::write_built_file;
 
 fn main() -> Result<()> {
     // re-run the build if this script is changed (or deleted!),
@@ -173,9 +171,6 @@ fn main() -> Result<()> {
         // we never have to `#[allow(dead_code)]` it.
         readable_shared_mem: { any(gdb, all(feature = "mem_profile", not(unshared_snapshot_mem))) },
     }
-
-    #[cfg(feature = "build-metadata")]
-    write_built_file()?;
 
     Ok(())
 }

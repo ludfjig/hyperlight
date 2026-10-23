@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 * **Breaking:** The `print_debug` cargo feature and the exported `hyperlight_host::debug!` macro. Use `tracing::debug!` with a subscriber.
+* **Breaking:** The `build-metadata` cargo feature. A library should not log build details, and for crates.io users its git fields were always empty. Applications can log build details with their own tooling.
 
 ### Fixed
 
