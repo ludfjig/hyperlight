@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 pub(crate) use file::host_cpu_vendor_golden_tag;
 pub use file::reference::{OciDigest, OciReference, OciTag};
-use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use hyperlight_common::layout::{
     SCRATCH_TOP_GVA, io_page, scratch_base_gpa, scratch_base_gva, scratch_reserved_top_gpa,
     scratch_reserved_top_gva, scratch_transport_end_gva,
@@ -32,6 +31,7 @@ use crate::mem::mgr::{GuestPageTableBuffer, SnapshotSharedMemory};
 use crate::mem::shared_mem::{ReadonlySharedMemory, SharedMemory};
 use crate::mem::virtq::VirtqSnapshot;
 use crate::sandbox::SandboxConfiguration;
+use crate::sandbox::host_funcs::HostFunctionDefinition;
 use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
 
 const PTE_SIZE: usize = size_of::<vmem::PageTableEntry>();
@@ -157,7 +157,7 @@ struct SnapshotState {
     /// [`crate::Sandbox::from_snapshot`] to reject a
     /// `HostFunctions` set that is missing required functions or
     /// has mismatched signatures.
-    host_functions: HostFunctionDetails,
+    host_functions: Vec<HostFunctionDefinition>,
 
     /// Validated ring images omitted from ordinary snapshot pages.
     ///
@@ -483,9 +483,7 @@ impl Snapshot {
                 next_action: NextAction::Initialise(entrypoint_gva),
                 original_entrypoint: entrypoint_gva,
                 snapshot_generation: 0,
-                host_functions: HostFunctionDetails {
-                    host_functions: None,
-                },
+                host_functions: Vec::new(),
                 virtq: None,
             }),
             metadata: BTreeMap::new(),
@@ -519,7 +517,7 @@ impl Snapshot {
         next_action: NextAction,
         original_entrypoint: u64,
         snapshot_generation: u64,
-        host_functions: HostFunctionDetails,
+        host_functions: Vec<HostFunctionDefinition>,
         virtq: Option<VirtqSnapshot>,
         scratch_size: usize,
     ) -> Result<Self> {
@@ -868,10 +866,7 @@ impl Snapshot {
         &self,
         provided: &crate::sandbox::host_funcs::FunctionRegistry,
     ) -> Result<()> {
-        let required = match &self.state.host_functions.host_functions {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+        let required = &self.state.host_functions;
         if required.is_empty() {
             return Ok(());
         }
@@ -885,13 +880,8 @@ impl Snapshot {
                 None => missing.push(req.function_name.clone()),
                 // Function exists, but signature does not match.
                 Some((found_parameter_types, found_return_type))
-                    if {
-                        let params_match = match req.parameter_types.as_deref() {
-                            Some(params) => params == found_parameter_types,
-                            None => found_parameter_types.is_empty(),
-                        };
-                        !params_match || req.return_type != found_return_type
-                    } =>
+                    if req.parameter_types != found_parameter_types
+                        || req.return_type != found_return_type =>
                 {
                     signature_mismatches.push(format!(
                         "{}: snapshot has {:?} -> {:?}, registered {:?} -> {:?}",
@@ -920,7 +910,6 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
     use hyperlight_common::vmem::{self, BasicMapping, Mapping, MappingKind, PAGE_SIZE};
 
     use crate::hypervisor::regs::CommonSpecialRegisters;
@@ -1004,7 +993,7 @@ mod tests {
             super::NextAction::None,
             0,
             1,
-            HostFunctionDetails::default(),
+            Vec::new(),
             None,
             mgr.layout.get_scratch_size(),
         )
@@ -1026,7 +1015,7 @@ mod tests {
             super::NextAction::None,
             0,
             2,
-            HostFunctionDetails::default(),
+            Vec::new(),
             None,
             mgr.layout.get_scratch_size(),
         )
@@ -1064,7 +1053,7 @@ mod tests {
             super::NextAction::None,
             0,
             1,
-            HostFunctionDetails::default(),
+            Vec::new(),
             None,
             scratch_size,
         )

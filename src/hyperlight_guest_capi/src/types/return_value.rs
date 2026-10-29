@@ -9,7 +9,7 @@ use core::mem::ManuallyDrop;
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{ReturnType, ReturnValue};
 
-use super::{FfiByteChunks, FfiVec};
+use super::FfiByteChunks;
 
 /// The value held by an [`FfiReturnValue`].
 #[repr(C)]
@@ -24,7 +24,6 @@ pub union FfiReturnValueUnion {
     pub Double: f64,
     pub Bool: bool,
     pub String: *mut c_char,
-    pub VecBytes: FfiVec,
     pub ByteChunks: FfiByteChunks,
 }
 
@@ -102,12 +101,12 @@ impl FfiReturnValue {
         }
     }
 
-    pub fn vec_bytes(value: Vec<u8>) -> Self {
+    /// Bytes stored in one owned chunk.
+    pub fn bytes(value: Vec<u8>) -> Self {
         Self {
-            tag: ReturnType::VecBytes,
-            // SAFETY: `FfiReturnValue` reclaims the allocation when consumed or dropped.
+            tag: ReturnType::ByteChunks,
             value: FfiReturnValueUnion {
-                VecBytes: unsafe { FfiVec::from_vec(value) },
+                ByteChunks: FfiByteChunks::from_owned_chunks(alloc::vec![value]),
             },
         }
     }
@@ -148,7 +147,6 @@ impl FfiReturnValue {
                     let value = CString::from_raw(value.value.String);
                     ReturnValue::String(value.to_string_lossy().into_owned())
                 }
-                ReturnType::VecBytes => ReturnValue::VecBytes(value.value.VecBytes.into_vec()),
                 ReturnType::ByteChunks => {
                     ReturnValue::ByteChunks(value.value.ByteChunks.into_owned_bytes())
                 }
@@ -163,7 +161,6 @@ impl Drop for FfiReturnValue {
         unsafe {
             match self.tag {
                 ReturnType::String => drop(CString::from_raw(self.value.String)),
-                ReturnType::VecBytes => drop(self.value.VecBytes.into_vec()),
                 ReturnType::ByteChunks => self.value.ByteChunks.drop_owned(),
                 _ => {}
             }

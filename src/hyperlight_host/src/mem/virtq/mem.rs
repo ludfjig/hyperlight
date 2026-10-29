@@ -7,7 +7,7 @@
 //! its lifecycle read lock. This preserves exclusive-memory coordination but
 //! makes descriptor traversal pay for one lock acquisition per field access.
 
-use core::mem::{align_of, size_of};
+use core::mem::{MaybeUninit, align_of, size_of};
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use hyperlight_common::layout::scratch_base_gva;
@@ -59,6 +59,11 @@ unsafe impl MemOps for HostMemOps {
     fn read(&self, addr: u64, dst: &mut [u8]) -> Result<()> {
         let offset = self.to_offset(addr)?;
         Ok(self.scratch_mem.copy_to_slice(dst, offset)?)
+    }
+
+    fn read_uninit(&self, addr: u64, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
+        let offset = self.to_offset(addr)?;
+        Ok(self.scratch_mem.copy_to_uninit(dst, offset)?)
     }
 
     fn write(&self, addr: u64, src: &[u8]) -> Result<()> {

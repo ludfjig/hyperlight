@@ -70,6 +70,7 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockWriteGuard};
 use super::{
     CreateVmError, HvfSyncError, HypervisorError, MapMemoryError, MemorySpaceInstallError,
     RegisterError, ResetVcpuError, RunVcpuError, UnmapMemoryError, VirtualMachine, VmExit,
+    io_out_value,
 };
 use crate::hypervisor::InterruptHandleImpl;
 use crate::hypervisor::regs::{
@@ -660,7 +661,7 @@ impl HvfCpu {
                                     } else {
                                         0
                                     };
-                                    VmExit::IoOut(port as u16, data.to_ne_bytes().to_vec())
+                                    VmExit::IoOut(port as u16, io_out_value(&data.to_ne_bytes()))
                                 }
                             } else {
                                 VmExit::MmioWrite(ipa)

@@ -8,6 +8,7 @@
 //! work with different memory backends e.g. Host vs Guest.
 
 use alloc::sync::Arc;
+use core::mem::MaybeUninit;
 
 use bytemuck::Pod;
 
@@ -25,6 +26,8 @@ use super::BufferLease;
 /// - Memory ordering guarantees are upheld as documented.
 /// - Typed reads/writes and atomic operations honor alignment and initialized
 ///   memory requirements for the translated addresses.
+/// - [`read_uninit`](Self::read_uninit) initializes every byte of its
+///   destination when it returns `Ok`.
 ///
 /// [`RingProducer`]: super::RingProducer
 /// [`RingConsumer`]: super::RingConsumer
@@ -43,6 +46,19 @@ pub unsafe trait MemOps {
     /// Implementations must return an error if `addr` cannot be read for
     /// at least `dst.len()` bytes.
     fn read(&self, addr: u64, dst: &mut [u8]) -> Result<(), Self::Error>;
+
+    /// Read bytes at a backend address into possibly uninitialized memory.
+    ///
+    /// Every byte of `dst` is initialized on `Ok`. The default zero-fills
+    /// `dst` and calls [`read`](Self::read). Backends override it to skip the
+    /// zero-fill.
+    fn read_uninit(&self, addr: u64, dst: &mut [MaybeUninit<u8>]) -> Result<(), Self::Error> {
+        dst.fill(MaybeUninit::new(0));
+        // SAFETY: Every element was just initialized, and `MaybeUninit<u8>` has
+        // the layout of `u8`.
+        let dst = unsafe { &mut *(dst as *mut [MaybeUninit<u8>] as *mut [u8]) };
+        self.read(addr, dst)
+    }
 
     /// Write bytes at a backend address.
     ///
@@ -146,6 +162,10 @@ unsafe impl<T: MemOps> MemOps for Arc<T> {
 
     fn read(&self, addr: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
         (**self).read(addr, dst)
+    }
+
+    fn read_uninit(&self, addr: u64, dst: &mut [MaybeUninit<u8>]) -> Result<(), Self::Error> {
+        (**self).read_uninit(addr, dst)
     }
 
     fn write(&self, addr: u64, src: &[u8]) -> Result<(), Self::Error> {

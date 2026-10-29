@@ -16,6 +16,9 @@ extra_bindings = ["hyperlight-guest-bin"]
 [enum]
 prefix_with_name = true
 
+[fn]
+deprecated_with_note = "__attribute__((deprecated({})))"
+
 [export]
 prefix = "hl_"
 

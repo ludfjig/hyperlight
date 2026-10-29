@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use hyperlight_host::func::Bytes;
 use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
 use hyperlight_host::{HostFunctions, Sandbox, SandboxBuilder};
 
@@ -115,9 +116,10 @@ fn captured_bss(golden: &GoldenTest) -> Result<(), String> {
 /// save/load.
 fn captured_heap_pattern(golden: &GoldenTest) -> Result<(), String> {
     let mut sbox = golden.load_sandbox()?;
-    let got: Vec<u8> = sbox
-        .call("ReadPattern", ())
-        .map_err(|e| format!("ReadPattern: {e}"))?;
+    let got = sbox
+        .call::<Vec<Bytes>>("ReadPattern", ())
+        .map_err(|e| format!("ReadPattern: {e}"))?
+        .concat();
     let expected: Vec<u8> = (0..HEAP_PATTERN_LEN as usize)
         .map(|i| (i & 0xff) as u8)
         .collect();
@@ -192,9 +194,9 @@ fn guest_types_round_trip(golden: &GoldenTest) -> Result<(), String> {
     }
     echo!("EchoBool", bool, [false, true]);
 
-    for v in [String::new(), "hello".to_string(), "héllo 🌍".to_string()] {
+    for v in ["", "hello", "héllo 🌍"] {
         let got: String = sbox
-            .call("Echo", v.clone())
+            .call("Echo", v)
             .map_err(|e| format!("Echo({v:?}): {e}"))?;
         if got != v {
             return Err(format!("Echo({v:?}) returned {got:?}"));
@@ -205,9 +207,10 @@ fn guest_types_round_trip(golden: &GoldenTest) -> Result<(), String> {
         vec![0u8, 1, 2, 3, 0xff],
         (0..256u32).map(|i| (i & 0xff) as u8).collect::<Vec<u8>>(),
     ] {
-        let got: Vec<u8> = sbox
-            .call("GetSizePrefixedBuffer", v.clone())
-            .map_err(|e| format!("GetSizePrefixedBuffer(len={}): {e}", v.len()))?;
+        let got = sbox
+            .call::<Vec<Bytes>>("GetSizePrefixedBuffer", v.as_slice())
+            .map_err(|e| format!("GetSizePrefixedBuffer(len={}): {e}", v.len()))?
+            .concat();
         if got != v {
             return Err(format!(
                 "GetSizePrefixedBuffer(len={}) did not round-trip",
@@ -220,17 +223,7 @@ fn guest_types_round_trip(golden: &GoldenTest) -> Result<(), String> {
         .call(
             "PrintElevenArgs",
             (
-                "a".to_string(),
-                1i32,
-                2i64,
-                "b".to_string(),
-                "c".to_string(),
-                true,
-                false,
-                3u32,
-                4u64,
-                5i32,
-                6.5f32,
+                "a", 1i32, 2i64, "b", "c", true, false, 3u32, 4u64, 5i32, 6.5f32,
             ),
         )
         .map_err(|e| format!("PrintElevenArgs: {e}"))?;
@@ -246,13 +239,16 @@ fn guest_types_round_trip(golden: &GoldenTest) -> Result<(), String> {
 fn host_round_trips(golden: &GoldenTest) -> Result<(), String> {
     let mut sbox = golden.load_sandbox()?;
     macro_rules! rt {
-        ($name:expr, $ty:ty, $value:expr) => {{
-            let v: $ty = $value;
+        ($name:expr, $ty:ty, $value:expr) => {
+            rt!($name, $ty, $value, v => v)
+        };
+        ($name:expr, $ty:ty, $value:expr, $v:ident => $arg:expr) => {{
+            let $v: $ty = $value;
             let got: $ty = sbox
-                .call($name, v.clone())
-                .map_err(|e| format!("{}({:?}): {e}", $name, v))?;
-            if got != v {
-                return Err(format!("{}({:?}) returned {:?}", $name, v, got));
+                .call($name, $arg)
+                .map_err(|e| format!("{}({:?}): {e}", $name, $v))?;
+            if got != $v {
+                return Err(format!("{}({:?}) returned {:?}", $name, $v, got));
             }
         }};
     }
@@ -263,8 +259,13 @@ fn host_round_trips(golden: &GoldenTest) -> Result<(), String> {
     rt!("RoundTripHostF32", f32, -1.25);
     rt!("RoundTripHostF64", f64, 1234.5);
     rt!("RoundTripHostBool", bool, false);
-    rt!("RoundTripHostString", String, "round-trip".to_string());
-    rt!("RoundTripHostVecBytes", Vec<u8>, vec![0u8, 1, 2, 3, 0xff]);
+    rt!("RoundTripHostString", String, "round-trip".to_string(), v => v.as_str());
+    rt!(
+        "RoundTripHostBytes",
+        Vec<Bytes>,
+        vec![Bytes::from(vec![0u8, 1, 2, 3, 0xff])],
+        v => v.as_slice()
+    );
     let _: () = sbox
         .call("RoundTripHostNoOp", ())
         .map_err(|e| format!("RoundTripHostNoOp: {e}"))?;

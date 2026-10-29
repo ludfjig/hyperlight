@@ -5,10 +5,8 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{
-    ParameterType, ParameterValue, ReturnType, ReturnValue,
+    ParameterType, ParameterValue, Parameters, ReturnType, ReturnValue, smallvec,
 };
-use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
-use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tracing::{Span, instrument};
 
@@ -97,21 +95,24 @@ impl Default for HostFunctions {
     }
 }
 
-impl From<&FunctionRegistry> for HostFunctionDetails {
-    fn from(registry: &FunctionRegistry) -> Self {
-        let host_functions = registry
-            .functions_map
+/// Name and signature of one registered host function, recorded in snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostFunctionDefinition {
+    pub(crate) function_name: String,
+    pub(crate) parameter_types: Vec<ParameterType>,
+    pub(crate) return_type: ReturnType,
+}
+
+impl FunctionRegistry {
+    pub(crate) fn definitions(&self) -> Vec<HostFunctionDefinition> {
+        self.functions_map
             .iter()
             .map(|(name, entry)| HostFunctionDefinition {
                 function_name: name.clone(),
-                parameter_types: Some(entry.parameter_types.to_vec()),
+                parameter_types: entry.parameter_types.to_vec(),
                 return_type: entry.return_type,
             })
-            .collect();
-
-        HostFunctionDetails {
-            host_functions: Some(host_functions),
-        }
+            .collect()
     }
 }
 
@@ -163,8 +164,8 @@ impl FunctionRegistry {
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     #[allow(dead_code)]
     pub(super) fn host_print(&mut self, msg: String) -> Result<i32> {
-        let res = self.call_host_func_impl("HostPrint", vec![ParameterValue::String(msg)])?;
-        res.try_into()
+        let res = self.call_host_func_impl("HostPrint", smallvec![ParameterValue::String(msg)])?;
+        <i32 as crate::func::SupportedReturnType>::from_value(res)
             .map_err(|_| HostFunctionNotFound("HostPrint".to_string()))
     }
     /// From the set of registered host functions, attempt to get the one
@@ -175,16 +176,12 @@ impl FunctionRegistry {
     /// its parameter list doesn't match `args`, or there was another error
     /// getting, configuring or calling the function.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-    pub(super) fn call_host_function(
-        &self,
-        name: &str,
-        args: Vec<ParameterValue>,
-    ) -> Result<ReturnValue> {
+    pub(super) fn call_host_function(&self, name: &str, args: Parameters) -> Result<ReturnValue> {
         self.call_host_func_impl(name, args)
     }
 
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-    fn call_host_func_impl(&self, name: &str, args: Vec<ParameterValue>) -> Result<ReturnValue> {
+    fn call_host_func_impl(&self, name: &str, args: Parameters) -> Result<ReturnValue> {
         let FunctionEntry {
             function,
             parameter_types: _,

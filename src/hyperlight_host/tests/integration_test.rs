@@ -115,7 +115,7 @@ fn interrupt_in_progress_guest_call() {
 
         barrier.wait();
         // Make sure we can still call guest functions after the VM was interrupted
-        sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+        sbox1.call::<String>("Echo", "hello").unwrap();
 
         // drop vm to make sure other thread can detect it
         drop(sbox1);
@@ -142,7 +142,7 @@ fn interrupt_guest_call_in_advance() {
         });
 
         barrier.wait(); // wait until `kill()` is called before starting the guest call
-        match sbox1.call::<String>("Echo", "hello".to_string()) {
+        match sbox1.call::<String>("Echo", "hello") {
             Ok(_) => {}
             Err(HyperlightError::ExecutionCanceledByHost()) => {
                 panic!("Unexpected Cancellation Error");
@@ -152,7 +152,7 @@ fn interrupt_guest_call_in_advance() {
 
         // Make sure we can still call guest functions after the VM was interrupted early
         // i.e. make sure we dont kill the next iteration.
-        sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+        sbox1.call::<String>("Echo", "hello").unwrap();
 
         // drop vm to make sure other thread can detect it
         drop(sbox1);
@@ -196,9 +196,9 @@ fn interrupt_same_thread() {
     for _ in 0..NUM_ITERS {
         barrier.wait();
         sbox1
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
-        match sbox2.call::<String>("Echo", "hello".to_string()) {
+        match sbox2.call::<String>("Echo", "hello") {
             // Only allow successful calls or interrupted.
             // The call can be successful in case the call is finished before kill() is called.
             Ok(_) | Err(HyperlightError::ExecutionCanceledByHost()) => {}
@@ -208,7 +208,7 @@ fn interrupt_same_thread() {
             sbox2.restore(snapshot2.clone()).unwrap();
         }
         sbox3
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
     }
     thread.join().expect("Thread should finish");
@@ -243,9 +243,9 @@ fn interrupt_same_thread_no_barrier() {
     barrier.wait();
     for _ in 0..NUM_ITERS {
         sbox1
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
-        match sbox2.call::<String>("Echo", "hello".to_string()) {
+        match sbox2.call::<String>("Echo", "hello") {
             // Only allow successful calls or interrupted.
             // The call can be successful in case the call is finished before kill() is called.
             Ok(_) | Err(HyperlightError::ExecutionCanceledByHost()) => {}
@@ -255,7 +255,7 @@ fn interrupt_same_thread_no_barrier() {
             sbox2.restore(snapshot2.clone()).unwrap();
         }
         sbox3
-            .call::<String>("Echo", "hello".to_string())
+            .call::<String>("Echo", "hello")
             .expect("Only sandbox 2 is allowed to be interrupted");
     }
     workload_done.store(true, Ordering::Relaxed);
@@ -376,9 +376,7 @@ fn interrupt_spamming_host_call() {
 
         barrier.wait();
         // This guest call calls "HostFunc1" in a loop
-        let res = sbox1
-            .call::<i32>("HostCallLoop", "HostFunc1".to_string())
-            .unwrap_err();
+        let res = sbox1.call::<i32>("HostCallLoop", "HostFunc1").unwrap_err();
 
         assert!(
             matches!(&res, HyperlightError::ExecutionCanceledByHost()),
@@ -392,10 +390,7 @@ fn interrupt_spamming_host_call() {
 #[test]
 fn print_four_args_c_guest() {
     with_c_sandbox(|mut sbox1| {
-        let res = sbox1.call::<i32>(
-            "PrintFourArgs",
-            ("Test4".to_string(), 3_i32, 4_i64, "Tested".to_string()),
-        );
+        let res = sbox1.call::<i32>("PrintFourArgs", ("Test4", 3_i32, 4_i64, "Tested"));
         assert!(matches!(&res, Ok(46)), "unexpected result: {res:?}");
     });
 }
@@ -419,7 +414,7 @@ fn guest_abort() {
 fn guest_abort_with_context1() {
     with_all_sandboxes(|mut sbox1| {
         let res = sbox1
-            .call::<()>("GuestAbortWithMessage", (25_i32, "Oh no".to_string()))
+            .call::<()>("GuestAbortWithMessage", (25_i32, "Oh no"))
             .unwrap_err();
         assert!(
             matches!(&res, HyperlightError::GuestAborted(code, context) if (*code == 25 && context == "Oh no")),
@@ -464,7 +459,7 @@ fn guest_abort_with_context2() {
                                 Proin sagittis nisl rhoncus mattis rhoncus urna. Magna eget est lorem ipsum.";
 
         let res = sbox1
-            .call::<()>("GuestAbortWithMessage", (60_i32, abort_message.to_string()))
+            .call::<()>("GuestAbortWithMessage", (60_i32, abort_message))
             .unwrap_err();
         assert!(
             matches!(&res, HyperlightError::GuestAborted(_, context) if context.contains("Guest abort buffer overflowed")),
@@ -482,7 +477,7 @@ fn guest_abort_c_guest() {
         let res = sbox1
             .call::<()>(
                 "GuestAbortWithMessage",
-                (75_i32, "This is a test error message".to_string()),
+                (75_i32, "This is a test error message"),
             )
             .unwrap_err();
         assert!(
@@ -497,7 +492,7 @@ fn guest_panic() {
     // this test is rust-specific
     with_rust_sandbox(|mut sbox1| {
         let res = sbox1
-            .call::<()>("guest_panic", "Error... error...".to_string())
+            .call::<()>("guest_panic", "Error... error...")
             .unwrap_err();
         assert!(
             matches!(&res, HyperlightError::GuestAborted(code, context) if *code == ErrorCode::UnknownError as u8 && context.contains("\nError... error...")),
@@ -790,7 +785,7 @@ fn log_test_messages(levelfilter: Option<tracing_core::LevelFilter>) {
             let level: u64 = GuestLogFilter::from(*level).into();
             let message = format!("Hello from log_message level {}", level as i32);
             sbox1
-                .call::<()>("LogMessage", (message.to_string(), level as i32))
+                .call::<()>("LogMessage", (message.as_str(), level as i32))
                 .unwrap();
         });
     }
@@ -910,16 +905,10 @@ fn c_guest_accesses_byte_chunks() {
 
         for _ in 0..2 {
             let output: Vec<Bytes> = sandbox
-                .call("RoundTripHostByteChunks", input.clone())
+                .call("RoundTripHostByteChunks", input.as_slice())
                 .unwrap();
 
-            assert_eq!(
-                output
-                    .iter()
-                    .flat_map(|chunk| chunk.iter().copied())
-                    .collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(output.concat(), expected);
         }
     });
 }
@@ -930,10 +919,7 @@ fn retained_guest_call_bytes_survive_restore() {
     with_rust_sandbox(|mut sandbox| {
         let expected = vec![0x5a; 6 * 1024];
         let retained: i32 = sandbox
-            .call(
-                "RetainGuestByteChunks",
-                vec![Bytes::copy_from_slice(&expected)],
-            )
+            .call("RetainGuestByteChunks", expected.as_slice())
             .unwrap();
 
         assert_eq!(retained as usize, expected.len());
@@ -946,7 +932,7 @@ fn retained_guest_call_bytes_survive_restore() {
         assert_eq!(ret, retained);
 
         let after_release: Vec<Bytes> = sandbox.call("ReadRetainedGuestByteChunks", ()).unwrap();
-        assert!(after_release.is_empty());
+        assert!(after_release.iter().all(Bytes::is_empty));
 
         sandbox.restore(snapshot).unwrap();
         let actual: Vec<Bytes> = sandbox.call("ReadRetainedGuestByteChunks", ()).unwrap();
@@ -968,16 +954,13 @@ fn retained_host_reply_bytes_survive_restore() {
 
         let expected = vec![0xa5; 6 * 1024];
         let retained: i32 = sandbox
-            .call(
-                "RetainHostByteChunks",
-                vec![Bytes::copy_from_slice(&expected)],
-            )
+            .call("RetainHostByteChunks", expected.as_slice())
             .unwrap();
 
         assert_eq!(retained as usize, expected.len());
         let snapshot = sandbox.snapshot().unwrap();
 
-        let echo: String = sandbox.call("Echo", "hello".to_string()).unwrap();
+        let echo: String = sandbox.call("Echo", "hello").unwrap();
         assert_eq!(echo, "hello");
 
         let actual: Vec<Bytes> = sandbox.call("ReadRetainedHostByteChunks", ()).unwrap();
@@ -987,7 +970,7 @@ fn retained_host_reply_bytes_survive_restore() {
         assert_eq!(ret, retained);
 
         let after_release: Vec<Bytes> = sandbox.call("ReadRetainedHostByteChunks", ()).unwrap();
-        assert!(after_release.is_empty());
+        assert!(after_release.iter().all(Bytes::is_empty));
 
         sandbox.restore(snapshot).unwrap();
         let actual: Vec<Bytes> = sandbox.call("ReadRetainedHostByteChunks", ()).unwrap();
@@ -1009,19 +992,13 @@ fn retained_byte_chunks_survive_pool_swap() {
 
     let expected = vec![0xa5; 8192];
     let actual: i32 = sandbox
-        .call(
-            "RetainGuestByteChunks",
-            vec![Bytes::copy_from_slice(&expected)],
-        )
+        .call("RetainGuestByteChunks", expected.as_slice())
         .unwrap();
 
     assert_eq!(actual as usize, expected.len());
 
     let actual: i32 = sandbox
-        .call(
-            "RetainHostByteChunks",
-            vec![Bytes::copy_from_slice(&expected)],
-        )
+        .call("RetainHostByteChunks", expected.as_slice())
         .unwrap();
 
     assert_eq!(actual as usize, expected.len());
@@ -1029,9 +1006,7 @@ fn retained_byte_chunks_survive_pool_swap() {
     let snapshot = sandbox.snapshot().unwrap();
     sandbox.restore(snapshot).unwrap();
 
-    let actual: i32 = sandbox
-        .call("ByteChunksLen", vec![Bytes::from(vec![0x5a; 12288])])
-        .unwrap();
+    let actual: i32 = sandbox.call("ByteChunksLen", &[0x5au8; 12288]).unwrap();
 
     assert_eq!(actual, 12288);
 
@@ -1045,9 +1020,7 @@ fn retained_byte_chunks_survive_pool_swap() {
     let snapshot = sandbox.snapshot().unwrap();
     sandbox.restore(snapshot).unwrap();
 
-    let actual: i32 = sandbox
-        .call("ByteChunksLen", vec![Bytes::from(vec![0x5a; 12288])])
-        .unwrap();
+    let actual: i32 = sandbox.call("ByteChunksLen", &[0x5au8; 12288]).unwrap();
 
     assert_eq!(actual, 12288);
 
@@ -1059,10 +1032,7 @@ fn retained_byte_chunks_survive_pool_swap() {
 
     let replacement = vec![0x3c; 6 * 4096];
     let actual: i32 = sandbox
-        .call(
-            "RetainGuestByteChunks",
-            vec![Bytes::copy_from_slice(&replacement)],
-        )
+        .call("RetainGuestByteChunks", replacement.as_slice())
         .unwrap();
 
     assert_eq!(actual as usize, replacement.len());
@@ -1594,7 +1564,7 @@ fn interrupt_infinite_loop_stress_test() {
                 // Call the guest function "CallHostThenSpin" which calls "WaitForKill" once then spins
                 // NOTE: If this test hangs, it means the guest was not successfully killed and is spinning forever.
                 // This indicates a bug in the cancellation mechanism.
-                let res = sandbox.call::<()>("CallHostThenSpin", "WaitForKill".to_string());
+                let res = sandbox.call::<()>("CallHostThenSpin", "WaitForKill");
 
                 // Wait for killer thread to finish
                 killer_thread.join().unwrap();
@@ -1682,11 +1652,11 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     let res = sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string());
+                        .call::<String>("Echo", "Real");
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     res
                 }
@@ -1695,22 +1665,22 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string())
+                        .call::<String>("Echo", "Real")
                 }
                 // sandbox on spawned thread, bait on main thread
                 2 => {
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     sandbox_handle.join().unwrap()
                 }
@@ -1718,13 +1688,13 @@ fn interrupt_infinite_moving_loop_stress_test() {
                 3 => {
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     let res = sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string());
+                        .call::<String>("Echo", "Real");
                     bait_handle.join().unwrap();
                     res
                 }
@@ -1733,10 +1703,10 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     let res = sandbox_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Real".to_string());
+                        .call::<String>("Echo", "Real");
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     bait_handle.join().unwrap();
@@ -1747,21 +1717,21 @@ fn interrupt_infinite_moving_loop_stress_test() {
                     bait_slot
                         .as_mut()
                         .unwrap()
-                        .call::<String>("Echo", "Bait".to_string())
+                        .call::<String>("Echo", "Bait")
                         .expect("Bait call should never be interrupted");
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     sandbox_handle.join().unwrap()
                 }
                 // sandbox on spawned thread, bait on spawned thread
                 6 => {
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     bait_handle.join().unwrap();
@@ -1771,12 +1741,12 @@ fn interrupt_infinite_moving_loop_stress_test() {
                 7 => {
                     let mut bait = bait_slot.take().unwrap();
                     let bait_handle = thread::spawn(move || {
-                        bait.call::<String>("Echo", "Bait".to_string())
+                        bait.call::<String>("Echo", "Bait")
                             .expect("Bait call should never be interrupted");
                     });
                     let mut sandbox = sandbox_slot.take().unwrap();
                     let sandbox_handle =
-                        thread::spawn(move || sandbox.call::<String>("Echo", "Real".to_string()));
+                        thread::spawn(move || sandbox.call::<String>("Echo", "Real"));
                     bait_handle.join().unwrap();
                     sandbox_handle.join().unwrap()
                 }
@@ -1979,7 +1949,7 @@ fn interrupt_cancel_delete_race() {
                     .collect();
 
                 // Makes sure RUNNING_BIT is set when kill() is called
-                let _ = sandbox.call::<String>("Echo", "test".to_string());
+                let _ = sandbox.call::<String>("Echo", "test");
 
                 // Drop the sandbox while kill threads are spamming
                 drop(sandbox);
@@ -2114,7 +2084,7 @@ fn non_pie_guest_hello_world() {
             .unwrap();
     let mut multi_use_sandbox: Sandbox = sandbox.evolve().unwrap();
     let result: i32 = multi_use_sandbox
-        .call("PrintOutput", "Hello from non-PIE guest!\n".to_string())
+        .call("PrintOutput", "Hello from non-PIE guest!\n")
         .unwrap();
     assert_eq!(result, 26);
 }

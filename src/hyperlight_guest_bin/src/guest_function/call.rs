@@ -2,12 +2,9 @@
 // Copyright 2025 The Hyperlight Authors.
 
 use alloc::format;
-use alloc::vec::Vec;
 
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-use hyperlight_common::flatbuffer_wrappers::function_types::{
-    FunctionCallResult, ParameterType, ReturnValue,
-};
+use hyperlight_common::flatbuffer_wrappers::function_types::{FunctionCallResult, ReturnValue};
 use hyperlight_common::flatbuffer_wrappers::guest_error::{ErrorCode, GuestError};
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest::transport::DispatchAction;
@@ -23,20 +20,20 @@ core::arch::global_asm!(
 );
 
 #[tracing::instrument(skip_all, parent = tracing::Span::current(), level= "Trace")]
-fn guest_dispatch_function_default(function_call: FunctionCall) -> Result<ReturnValue> {
-    let name = &function_call.function_name;
+fn guest_dispatch_function_default(function_call: FunctionCall<'_>) -> Result<ReturnValue> {
+    let name = function_call.function_name;
     bail!(ErrorCode::GuestFunctionNotFound => "No handler found for function call: {name:#?}");
 }
 
 #[instrument(skip_all, level = "Info")]
-pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<ReturnValue> {
+pub(crate) fn call_guest_function(function_call: FunctionCall<'_>) -> Result<ReturnValue> {
     // Validate this is a Guest Function Call
-    if function_call.function_call_type() != FunctionCallType::Guest {
+    if function_call.function_call_type != FunctionCallType::Guest {
         return Err(HyperlightGuestError::new(
             ErrorCode::GuestError,
             format!(
                 "Invalid function call type: {:#?}, should be Guest.",
-                function_call.function_call_type()
+                function_call.function_call_type
             ),
         ));
     }
@@ -46,24 +43,17 @@ pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<ReturnV
     // this is to avoid the clippy warning "shared reference to mutable static"
     #[allow(clippy::deref_addrof)]
     if let Some(registered_function_definition) =
-        unsafe { (*(&raw const REGISTERED_GUEST_FUNCTIONS)).get(&function_call.function_name) }
+        unsafe { (*(&raw const REGISTERED_GUEST_FUNCTIONS)).get(function_call.function_name) }
     {
-        let function_call_parameter_types: Vec<ParameterType> = function_call
-            .parameters
-            .iter()
-            .flatten()
-            .map(|p| p.into())
-            .collect();
-
         // Verify that the function call has the correct parameter types and length.
-        registered_function_definition.verify_parameters(&function_call_parameter_types)?;
+        registered_function_definition.verify_parameter_values(&function_call.parameters)?;
 
         (registered_function_definition.function_pointer)(function_call)
     } else {
         // The given function is not registered. The guest should implement a function called
         // guest_dispatch_function to handle this.
         unsafe extern "Rust" {
-            fn guest_dispatch_function(function_call: FunctionCall) -> Result<ReturnValue>;
+            fn guest_dispatch_function(function_call: FunctionCall<'_>) -> Result<ReturnValue>;
         }
 
         unsafe { guest_dispatch_function(function_call) }
@@ -90,12 +80,15 @@ pub(crate) fn internal_dispatch_function() {
         .expect("H2G dispatch deserialization failed");
 
     let result = match dispatch {
-        DispatchAction::Call(cid, fc) => {
+        DispatchAction::Call(cid, mut request) => {
             // Reseed the libc PRNG if requested by the host.
             #[cfg(feature = "libc")]
             crate::refresh_libc_rng();
 
-            let res = call_guest_function(fc).map_err(|err| GuestError::new(err.kind, err.message));
+            let res = request
+                .decode()
+                .and_then(call_guest_function)
+                .map_err(|err| GuestError::new(err.kind, err.message));
             Some((cid, FunctionCallResult::new(res)))
         }
         DispatchAction::SnapshotCheckpoint => None,

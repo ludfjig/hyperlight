@@ -32,7 +32,7 @@ use crate::hypervisor::virtual_machine::XSAVE_BUFFER_SIZE;
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::TimerThread;
 use crate::hypervisor::virtual_machine::{
     CreateVmError, MapMemoryError, RegisterError, RunVcpuError, UnmapMemoryError, VirtualMachine,
-    VmExit, validate_guest_msrs,
+    VmExit, io_out_value, validate_guest_msrs,
 };
 use crate::mem::memory_region::MemoryRegion;
 #[cfg(feature = "trace_guest")]
@@ -263,7 +263,7 @@ impl KvmVm {
                     if (0x40..=0x43).contains(&port) {
                         continue;
                     }
-                    return Ok(VmExit::IoOut(port, data.to_vec()));
+                    return Ok(VmExit::IoOut(port, io_out_value(data)));
                 }
                 Ok(VcpuExit::MmioRead(addr, _)) => return Ok(VmExit::MmioRead(addr)),
                 Ok(VcpuExit::MmioWrite(addr, _)) => return Ok(VmExit::MmioWrite(addr)),
@@ -311,7 +311,7 @@ impl KvmVm {
         match self.vcpu_fd.run() {
             Ok(VcpuExit::Hlt) => Ok(VmExit::Halt()),
             Ok(VcpuExit::IoOut(port, _)) if port == VmAction::Halt as u16 => Ok(VmExit::Halt()),
-            Ok(VcpuExit::IoOut(port, data)) => Ok(VmExit::IoOut(port, data.to_vec())),
+            Ok(VcpuExit::IoOut(port, data)) => Ok(VmExit::IoOut(port, io_out_value(data))),
             Ok(VcpuExit::MmioRead(addr, _)) => Ok(VmExit::MmioRead(addr)),
             Ok(VcpuExit::MmioWrite(addr, _)) => Ok(VmExit::MmioWrite(addr)),
             #[cfg(gdb)]

@@ -143,8 +143,9 @@ pub(crate) enum VmExit {
     },
     /// The vCPU has halted
     Halt(),
-    /// The vCPU has issued a write to the given port with the given value
-    IoOut(u16, Vec<u8>),
+    /// The vCPU has issued a write to the given port. The value holds the
+    /// first four data bytes in little-endian order, or `None` for no data.
+    IoOut(u16, Option<u32>),
     /// The vCPU tried to read from the given (unmapped) addr
     MmioRead(u64),
     /// The vCPU tried to write to the given (unmapped) addr
@@ -162,6 +163,18 @@ pub(crate) enum VmExit {
         )
     )]
     Retry(),
+}
+
+/// The first four port write bytes as a zero-padded little-endian value, or
+/// `None` for an empty write.
+pub(crate) fn io_out_value(data: &[u8]) -> Option<u32> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut bytes = [0u8; 4];
+    let len = data.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&data[..len]);
+    Some(u32::from_le_bytes(bytes))
 }
 
 /// VM error

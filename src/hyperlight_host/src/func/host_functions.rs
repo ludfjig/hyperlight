@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
+use hyperlight_common::flatbuffer_wrappers::function_types::{Parameters, ReturnValue};
 use hyperlight_common::for_each_tuple;
 use hyperlight_common::func::{Error as FuncError, Function, ResultType};
 
@@ -144,7 +144,7 @@ where
 }
 
 pub(crate) struct TypeErasedHostFunction {
-    func: Box<dyn Fn(Vec<ParameterValue>) -> Result<ReturnValue> + Send + Sync + 'static>,
+    func: Box<dyn Fn(Parameters) -> Result<ReturnValue> + Send + Sync + 'static>,
 }
 
 impl<Args, Output> HostFunction<Output, Args>
@@ -159,7 +159,7 @@ where
 }
 
 impl TypeErasedHostFunction {
-    pub(crate) fn call(&self, args: Vec<ParameterValue>) -> Result<ReturnValue> {
+    pub(crate) fn call(&self, args: Parameters) -> Result<ReturnValue> {
         (self.func)(args)
     }
 }
@@ -193,7 +193,7 @@ where
 {
     fn from(func: HostFunction<Output, Args>) -> TypeErasedHostFunction {
         TypeErasedHostFunction {
-            func: Box::new(move |args: Vec<ParameterValue>| {
+            func: Box::new(move |args: Parameters| {
                 let args = Args::from_value(args)?;
                 Ok(func.call(args)?.into_value())
             }),

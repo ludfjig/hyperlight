@@ -13,20 +13,36 @@ use hyperlight_common::virtq::Segments;
 use crate::bail;
 use crate::error::{GuestErrorContext, Result};
 
-/// Decode one H2G guest-function request payload.
+/// One received guest function request.
 ///
-/// Chunked external values retain their H2G slot owners until their final
-/// [`Bytes`] clone drops.
-pub(super) fn decode_request(segments: Segments) -> Result<FunctionCall> {
-    let (control, mut external_values) = decode_payload(segments)?;
-    FunctionCall::decode(&control, &mut external_values)
-        .with_context(|| "failed to decode guest function request")
+/// It owns the control data and external values. Decoding borrows the
+/// function name from the control data. Byte values keep their H2G slots
+/// until their final [`Bytes`] clone drops.
+pub struct Request {
+    control: Bytes,
+    external_values: Segments,
+}
+
+impl Request {
+    /// Decode the call. Each request decodes once.
+    pub fn decode(&mut self) -> Result<FunctionCall<'_>> {
+        FunctionCall::decode(&self.control, &mut self.external_values)
+            .with_context(|| "failed to decode guest function request")
+    }
+}
+
+/// Split one H2G guest-function request payload.
+pub(super) fn decode_request(segments: Segments) -> Result<Request> {
+    let (control, external_values) = decode_payload(segments)?;
+    Ok(Request {
+        control,
+        external_values,
+    })
 }
 
 /// Decode one G2H host-function response.
 ///
-/// Contiguous byte values are flattened into `Vec<u8>`. Chunked values retain
-/// their transport-backed [`Bytes`] owners.
+/// Byte values share their G2H slots without copying.
 pub(super) fn decode_response(segments: Segments, cid: u32) -> Result<FunctionCallResult> {
     let (header, payload) = split_header(segments)?;
     if header.kind != MsgKind::Response {
@@ -83,8 +99,8 @@ fn decode_payload(mut segments: Segments) -> Result<(Bytes, Segments)> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use alloc::vec::Vec;
 
-    use flatbuffers::FlatBufferBuilder;
     use hyperlight_common::flatbuffer_wrappers::ExternalValueSource;
     use hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue;
     use hyperlight_common::transport::ExternalValues;
@@ -109,7 +125,7 @@ mod tests {
         drop(control);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].as_ptr(), ptr.wrapping_add(8));
-        assert_eq!(chunks[0].as_ref(), b"data");
+        assert_eq!(chunks, [Bytes::from_static(b"data")]);
     }
 
     #[test]
@@ -133,7 +149,7 @@ mod tests {
         source.finish().unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].as_ptr(), ptr.wrapping_add(2));
-        assert_eq!(chunks[0].as_ref(), b"data");
+        assert_eq!(chunks, [Bytes::from_static(b"data")]);
     }
 
     #[test]
@@ -153,12 +169,12 @@ mod tests {
     }
 
     #[test]
-    fn response_byte_chunks_retain_transport_storage() {
+    fn response_byte_chunks_share_transport_storage() {
         let external = Bytes::from(vec![1, 2, 3, 4]);
         let external_ptr = external.as_ptr();
 
         let result = FunctionCallResult::new(Ok(ReturnValue::ByteChunks(vec![external.clone()])));
-        let mut builder = FlatBufferBuilder::new();
+        let mut builder = Vec::new();
         let mut external_values = ExternalValues::new();
 
         let control = result.encode(&mut builder, &mut external_values).unwrap();
@@ -185,7 +201,7 @@ mod tests {
     #[test]
     fn response_rejects_payload_length_mismatch() {
         let result = FunctionCallResult::new(Ok(ReturnValue::UInt(17)));
-        let mut builder = FlatBufferBuilder::new();
+        let mut builder = Vec::new();
         let mut external_values = ExternalValues::new();
 
         let control = result.encode(&mut builder, &mut external_values).unwrap();
@@ -207,27 +223,32 @@ mod tests {
     }
 
     #[test]
-    fn request_byte_chunks_retain_transport_storage() {
+    fn request_byte_chunks_share_transport_storage() {
         use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCallType;
-        use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
+        use hyperlight_common::flatbuffer_wrappers::function_types::{
+            ParameterValue, ParameterValueRef, ReturnType,
+        };
 
         let external = Bytes::from(vec![1, 2, 3, 4]);
         let external_ptr = external.as_ptr();
-        let call = FunctionCall::new(
-            "echo".into(),
-            Some(vec![ParameterValue::ByteChunks(vec![external.clone()])]),
+        let chunks = [external.clone()];
+        let mut builder = Vec::new();
+        let mut external_values = ExternalValues::new();
+        let control = FunctionCall::encode(
+            "echo",
             FunctionCallType::Guest,
             ReturnType::ByteChunks,
-        );
-        let mut builder = FlatBufferBuilder::new();
-        let mut external_values = ExternalValues::new();
-        let control = call.encode(&mut builder, &mut external_values).unwrap();
+            [ParameterValueRef::ByteChunks(&chunks)],
+            &mut builder,
+            &mut external_values,
+        )
+        .unwrap();
         let segments = Segments::new([Bytes::copy_from_slice(control), external]);
 
-        let decoded = decode_request(segments).unwrap();
+        let mut request = decode_request(segments).unwrap();
+        let decoded = request.decode().unwrap();
         assert_eq!(decoded.function_name, "echo");
-        let ParameterValue::ByteChunks(chunks) =
-            decoded.parameters.unwrap().into_iter().next().unwrap()
+        let ParameterValue::ByteChunks(chunks) = decoded.parameters.into_iter().next().unwrap()
         else {
             panic!("expected ByteChunks parameter");
         };

@@ -9,13 +9,14 @@ use core::ptr::NonNull;
 
 use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
 use hyperlight_common::flatbuffer_wrappers::function_types::{
-    ParameterType, ReturnType, ReturnValue,
+    ParameterType, ParameterValue, ReturnType, ReturnValue,
 };
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
+use hyperlight_common::func::SupportedReturnType;
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest_bin::guest_function::definition::GuestFunctionDefinition;
 use hyperlight_guest_bin::guest_function::register::GuestFunctionRegister;
-use hyperlight_guest_bin::host_comm::call_host_function;
+use hyperlight_guest_bin::host_comm::call_host_dynamic;
 
 use crate::error::take_guest_error;
 use crate::types::{FfiFunctionCall, FfiReturnValue, OwnedFfiFunctionCall};
@@ -45,21 +46,15 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<ReturnValue> {
+pub fn guest_dispatch_function(function_call: FunctionCall<'_>) -> Result<ReturnValue> {
     // Discard an error left by guest code outside the current dispatch.
     let _ = take_guest_error();
 
     let registry = &raw const REGISTERED_C_GUEST_FUNCTIONS;
     // SAFETY: Guest execution is serialized. The registry borrow ends before C runs.
     let registered_func =
-        if let Some(definition) = unsafe { (&*registry).get(&function_call.function_name) } {
-            let function_call_parameter_types: Vec<ParameterType> = function_call
-                .parameters
-                .iter()
-                .flatten()
-                .map(|p| p.into())
-                .collect();
-            definition.verify_parameters(&function_call_parameter_types)?;
+        if let Some(definition) = unsafe { (&*registry).get(function_call.function_name) } {
+            definition.verify_parameter_values(&function_call.parameters)?;
             Some(definition.function_pointer)
         } else {
             None
@@ -124,7 +119,8 @@ pub extern "C" fn hl_call_host_function(function_call: &FfiFunctionCall) {
     let func_name = unsafe { function_call.copy_function_name() };
     let return_type = unsafe { function_call.copy_return_type() };
 
-    let result = call_host_function::<ReturnValue>(&func_name, Some(parameters), return_type);
+    let parameters: Vec<_> = parameters.iter().map(ParameterValue::as_ref).collect();
+    let result = call_host_dynamic(&func_name, &parameters, return_type);
     // SAFETY: Single vCPU guest execution serializes access to this slot.
     let _ = unsafe { (&raw mut LAST_HOST_RESULT).replace(Some(result)) };
 }
@@ -132,14 +128,11 @@ pub extern "C" fn hl_call_host_function(function_call: &FfiFunctionCall) {
 /// Retrieve the return value stashed by the last `hl_call_host_function`.
 ///
 /// Panics if no value was stashed, the host returned an error, or the type differs.
-pub(crate) fn take_last_host_return<T: TryFrom<ReturnValue>>() -> T {
+pub(crate) fn take_last_host_return<T: SupportedReturnType>() -> T {
     // SAFETY: Single vCPU guest execution serializes access to this slot.
     let value = unsafe { (&raw mut LAST_HOST_RESULT).replace(None) }
         .expect("No host return value available")
         .expect("Host function returned an error");
 
-    match T::try_from(value) {
-        Ok(value) => value,
-        Err(_) => panic!("Host return value type mismatch"),
-    }
+    T::from_value(value).expect("Host return value type mismatch")
 }

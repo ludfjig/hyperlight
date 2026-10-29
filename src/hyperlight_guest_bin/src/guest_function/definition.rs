@@ -6,7 +6,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ReturnType};
+use hyperlight_common::flatbuffer_wrappers::function_types::{
+    ParameterType, ParameterValue, ReturnType,
+};
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::for_each_tuple;
 use hyperlight_common::func::{
@@ -15,7 +17,7 @@ use hyperlight_common::func::{
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 
 /// The function pointer type for Rust guest functions.
-pub type GuestFunc = fn(FunctionCall) -> Result<ReturnValue>;
+pub type GuestFunc = fn(FunctionCall<'_>) -> Result<ReturnValue>;
 
 /// The definition of a function exposed from the guest to the host.
 ///
@@ -105,13 +107,13 @@ macro_rules! impl_host_function {
             };
 
             fn into_guest_function(self) -> GuestFunc {
-                |fc: FunctionCall| {
+                |fc: FunctionCall<'_>| {
                     // SAFETY: This is safe because:
                     //  1. F is zero-sized (enforced by the ASSERT_ZERO_SIZED const).
                     //  2. F has no Drop impl (enforced by the Copy bound).
                     // Therefore, creating an instance of F is safe.
                     let this = unsafe { core::mem::zeroed::<F>() };
-                    let params = fc.parameters.unwrap_or_default();
+                    let params = fc.parameters;
                     let params = <($($P,)*) as ParameterTuple>::from_value(params)?;
                     let result = Function::<R::ReturnType, ($($P,)*), HyperlightGuestError>::call(&this, params)?;
                     Ok(result.into_value())
@@ -175,41 +177,30 @@ impl<F: Copy> GuestFunctionDefinition<F> {
         function.as_guest_function_definition(function_name)
     }
 
-    /// Verify that `self` has same signature as the provided `parameter_types`.
-    pub fn verify_parameters(&self, parameter_types: &[ParameterType]) -> Result<()> {
-        // Verify that the function does not have more than `MAX_PARAMETERS` parameters.
-        const MAX_PARAMETERS: usize = 11;
-        if parameter_types.len() > MAX_PARAMETERS {
-            return Err(HyperlightGuestError::new(
-                ErrorCode::GuestError,
-                format!(
-                    "Function {} has too many parameters: {} (max allowed is {}).",
-                    self.function_name,
-                    parameter_types.len(),
-                    MAX_PARAMETERS
-                ),
-            ));
-        }
+    /// Verify that `self` accepts the provided parameter values.
+    pub fn verify_parameter_values(&self, parameters: &[ParameterValue]) -> Result<()> {
+        let count = parameters.len();
 
-        if self.parameter_types.len() != parameter_types.len() {
+        if self.parameter_types.len() != count {
             return Err(HyperlightGuestError::new(
                 ErrorCode::GuestFunctionIncorrecNoOfParameters,
                 format!(
                     "Called function {} with {} parameters but it takes {}.",
                     self.function_name,
-                    parameter_types.len(),
+                    count,
                     self.parameter_types.len()
                 ),
             ));
         }
 
-        for (i, parameter_type) in self.parameter_types.iter().enumerate() {
-            if parameter_type != &parameter_types[i] {
+        for (i, (expected, value)) in self.parameter_types.iter().zip(parameters).enumerate() {
+            let actual = ParameterType::from(value);
+            if expected != &actual {
                 return Err(HyperlightGuestError::new(
                     ErrorCode::GuestFunctionParameterTypeMismatch,
                     format!(
                         "Expected parameter type {:?} for parameter index {} of function {} but got {:?}.",
-                        parameter_type, i, self.function_name, parameter_types[i]
+                        expected, i, self.function_name, actual
                     ),
                 ));
             }

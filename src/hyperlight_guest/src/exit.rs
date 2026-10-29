@@ -79,8 +79,8 @@ pub(crate) fn outb(port: u16, data: &[u8]) {
 }
 
 /// Prints a message using `OutBAction::DebugPrint`. It transmits bytes of a message
-/// through several VMExists and, with such, it is slower than
-/// `print_output_with_host_print`.
+/// through several VMExists and, with such, it is slower than calling the
+/// host's `HostPrint` function.
 ///
 /// This function should be used in debug mode only. This function does not
 /// require memory to be setup to be used.

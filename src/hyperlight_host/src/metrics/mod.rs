@@ -95,9 +95,7 @@ mod tests {
                 .build()
                 .unwrap();
 
-            multi
-                .call::<i32>("PrintOutput", "Hello".to_string())
-                .unwrap();
+            multi.call::<i32>("PrintOutput", "Hello").unwrap();
 
             let interrupt_handle = multi.interrupt_handle();
             multi
@@ -108,7 +106,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let result = multi.call::<()>("CallHostThenSpin", "CancelGuest".to_string());
+            let result = multi.call::<()>("CallHostThenSpin", "CancelGuest");
             assert!(
                 matches!(result, Err(HyperlightError::ExecutionCanceledByHost())),
                 "Expected guest cancellation, got {result:?}"

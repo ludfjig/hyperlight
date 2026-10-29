@@ -2,7 +2,7 @@
 // Copyright 2025 The Hyperlight Authors.
 
 use crate::Result;
-use crate::func::{ParameterTuple, SupportedReturnType};
+use crate::func::{AsParameters, SupportedReturnType};
 
 /// Trait used by the macros to paper over the differences between hyperlight and hyperlight-wasm
 pub trait Callable {
@@ -10,6 +10,6 @@ pub trait Callable {
     fn call<Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl AsParameters,
     ) -> Result<Output>;
 }

@@ -48,7 +48,7 @@ use crate::hypervisor::virtual_machine::XSAVE_BUFFER_SIZE;
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::TimerThread;
 use crate::hypervisor::virtual_machine::{
     CreateVmError, MapMemoryError, RegisterError, RunVcpuError, UnmapMemoryError, VirtualMachine,
-    VmExit,
+    VmExit, io_out_value,
 };
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 #[cfg(feature = "trace_guest")]
@@ -375,7 +375,10 @@ impl VirtualMachine for MshvVm {
                             // Suppress unused variable warning when hw-interrupts is disabled
                             let _ = is_write;
 
-                            return Ok(VmExit::IoOut(port_number, rax.to_le_bytes().to_vec()));
+                            return Ok(VmExit::IoOut(
+                                port_number,
+                                io_out_value(&rax.to_le_bytes()),
+                            ));
                         }
                         UNMAPPED_GPA_MESSAGE => {
                             let mimo_message = m

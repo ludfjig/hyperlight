@@ -794,19 +794,11 @@ impl HyperlightVm {
         mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
         host_funcs: &Arc<Mutex<FunctionRegistry>>,
         port: u16,
-        data: Vec<u8>,
+        data: Option<u32>,
     ) -> std::result::Result<(), HandleIoError> {
-        if data.is_empty() {
+        let Some(val) = data else {
             return Err(HandleIoError::NoData);
-        }
-
-        #[allow(clippy::get_first)]
-        let val = u32::from_le_bytes([
-            data.get(0).copied().unwrap_or(0),
-            data.get(1).copied().unwrap_or(0),
-            data.get(2).copied().unwrap_or(0),
-            data.get(3).copied().unwrap_or(0),
-        ]);
+        };
 
         #[cfg(feature = "mem_profile")]
         {

@@ -6,12 +6,11 @@
 use alloc::vec::Vec;
 use core::result;
 
-use flatbuffers::FlatBufferBuilder;
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
 use hyperlight_common::flatbuffer_wrappers::function_types::{
-    FunctionCallResult, ParameterValue, ReturnType, ReturnValue,
+    FunctionCallResult, ParameterValueRef, ReturnType, ReturnValue,
 };
-use hyperlight_common::flatbuffer_wrappers::util::estimate_flatbuffer_capacity;
+use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
 use hyperlight_common::layout::scratch_transport_end_gva;
 use hyperlight_common::outb::OutBAction;
 use hyperlight_common::transport::{
@@ -56,7 +55,7 @@ type H2gProducer = VirtqProducer<GuestMemOps, NoopNotifier>;
 /// Work selected by one H2G dispatch entry.
 pub enum DispatchAction {
     /// Invoke one guest function and return its correlation ID.
-    Call(u32, FunctionCall),
+    Call(u32, codec::Request),
     /// Prepare canonical transport state for snapshot capture.
     SnapshotCheckpoint,
 }
@@ -89,7 +88,7 @@ impl ReplyCapacity {
     /// Select reply capacity for one host function return type.
     fn for_return_type(return_type: ReturnType) -> Self {
         match return_type {
-            ReturnType::String | ReturnType::VecBytes | ReturnType::ByteChunks => Self::Available,
+            ReturnType::String | ReturnType::ByteChunks => Self::Available,
             _ => Self::Bounded(G2H_LOWER_SLOT_SIZE),
         }
     }
@@ -109,6 +108,8 @@ pub struct GuestContext {
     mbx_gva: u64,
     /// Correlation ID assigned to the next host-function request.
     next_cid: u32,
+    /// Reused storage for encoding control data.
+    wire_buf: Vec<u8>,
 }
 
 impl GuestContext {
@@ -152,6 +153,7 @@ impl GuestContext {
             h2g_slot_size: h2g.buffer_size,
             mbx_gva,
             next_cid: 1,
+            wire_buf: Vec::new(),
         };
 
         ctx.prefill_h2g()?;
@@ -170,26 +172,23 @@ impl GuestContext {
     pub fn call_host_function(
         &mut self,
         function_name: &str,
-        parameters: Option<Vec<ParameterValue>>,
+        parameters: &[ParameterValueRef<'_>],
         return_type: ReturnType,
     ) -> Result<ReturnValue> {
-        // Encode control data separately from borrowed external byte values.
-        let params = parameters.as_deref().unwrap_or_default();
-        let estimated_capacity = estimate_flatbuffer_capacity(function_name, params);
-
-        let fc = FunctionCall::new(
-            function_name.into(),
-            parameters,
-            FunctionCallType::Host,
-            return_type,
-        );
-
-        let mut builder = FlatBufferBuilder::with_capacity(estimated_capacity);
+        // Taken so the message can borrow it while `self` submits the request.
+        let mut buffer = core::mem::take(&mut self.wire_buf);
         let mut externals = ExternalValues::new();
 
-        let control = fc
-            .encode(&mut builder, &mut externals)
-            .with_context(|| "failed to encode host function call")?;
+        // Control data is encoded separately from borrowed external byte values.
+        let control = FunctionCall::encode(
+            function_name,
+            FunctionCallType::Host,
+            return_type,
+            parameters.iter().copied(),
+            &mut buffer,
+            &mut externals,
+        )
+        .with_context(|| "failed to encode host function call")?;
 
         // Frame the request and include external values in its total length.
         let cid = self.allocate_cid();
@@ -218,6 +217,9 @@ impl GuestContext {
             }
         };
 
+        drop(msg);
+        self.wire_buf = buffer;
+
         // Poll completions, skipping earlier one-way acknowledgements until
         // the request reply is available.
         let reply = loop {
@@ -237,7 +239,7 @@ impl GuestContext {
             UsedChain::Ack(_) => bail!("G2H: response was ack-only"),
         };
 
-        // Decode external ByteChunks without flattening their transport-backed
+        // Decode external byte values without flattening their transport-backed
         // segments.
         let fcr = codec::decode_response(segments, cid)?;
         Ok(fcr.into_inner()?)
@@ -245,8 +247,7 @@ impl GuestContext {
 
     /// Receive one host-to-guest dispatch action.
     ///
-    /// External `ByteChunks` retain their owner-backed H2G slots. Contiguous
-    /// `VecBytes` values copy directly into their final `Vec<u8>`.
+    /// External byte values share their H2G slots without copying.
     pub fn recv_h2g_dispatch(&mut self) -> Result<DispatchAction> {
         self.g2h_producer
             .reclaim()
@@ -321,11 +322,12 @@ impl GuestContext {
             .with_context(|| "G2H response reclaim failed")?;
 
         {
-            let mut builder = FlatBufferBuilder::new();
+            // Taken so the message can borrow it while `self` submits the result.
+            let mut buffer = core::mem::take(&mut self.wire_buf);
             let mut externals = ExternalValues::new();
 
             let control = result
-                .encode(&mut builder, &mut externals)
+                .encode(&mut buffer, &mut externals)
                 .with_context(|| "failed to encode guest function result")?;
 
             let msg = EncodedMessage::new(MsgKind::Response, cid, control, externals)
@@ -333,6 +335,9 @@ impl GuestContext {
 
             self.try_send_deferred(&msg, ReplyCapacity::None)
                 .with_context(|| "G2H response submission failed")?;
+
+            drop(msg);
+            self.wire_buf = buffer;
         }
 
         drop(result);
@@ -409,10 +414,20 @@ impl GuestContext {
     /// # Errors
     ///
     /// Returns an error when the message cannot be framed or submitted.
-    pub fn emit_log(&mut self, log_data: &[u8]) -> Result<()> {
-        let message = EncodedMessage::new(MsgKind::Log, 0, log_data, ExternalValues::new())
+    pub fn emit_log(&mut self, log: &GuestLogData<'_>) -> Result<()> {
+        // Taken so the message can borrow it while `self` submits the log.
+        let mut buffer = core::mem::take(&mut self.wire_buf);
+
+        let control = log
+            .encode(&mut buffer)
+            .with_context(|| "failed to encode guest log")?;
+        let message = EncodedMessage::new(MsgKind::Log, 0, control, ExternalValues::new())
             .context("G2H message length overflow")?;
-        self.send_g2h_oneshot(&message)
+        let sent = self.send_g2h_oneshot(&message);
+
+        drop(message);
+        self.wire_buf = buffer;
+        sent
     }
 
     /// Publish one writable H2G chain for each currently free slot.

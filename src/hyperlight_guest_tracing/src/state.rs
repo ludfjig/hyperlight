@@ -2,12 +2,12 @@
 // Copyright 2025 The Hyperlight Authors.
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use hyperlight_common::flatbuffer_wrappers::guest_trace_data::{
-    EventsBatchEncoder, EventsEncoder, GuestEvent, MAX_TRACE_DATA_SIZE,
+    EventKeyValue, EventsBatchEncoder, EventsEncoder, GuestEvent, MAX_TRACE_DATA_SIZE,
 };
 use hyperlight_common::outb::OutBAction;
 use tracing_core::Event;
@@ -28,6 +28,8 @@ pub(crate) struct GuestState {
     next_id: AtomicU64,
     /// Stack of active spans
     stack: Vec<u64>,
+    /// Reused storage for the fields of one event
+    fields: Vec<EventKeyValue<'static>>,
 }
 
 /// Start with a stack capacity for active spans
@@ -59,6 +61,7 @@ impl GuestState {
             encoder,
             next_id: AtomicU64::new(1),
             stack: Vec::with_capacity(ACTIVE_SPANS_CAPACITY),
+            fields: Vec::new(),
         }
     }
 
@@ -129,11 +132,7 @@ impl GuestState {
         let (idn, id) = self.alloc_id();
 
         let md = attrs.metadata();
-        let name = String::from(md.name());
-        let target = String::from(md.target());
-
-        // Visit fields to collect them
-        let mut fields = Vec::new();
+        let mut fields = core::mem::take(&mut self.fields);
         attrs.record(&mut FieldsVisitor { out: &mut fields });
 
         // Find parent from current stack top (if any)
@@ -142,14 +141,12 @@ impl GuestState {
         let event = GuestEvent::OpenSpan {
             id: idn,
             parent_id,
-            name,
-            target,
+            name: Cow::Borrowed(md.name()),
+            target: Cow::Borrowed(md.target()),
             tsc: invariant_tsc::read_tsc(),
             fields,
         };
-
-        // Serialize the event
-        self.encoder.encode(&event);
+        self.encode_with_fields(event);
 
         id
     }
@@ -160,34 +157,40 @@ impl GuestState {
         let parent_id = stack.last().copied().unwrap_or(0);
 
         let md = event.metadata();
-        let name = String::from(md.name());
-
-        let mut fields = Vec::new();
+        let mut fields = core::mem::take(&mut self.fields);
         event.record(&mut FieldsVisitor { out: &mut fields });
 
         let event = GuestEvent::LogEvent {
             parent_id,
-            name,
+            name: Cow::Borrowed(md.name()),
             tsc: invariant_tsc::read_tsc(),
             fields,
         };
-
-        // Serialize the event
-        self.encoder.encode(&event);
+        self.encode_with_fields(event);
     }
 
     /// Record new values for an existing span
     pub(crate) fn record(&mut self, s_id: &Id, values: &Record<'_>) {
-        let mut v = Vec::new();
-        values.record(&mut FieldsVisitor { out: &mut v });
+        let mut fields = core::mem::take(&mut self.fields);
+        values.record(&mut FieldsVisitor { out: &mut fields });
 
         let event = GuestEvent::EditSpan {
             id: s_id.into_u64(),
-            fields: v,
+            fields,
         };
+        self.encode_with_fields(event);
+    }
 
-        // Serialize the event
+    /// Encodes an event and keeps its field storage for the next event.
+    fn encode_with_fields(&mut self, event: GuestEvent<'static>) {
         self.encoder.encode(&event);
+        if let GuestEvent::OpenSpan { mut fields, .. }
+        | GuestEvent::LogEvent { mut fields, .. }
+        | GuestEvent::EditSpan { mut fields, .. } = event
+        {
+            fields.clear();
+            self.fields = fields;
+        }
     }
 
     /// Enter a span (push it on the stack)

@@ -131,7 +131,7 @@ scratch memory. Snapshot restores use the saved transport layout.
 Pool size sets the transport budget. Buffer size determines how many buffers
 share that budget.
 
-The guest cannot know the size of a `String`, `VecBytes`, or `ByteChunks` reply
+The guest cannot know the size of a `String` or `ByteChunks` reply
 in advance. It reserves as many reply buffers as the pool and queue allow.
 Even a small reply can therefore require many buffers to be managed.
 
@@ -185,7 +185,7 @@ Every logical message has this byte layout:
 
 ```text
  +----------------+-----------------------------+---------------------+
- | MsgHeader      | size-prefixed FlatBuffer    | external byte data  |
+ | MsgHeader      | size-prefixed postcard      | external byte data  |
  | 12 bytes       | control data                | zero or more values |
  +----------------+-----------------------------+---------------------+
 ```
@@ -208,8 +208,9 @@ The active message kinds are:
 * `Log`
 * `SnapshotCheckpoint`
 
-The FlatBuffer holds the typed function call or result and the lengths of
-external byte values. External bytes follow it in the same logical message.
+The control data holds the typed function call or result and the lengths of
+external byte values. It is one [postcard](https://docs.rs/postcard) value
+after a little-endian `u32` size prefix. Decoding rejects trailing bytes. External bytes follow it in the same logical message.
 A logical message may span several descriptors or several H2G receive buffers.
 
 The guest reads control data directly when it occupies one segment. It copies
@@ -218,22 +219,22 @@ control data out of guest writable scratch.
 
 ### Choosing a value type
 
-* `String`: UTF-8 text, encoded inside the FlatBuffer.
-* `VecBytes`: small binary values, or a receiver that needs a contiguous `Vec<u8>`.
-* `ByteChunks`: large binary data or data already held in chunks.
+* `String`: UTF-8 text, encoded inside the control data.
+* `ByteChunks`: binary data. Arguments can be `&[u8]`, `Vec<u8>`, `Bytes`, or
+  `Vec<Bytes>`. Each is sent without copying. Receivers always get
+  `Vec<Bytes>`. The host receives one chunk. The guest receives one chunk per
+  transport buffer the value spans. `concat` copies the chunks into one vector.
 
-For small `String` or `VecBytes` values, aim to fit the complete guest-sent G2H
+For small `String` or `ByteChunks` values, aim to fit the complete guest-sent G2H
 message in 256 bytes. The payload budget is `256 - 12 - envelope_overhead`.
-The 12-byte header is fixed. FlatBuffer overhead includes its size prefix
+The 12-byte header is fixed. Control data overhead includes its size prefix
 and metadata, and varies with the call. This is a sizing guideline, not a
 limit on the value types.
 
 ### External byte values
 
-`VecBytes` and `ByteChunks` payloads stay outside the FlatBuffer. It contains the
-total logical value length and whether the value is chunked. The encoder can
-then reference the caller's byte slices directly without first copying them into
-one contiguous FlatBuffer.
+Byte payloads stay outside the control data, which records each value's total
+length. The encoder references the caller's byte slices directly.
 
 `ExternalValueSource` is implemented by `RecvChain` for host decoding and by
 `Segments` for guest decoding.
@@ -247,7 +248,7 @@ Payload copying for `ByteChunks` follows the receiver's ownership model:
 
 Guest views use `Bytes::from_owner` and keep each slot allocated until its
 final owner drops. Host copies isolate host code from guest writable scratch.
-`VecBytes` copies external data into one contiguous `Vec<u8>`.
+The host copies each value into one chunk.
 
 C guest function parameters expose `ByteChunks` as a borrowed
 `hl_ByteChunks` array. Each `hl_ByteChunk` contains a pointer and length. The
@@ -257,13 +258,13 @@ returns. `hl_get_host_return_value_as_ByteChunks` returns an owning view that
 must be released with `hl_free_byte_chunks`. Chunk arrays produced by C are
 copied by `hl_result_from_ByteChunks`.
 
-The wire format does not preserve the sender's `Vec<Bytes>` boundaries. It
+The wire format does not preserve the sender's chunk boundaries. It
 records one total length, not each source chunk length. The receiver sees the
 logical byte sequence split where it intersects transport buffers.
 
 Each payload letter represents 1 KiB. Metadata size varies with the call.
 It combines the fixed 12-byte message header and the size-prefixed
-FlatBuffer. This example uses 1 KiB of metadata.
+control data. This example uses 1 KiB of metadata.
 
 ```text
 Sender chunks:      [AB] [CDEFG] [HIJ]    2 + 5 + 3 KiB
@@ -274,7 +275,7 @@ Guest ByteChunks:                     [ABC] [DEFG] [HIJ]    3 + 4 + 3 KiB
 Guest chunks exclude the metadata and unused space.
 
 H2G chunking follows the preposted H2G slot size. G2H responses returned to
-the guest follow the G2H writable slot size. The message header and FlatBuffer
+the guest follow the G2H writable slot size. The message header and control data
 can consume part of the first slot. The final slot can also be partial.
 
 #### Example: keeping a payload in one chunk
@@ -379,8 +380,9 @@ external `ByteChunks`:
 
 * H2G `ByteChunks` can retain host written receive slots after a guest function
   returns.
-* G2H host responses can become owner-backed guest `Bytes`.
-* `VecBytes` values copy into a contiguous `Vec<u8>`.
+* G2H host responses can become owner-backed guest `Bytes`. A guest that
+  returns them as its result holds their slots while the result is sent, so
+  the G2H pool must fit both. Copying them with `concat` releases the slots.
 * Multiple `Bytes` clones or slices backed by one owner keep one slot live.
 * The final owner unmaps its alias and returns the virtual range for reuse.
   Its lease releases the slot in its original pool.
@@ -409,7 +411,7 @@ freed virtual ranges bounds page-table growth by the alias high-water mark.
 
 ### Trust boundary
 
-The host treats guest rings, descriptors, headers, FlatBuffers, and payload
+The host treats guest rings, descriptors, headers, control data, and payload
 lengths as untrusted.
 
 * Rings and payloads use checked copies and atomics within mapped scratch.

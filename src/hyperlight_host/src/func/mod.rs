@@ -16,20 +16,19 @@ pub(crate) mod host_functions;
 
 /// Re-export for `HostFunction` trait
 pub use host_functions::{HostFunction, Registerable};
-/// Re-export for chunk-preserving byte values
+/// Re-export for byte values
 pub use hyperlight_common::flatbuffer_wrappers::function_types::Bytes;
 /// Re-export for `ParameterType` enum
 pub use hyperlight_common::flatbuffer_wrappers::function_types::ParameterType;
 /// Re-export for `ParameterValue` enum
 pub use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+/// Re-export for `ParameterValueRef` enum
+pub use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValueRef;
 /// Re-export for `ReturnType` enum
 pub use hyperlight_common::flatbuffer_wrappers::function_types::ReturnType;
 /// Re-export for `ReturnValue` enum
 pub use hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue;
-/// Re-export for `HostFunctionDefinition`
-pub use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
-/// Re-export for `HostFunctionDetails`
-pub use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 pub use hyperlight_common::func::{
-    ParameterTuple, ResultType, SupportedParameterType, SupportedReturnType,
+    AsParameter, AsParameters, ParameterTuple, ResultType, SupportedParameterType,
+    SupportedReturnType,
 };

@@ -65,6 +65,8 @@ impl GuestFunctionRegister<GuestFunc> {
     }
 }
 
+/// Register a guest function from a definition.
+#[deprecated(note = "use `#[guest_function]` or `register_fn`")]
 pub fn register_function(function_definition: GuestFunctionDefinition<GuestFunc>) {
     unsafe {
         // This is currently safe, because we are single threaded, but we

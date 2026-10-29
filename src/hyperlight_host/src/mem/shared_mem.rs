@@ -3,7 +3,7 @@
 
 use std::ffi::c_void;
 use std::io::Error;
-use std::mem::{align_of, size_of};
+use std::mem::{MaybeUninit, align_of, size_of};
 #[cfg(unix)]
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering;
@@ -1129,12 +1129,12 @@ impl SharedMemory for GuestSharedMemory {
 /// racing loads in LLVM return `undef`, as discussed above, we would
 /// ideally `llvm.freeze` the result of any load out of the sandbox.
 ///
-/// It would furthermore be ideal if we could run the flatbuffers
-/// parsing code directly on the guest memory, in order to avoid
+/// It would furthermore be ideal if we could run the message
+/// decoder directly on the guest memory, in order to avoid
 /// unnecessary copies.  That is unfortunately probably not viable at
-/// the present time: because the generated flatbuffers parsing code
-/// doesn't use atomic or volatile accesses, it is likely to introduce
-/// double-read vulnerabilities.
+/// the present time: because the decoder doesn't use atomic or
+/// volatile accesses, it is likely to introduce double-read
+/// vulnerabilities.
 ///
 /// In short, none of the Rust-level operations available to us do the
 /// right thing, at the Rust spec level or the LLVM spec level. Our
@@ -1281,12 +1281,23 @@ impl HostSharedMemory {
     /// Copy the contents of the slice into the sandbox at the
     /// specified offset
     pub fn copy_to_slice(&self, slice: &mut [u8], offset: usize) -> Result<()> {
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and `copy_to_uninit`
+        // writes only initialized bytes.
+        let slice = unsafe { &mut *(slice as *mut [u8] as *mut [MaybeUninit<u8>]) };
+        self.copy_to_uninit(slice, offset)
+    }
+
+    /// Copy sandbox memory at `offset` into possibly uninitialized memory.
+    ///
+    /// Every byte of `slice` is initialized when this returns `Ok`.
+    pub fn copy_to_uninit(&self, slice: &mut [MaybeUninit<u8>], offset: usize) -> Result<()> {
         bounds_check!(offset, slice.len(), self.mem_size());
         let base = self.base_ptr().wrapping_add(offset);
         let guard = self.lock.try_read()?;
 
         const CHUNK: usize = size_of::<u128>();
         let len = slice.len();
+        let dst = slice.as_mut_ptr().cast::<u8>();
         let mut i = 0;
 
         // Handle unaligned head bytes until we reach u128 alignment.
@@ -1296,17 +1307,16 @@ impl HostSharedMemory {
         let align_offset = base.align_offset(align_of::<u128>());
         let head_len = align_offset.min(len);
         while i < head_len {
-            unsafe {
-                slice[i] = base.add(i).read_volatile();
-            }
+            // SAFETY: `i < len`, so both pointers are in bounds. The bounds check
+            // covers the source.
+            unsafe { dst.add(i).write(base.add(i).read_volatile()) };
             i += 1;
         }
 
-        // Read aligned u128 chunks
-        // SAFETY: After processing head_len bytes, base.add(i) is u128-aligned.
-        // We use write_unaligned for the destination since the slice may not be u128-aligned.
-        let dst = slice.as_mut_ptr();
+        // Read aligned u128 chunks. The destination may be unaligned.
         while i + CHUNK <= len {
+            // SAFETY: After the head, `base.add(i)` is u128-aligned. Both ranges
+            // hold CHUNK bytes because `i + CHUNK <= len`.
             unsafe {
                 let value = (base.add(i) as *const u128).read_volatile();
                 std::ptr::write_unaligned(dst.add(i) as *mut u128, value);
@@ -1316,9 +1326,8 @@ impl HostSharedMemory {
 
         // Handle remaining tail bytes
         while i < len {
-            unsafe {
-                slice[i] = base.add(i).read_volatile();
-            }
+            // SAFETY: `i < len`, so both pointers are in bounds.
+            unsafe { dst.add(i).write(base.add(i).read_volatile()) };
             i += 1;
         }
 

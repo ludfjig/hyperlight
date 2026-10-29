@@ -30,7 +30,8 @@ fn run_once(test_file: &Path, label: &str) -> hyperlight_host::Result<()> {
         std::fs::metadata(test_file)?.len()
     );
 
-    let result: String = sandbox.call("Echo", format!("{label}: mapped_file_cow works!"))?;
+    let result: String =
+        sandbox.call("Echo", format!("{label}: mapped_file_cow works!").as_str())?;
     eprintln!("[{label}] guest returned: {result}");
     Ok(())
 }

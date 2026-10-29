@@ -6,9 +6,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
+#[cfg(feature = "fuzzing")]
+use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
 use hyperlight_common::flatbuffer_wrappers::function_types::{
-    ParameterValue, ReturnType, ReturnValue,
+    ParameterValueRef, ReturnType, ReturnValue,
 };
 use tracing::{Span, instrument};
 use tracing_core::LevelFilter;
@@ -17,7 +18,7 @@ use super::Callable;
 use super::file_mapping::prepare_file_cow;
 use super::host_funcs::FunctionRegistry;
 use super::snapshot::{Snapshot, SnapshotOptions};
-use crate::func::{ParameterTuple, SupportedReturnType};
+use crate::func::{AsParameters, SupportedReturnType};
 use crate::hypervisor::InterruptHandle;
 use crate::hypervisor::hyperlight_vm::{HyperlightVm, HyperlightVmError};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
@@ -233,7 +234,7 @@ impl Sandbox {
     /// let tag = OciTag::new("latest")?;
     /// let snapshot = Arc::new(Snapshot::load("./guest_snapshot", tag)?);
     /// let mut sandbox = Sandbox::from_snapshot(snapshot, HostFunctions::default(), None)?;
-    /// let result: String = sandbox.call("Echo", "hello".to_string())?;
+    /// let result: String = sandbox.call("Echo", "hello")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -381,7 +382,7 @@ impl Sandbox {
     /// let mut sandbox = SandboxBuilder::from_file("guest.bin").build()?;
     ///
     /// // Modify sandbox state
-    /// sandbox.call_guest_function_by_name::<i32>("SetValue", 42)?;
+    /// sandbox.call::<i32>("SetValue", 42)?;
     ///
     /// // Capture a snapshot of the current memory state
     /// let snapshot = sandbox.snapshot()?;
@@ -472,10 +473,13 @@ impl Sandbox {
             .get_msr_reset_state()
             .map_err(|e| HyperlightError::HyperlightVmError(e.into()))?;
         let next_action = self.vm.get_next_action();
-        let host_functions = (&*self.host_funcs.try_lock().map_err(|e| {
-            crate::new_error!("Error locking host_funcs at {}:{}: {}", file!(), line!(), e)
-        })?)
-            .into();
+        let host_functions = self
+            .host_funcs
+            .try_lock()
+            .map_err(|e| {
+                crate::new_error!("Error locking host_funcs at {}:{}: {}", file!(), line!(), e)
+            })?
+            .definitions();
 
         self.mem_mgr.snapshot(
             mapped_regions_vec,
@@ -570,13 +574,13 @@ impl Sandbox {
     /// let snapshot = sandbox.snapshot()?;
     ///
     /// // Modify sandbox state
-    /// sandbox.call_guest_function_by_name::<i32>("SetValue", 100)?;
-    /// let value: i32 = sandbox.call_guest_function_by_name("GetValue", ())?;
+    /// sandbox.call::<i32>("SetValue", 100)?;
+    /// let value: i32 = sandbox.call("GetValue", ())?;
     /// assert_eq!(value, 100);
     ///
     /// // Restore to previous state (same sandbox)
     /// sandbox.restore(snapshot)?;
-    /// let restored_value: i32 = sandbox.call_guest_function_by_name("GetValue", ())?;
+    /// let restored_value: i32 = sandbox.call("GetValue", ())?;
     /// assert_eq!(restored_value, 0); // Back to initial state
     /// # Ok(())
     /// # }
@@ -601,7 +605,7 @@ impl Sandbox {
     ///         assert!(sandbox.status().is_ready());
     ///         
     ///         // Sandbox is now usable again
-    ///         sandbox.call::<String>("Echo", "hello".to_string())?;
+    ///         sandbox.call::<String>("Echo", "hello")?;
     ///     }
     /// }
     /// # Ok(())
@@ -715,56 +719,8 @@ impl Sandbox {
 
     /// Calls a guest function by name with the specified arguments.
     ///
-    /// Changes made to the sandbox during execution are *not* persisted.
-    ///
-    /// ## Poisoned Sandbox
-    ///
-    /// This method will return [`crate::HyperlightError::PoisonedSandbox`] if the sandbox
-    /// is currently poisoned. Use [`restore()`](Self::restore) to recover from a poisoned state.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use hyperlight_host::SandboxBuilder;
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut sandbox = SandboxBuilder::from_file("guest.bin").build()?;
-    ///
-    /// // Call function with no arguments
-    /// let result: i32 = sandbox.call_guest_function_by_name("GetCounter", ())?;
-    ///
-    /// // Call function with single argument
-    /// let doubled: i32 = sandbox.call_guest_function_by_name("Double", 21)?;
-    /// assert_eq!(doubled, 42);
-    ///
-    /// // Call function with multiple arguments
-    /// let sum: i32 = sandbox.call_guest_function_by_name("Add", (10, 32))?;
-    /// assert_eq!(sum, 42);
-    ///
-    /// // Call function returning string
-    /// let message: String = sandbox.call_guest_function_by_name("Echo", "Hello, World!".to_string())?;
-    /// assert_eq!(message, "Hello, World!");
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[doc(hidden)]
-    #[deprecated(
-        since = "0.8.0",
-        note = "Deprecated in favour of call and snapshot/restore."
-    )]
-    #[instrument(err(Debug), skip(self, args), parent = Span::current())]
-    pub fn call_guest_function_by_name<Output: SupportedReturnType>(
-        &mut self,
-        func_name: &str,
-        args: impl ParameterTuple,
-    ) -> Result<Output> {
-        self.check_ready()?;
-        let snapshot = self.snapshot()?;
-        let res = self.call(func_name, args);
-        self.restore(snapshot)?;
-        res
-    }
-
-    /// Calls a guest function by name with the specified arguments.
+    /// Arguments are borrowed and copied once into the call. See
+    /// [`AsParameter`](crate::func::AsParameter) for the accepted types.
     ///
     /// Changes made to the sandbox during execution are persisted.
     ///
@@ -803,7 +759,7 @@ impl Sandbox {
     /// assert_eq!(sum, 42);
     ///
     /// // Call function returning string
-    /// let message: String = sandbox.call("Echo", "Hello, World!".to_string())?;
+    /// let message: String = sandbox.call("Echo", "Hello, World!")?;
     /// assert_eq!(message, "Hello, World!");
     /// # Ok(())
     /// # }
@@ -820,7 +776,7 @@ impl Sandbox {
     /// let snapshot = sandbox.snapshot()?;
     ///
     /// // Call potentially unsafe guest function
-    /// let result = sandbox.call::<String>("RiskyOperation", "input".to_string());
+    /// let result = sandbox.call::<String>("RiskyOperation", "input");
     ///
     /// // Check if the call failed and poisoned the sandbox
     /// if let Err(e) = result {
@@ -838,7 +794,7 @@ impl Sandbox {
     pub fn call<Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl AsParameters,
     ) -> Result<Output> {
         self.check_ready()?;
         // Reset snapshot since we are mutating the sandbox state
@@ -847,7 +803,7 @@ impl Sandbox {
             let ret = self.call_guest_function_by_name_no_reset(
                 func_name,
                 Output::TYPE,
-                args.into_value(),
+                args.as_parameters().as_ref(),
             );
             // Use the ? operator to allow converting any hyperlight_common::func::Error
             // returned by from_value into a HyperlightError
@@ -967,7 +923,8 @@ impl Sandbox {
         // Reset snapshot since we are mutating the sandbox state
         self.snapshot = None;
         maybe_time_and_emit_guest_call(func_name, || {
-            self.call_guest_function_by_name_no_reset(func_name, ret_type, args)
+            let args: Vec<_> = args.iter().map(ParameterValue::as_ref).collect();
+            self.call_guest_function_by_name_no_reset(func_name, ret_type, &args)
         })
     }
 
@@ -975,20 +932,15 @@ impl Sandbox {
         &mut self,
         function_name: &str,
         return_type: ReturnType,
-        args: Vec<ParameterValue>,
+        args: &[ParameterValueRef<'_>],
     ) -> Result<ReturnValue> {
         self.check_ready()?;
         self.with_guest_execution(|sbox| {
             sbox.transport_dirty = true;
 
-            let fc = FunctionCall::new(
-                function_name.to_string(),
-                Some(args),
-                FunctionCallType::Guest,
-                return_type,
-            );
-
-            let cid = sbox.mem_mgr.write_guest_function_call(&fc)?;
+            let cid = sbox
+                .mem_mgr
+                .write_guest_function_call(function_name, args, return_type)?;
             sbox.dispatch_guest_call()?;
 
             let guest_result = sbox.mem_mgr.read_h2g_result_from_g2h(cid)?.into_inner();
@@ -1069,7 +1021,7 @@ impl Sandbox {
     /// });
     ///
     /// // This call may be interrupted by the spawned thread
-    /// let result = sandbox.call_guest_function_by_name::<i32>("LongRunningFunction", ());
+    /// let result = sandbox.call::<i32>("LongRunningFunction", ());
     /// # Ok(())
     /// # }
     /// ```
@@ -1186,7 +1138,7 @@ impl Callable for Sandbox {
     fn call<Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        args: impl ParameterTuple,
+        args: impl AsParameters,
     ) -> Result<Output> {
         self.check_ready()?;
         self.call(func_name, args)
@@ -1266,8 +1218,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-    use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+    use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValueRef;
     use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
     use hyperlight_common::func::{Bytes, SupportedReturnType};
     use hyperlight_testing::sandbox_sizes::{LARGE_HEAP_SIZE, MEDIUM_HEAP_SIZE, SMALL_HEAP_SIZE};
@@ -1368,7 +1319,7 @@ mod tests {
         ));
         // Rejected sizes do not enter the guest: a pending transport
         // checkpoint, which a capture would run, is still pending.
-        let echo: String = sbox.call("Echo", "still".to_string()).unwrap();
+        let echo: String = sbox.call("Echo", "still").unwrap();
         assert_eq!(echo, "still");
         assert!(sbox.transport_dirty);
         assert!(sbox.snapshot_with_options(&scratch(4096)).is_err());
@@ -1383,13 +1334,13 @@ mod tests {
             sbox.snapshot_with_options(&scratch(no_pt_room)),
             Err(HyperlightError::MemoryRequestTooSmall(..))
         ));
-        let echo: String = sbox.call("Echo", "usable".to_string()).unwrap();
+        let echo: String = sbox.call("Echo", "usable").unwrap();
         assert_eq!(echo, "usable");
 
         for _ in 0..3 {
             sbox.restore(small.clone()).unwrap();
             assert_eq!(sbox.mem_mgr.scratch_mem.mem_size(), 2 << 20);
-            let echo: String = sbox.call("Echo", "hello".to_string()).unwrap();
+            let echo: String = sbox.call("Echo", "hello").unwrap();
             assert_eq!(echo, "hello");
             sbox.call::<()>("AllocAndWritePattern", 32u64 << 10)
                 .unwrap();
@@ -1405,12 +1356,12 @@ mod tests {
         let loaded = crate::sandbox::snapshot::Snapshot::checked_load(dir.path(), tag).unwrap();
         sbox.restore(Arc::new(loaded)).unwrap();
         assert_eq!(sbox.mem_mgr.scratch_mem.mem_size(), 2 << 20);
-        let echo: String = sbox.call("Echo", "loaded".to_string()).unwrap();
+        let echo: String = sbox.call("Echo", "loaded").unwrap();
         assert_eq!(echo, "loaded");
 
         sbox.restore(full).unwrap();
         assert_eq!(sbox.mem_mgr.scratch_mem.mem_size(), 8 << 20);
-        let echo: String = sbox.call("Echo", "back".to_string()).unwrap();
+        let echo: String = sbox.call("Echo", "back").unwrap();
         assert_eq!(echo, "back");
     }
 
@@ -1432,7 +1383,7 @@ mod tests {
             sbox.restore(large.clone()).unwrap();
             assert_eq!(sbox.mem_mgr.scratch_mem.mem_size(), 16 << 20);
             sbox.call::<()>("AllocAndWritePattern", 8u64 << 20).unwrap();
-            let echo: String = sbox.call("Echo", "grown".to_string()).unwrap();
+            let echo: String = sbox.call("Echo", "grown").unwrap();
             assert_eq!(echo, "grown");
         }
     }
@@ -1482,7 +1433,7 @@ mod tests {
         ] {
             sbox.restore(base.clone()).unwrap();
             let held = chunks(seed);
-            let len: i32 = sbox.call(hold, held.clone()).unwrap();
+            let len: i32 = sbox.call(hold, held.as_slice()).unwrap();
             assert_eq!(len, 11 * 1024);
             assert_eq!(read_back(&mut sbox, read), held.concat());
 
@@ -1494,7 +1445,10 @@ mod tests {
                 // can bring the first ones back, and the restore must drop
                 // the live ones.
                 assert_eq!(sbox.call::<i32>(release, ()).unwrap(), len);
-                assert_eq!(sbox.call::<i32>(hold, chunks(!seed)).unwrap(), len);
+                assert_eq!(
+                    sbox.call::<i32>(hold, chunks(!seed).as_slice()).unwrap(),
+                    len
+                );
                 sbox.restore(snapshot).unwrap();
                 assert_eq!(sbox.mem_mgr.scratch_mem.mem_size(), size);
 
@@ -1502,8 +1456,9 @@ mod tests {
                 // a restore. The held chunks read from their captured copy, so
                 // this traffic must not change them.
                 let other = chunks(seed ^ 0x80);
-                let echoed: Vec<Bytes> =
-                    sbox.call("RoundTripHostByteChunks", other.clone()).unwrap();
+                let echoed: Vec<Bytes> = sbox
+                    .call("RoundTripHostByteChunks", other.as_slice())
+                    .unwrap();
                 assert_eq!(echoed.concat(), other.concat());
                 assert_eq!(read_back(&mut sbox, read), held.concat());
             }
@@ -1515,7 +1470,7 @@ mod tests {
             // release that leaks its slot runs the pool dry.
             for round in 1..=32 {
                 let next = chunks(seed + round);
-                assert_eq!(sbox.call::<i32>(hold, next.clone()).unwrap(), len);
+                assert_eq!(sbox.call::<i32>(hold, next.as_slice()).unwrap(), len);
                 assert_eq!(read_back(&mut sbox, read), next.concat());
                 assert_eq!(sbox.call::<i32>(release, ()).unwrap(), len);
             }
@@ -1527,7 +1482,7 @@ mod tests {
             sbox.restore(back).unwrap();
             assert_eq!(sbox.mem_mgr.scratch_mem.mem_size(), 8 << 20);
             let last = chunks(seed + 0x21);
-            assert_eq!(sbox.call::<i32>(hold, last.clone()).unwrap(), len);
+            assert_eq!(sbox.call::<i32>(hold, last.as_slice()).unwrap(), len);
             assert_eq!(read_back(&mut sbox, read), last.concat());
             assert_eq!(sbox.call::<i32>(release, ()).unwrap(), len);
         }
@@ -1564,7 +1519,7 @@ mod tests {
         assert!(allocator < arena.base_addr() + 0x4000, "{allocator:#x}");
 
         sbox.restore(small).unwrap();
-        let echo: String = sbox.call("Echo", "recovered".to_string()).unwrap();
+        let echo: String = sbox.call("Echo", "recovered").unwrap();
         assert_eq!(echo, "recovered");
     }
 
@@ -1576,18 +1531,14 @@ mod tests {
         let snapshot = sbox.snapshot().unwrap();
 
         // poison on purpose
-        let res = sbox
-            .call::<()>("guest_panic", "hello".to_string())
-            .unwrap_err();
+        let res = sbox.call::<()>("guest_panic", "hello").unwrap_err();
         assert!(
             matches!(res, HyperlightError::GuestAborted(code, context) if code == ErrorCode::UnknownError as u8 && context.contains("hello"))
         );
         assert!(sbox.status().is_poisoned());
 
         // guest calls should fail when poisoned
-        let res = sbox
-            .call::<()>("guest_panic", "hello2".to_string())
-            .unwrap_err();
+        let res = sbox.call::<()>("guest_panic", "hello2").unwrap_err();
         assert!(matches!(res, HyperlightError::PoisonedSandbox));
 
         // snapshot should fail when poisoned
@@ -1615,26 +1566,17 @@ mod tests {
             std::fs::remove_file(&temp_file).ok(); // Clean up
         }
 
-        // call_guest_function_by_name (deprecated) should fail when poisoned
-        #[allow(deprecated)]
-        let res = sbox
-            .call_guest_function_by_name::<String>("Echo", "test".to_string())
-            .unwrap_err();
-        assert!(matches!(res, HyperlightError::PoisonedSandbox));
-
         // restore to non-poisoned snapshot should work and clear poison
         sbox.restore(snapshot.clone()).unwrap();
         assert_eq!(sbox.status(), SandboxStatus::Ready);
 
         // guest calls should work again after restore
-        let res = sbox.call::<String>("Echo", "hello2".to_string()).unwrap();
+        let res = sbox.call::<String>("Echo", "hello2").unwrap();
         assert_eq!(res, "hello2".to_string());
         assert_eq!(sbox.status(), SandboxStatus::Ready);
 
         // re-poison on purpose
-        let res = sbox
-            .call::<()>("guest_panic", "hello".to_string())
-            .unwrap_err();
+        let res = sbox.call::<()>("guest_panic", "hello").unwrap_err();
         assert!(
             matches!(res, HyperlightError::GuestAborted(code, context) if code == ErrorCode::UnknownError as u8 && context.contains("hello"))
         );
@@ -1645,7 +1587,7 @@ mod tests {
         assert_eq!(sbox.status(), SandboxStatus::Ready);
 
         // guest calls should work again
-        let res = sbox.call::<String>("Echo", "hello3".to_string()).unwrap();
+        let res = sbox.call::<String>("Echo", "hello3").unwrap();
         assert_eq!(res, "hello3".to_string());
         assert_eq!(sbox.status(), SandboxStatus::Ready);
 
@@ -1667,10 +1609,7 @@ mod tests {
         // Repeated calls exhaust the transport if buffers leak.
         for _ in 0..1000 {
             let result = sandbox
-                .call::<i64>(
-                    "CallGivenParamlessHostFuncThatReturnsI64",
-                    "HostError".to_string(),
-                )
+                .call::<i64>("CallGivenParamlessHostFuncThatReturnsI64", "HostError")
                 .unwrap_err();
 
             assert!(
@@ -1684,7 +1623,7 @@ mod tests {
         let path = simple_guest_as_pathbuf();
         let mut sandbox = SandboxBuilder::from_file(path).build().unwrap();
         sandbox
-            .call::<()>("CallHostExpectError", "SomeUnknownHostFunc".to_string())
+            .call::<()>("CallHostExpectError", "SomeUnknownHostFunc")
             .unwrap();
     }
 
@@ -1708,29 +1647,6 @@ mod tests {
         }
     }
 
-    /// Tests that call_guest_function_by_name restores the state correctly
-    #[test]
-    fn test_call_guest_function_by_name() {
-        let mut sbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
-            .build()
-            .unwrap();
-
-        let snapshot = sbox.snapshot().unwrap();
-
-        let _ = sbox.call::<i32>("AddToStatic", 5i32).unwrap();
-        let res: i32 = sbox.call("GetStatic", ()).unwrap();
-        assert_eq!(res, 5);
-
-        sbox.restore(snapshot).unwrap();
-        #[allow(deprecated)]
-        let _ = sbox
-            .call_guest_function_by_name::<i32>("AddToStatic", 5i32)
-            .unwrap();
-        #[allow(deprecated)]
-        let res: i32 = sbox.call_guest_function_by_name("GetStatic", ()).unwrap();
-        assert_eq!(res, 0);
-    }
-
     // Checks that 1,000 calls work with constrained guest memory.
     // This catches guest stack reset and heap leaks.
     #[test]
@@ -1751,7 +1667,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..1000 {
-            sbox1.call::<String>("Echo", "hello".to_string()).unwrap();
+            sbox1.call::<String>("Echo", "hello").unwrap();
         }
 
         let mut sbox2 = SandboxBuilder::from_file(simple_guest_as_pathbuf())
@@ -1762,10 +1678,7 @@ mod tests {
 
         for i in 0..1000 {
             sbox2
-                .call::<i32>(
-                    "PrintUsingPrintf",
-                    format!("Hello World {}\n", i).to_string(),
-                )
+                .call::<i32>("PrintUsingPrintf", format!("Hello World {}\n", i).as_str())
                 .unwrap();
         }
     }
@@ -1852,8 +1765,10 @@ mod tests {
         // Restore the canonical descriptor before continuing the source.
         sandbox.mem_mgr.scratch_mem.write::<u64>(offset, 0).unwrap();
         let expected = vec![0x5a; 2 * hyperlight_common::vmem::PAGE_SIZE + 137];
-        let actual: Vec<u8> = sandbox.call("EchoGuestVecBytes", expected.clone()).unwrap();
-        assert_eq!(actual, expected);
+        let actual: Vec<Bytes> = sandbox
+            .call("EchoGuestByteChunks", expected.as_slice())
+            .unwrap();
+        assert_eq!(actual.concat(), expected);
     }
 
     #[test]
@@ -1893,13 +1808,14 @@ mod tests {
             .build()
             .unwrap();
 
-        let call = FunctionCall::new(
-            "PrintOutput".into(),
-            Some(vec![ParameterValue::String("checkpoint".into())]),
-            FunctionCallType::Guest,
-            i32::TYPE,
-        );
-        sandbox.mem_mgr.write_guest_function_call(&call).unwrap();
+        sandbox
+            .mem_mgr
+            .write_guest_function_call(
+                "PrintOutput",
+                &[ParameterValueRef::String("checkpoint")],
+                i32::TYPE,
+            )
+            .unwrap();
 
         let error = sandbox.dispatch_guest_call_restricted().unwrap_err();
 
@@ -1912,6 +1828,23 @@ mod tests {
     }
 
     #[test]
+    fn restore_erases_host_wire_buffer() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+        let snapshot = sandbox.snapshot().unwrap();
+
+        let echoed: String = sandbox.call("Echo", "secret").unwrap();
+        assert_eq!(echoed, "secret");
+        assert_ne!(sandbox.mem_mgr.wire_buf.capacity(), 0);
+
+        sandbox.restore(snapshot).unwrap();
+        let buffer = &sandbox.mem_mgr.wire_buf;
+        assert_eq!(buffer.len(), buffer.capacity());
+        assert!(buffer.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
     fn restore_resets_execution_mode() {
         let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
             .build()
@@ -1921,9 +1854,7 @@ mod tests {
         sandbox.mem_mgr.execution_mode = ExecutionMode::Restricted;
         sandbox.restore(snapshot).unwrap();
 
-        sandbox
-            .call::<i32>("PrintOutput", "restored".to_string())
-            .unwrap();
+        sandbox.call::<i32>("PrintOutput", "restored").unwrap();
     }
 
     #[test]
@@ -1956,13 +1887,13 @@ mod tests {
             .unwrap();
 
         let mut sandbox = sandbox.evolve().unwrap();
-        let retained = vec![Bytes::from(vec![0xa5; 6 * 1024])];
+        let retained = [0xa5u8; 6 * 1024];
 
         for (retain, release) in [
             ("RetainGuestByteChunks", "ReleaseGuestByteChunks"),
             ("RetainHostByteChunks", "ReleaseHostByteChunks"),
         ] {
-            let retained_len: i32 = sandbox.call(retain, retained.clone()).unwrap();
+            let retained_len: i32 = sandbox.call(retain, &retained).unwrap();
             assert_eq!(retained_len, 6 * 1024);
             sandbox.mem_mgr.abort_buffer.extend_from_slice(&[0xAA; 8]);
 
@@ -1986,10 +1917,7 @@ mod tests {
             .build()
             .unwrap();
         sandbox
-            .call::<i32>(
-                "RetainGuestByteChunks",
-                vec![Bytes::from(vec![0x5a; 6 * 1024])],
-            )
+            .call::<i32>("RetainGuestByteChunks", &[0x5au8; 6 * 1024])
             .unwrap();
         sandbox.checkpoint_transport_for_snapshot().unwrap();
         let source_root = sandbox.vm.get_root_pt().unwrap();
@@ -2000,16 +1928,14 @@ mod tests {
         let mut clone =
             Sandbox::from_snapshot(snapshot, crate::HostFunctions::default(), None).unwrap();
         let expected = vec![0x3c; 3 * hyperlight_common::vmem::PAGE_SIZE + 117];
-        let call = FunctionCall::new(
-            "EchoGuestVecBytes".into(),
-            Some(vec![ParameterValue::VecBytes(expected.clone())]),
-            FunctionCallType::Guest,
-            Vec::<u8>::TYPE,
-        );
+        let parameters = [ParameterValueRef::ByteSlice(&expected)];
 
         for restored in [&mut sandbox, &mut clone] {
             restored.transport_dirty = true;
-            let cid = restored.mem_mgr.write_guest_function_call(&call).unwrap();
+            let cid = restored
+                .mem_mgr
+                .write_guest_function_call("EchoGuestByteChunks", &parameters, <Vec<Bytes>>::TYPE)
+                .unwrap();
             restored.dispatch_guest_call().unwrap();
             let value = restored
                 .mem_mgr
@@ -2017,7 +1943,7 @@ mod tests {
                 .unwrap()
                 .into_inner()
                 .unwrap();
-            assert_eq!(Vec::<u8>::from_value(value).unwrap(), expected);
+            assert_eq!(<Vec<Bytes>>::from_value(value).unwrap().concat(), expected);
         }
 
         assert_eq!(
@@ -2119,12 +2045,13 @@ mod tests {
         }
 
         let _guard = map_mem.lock.try_read().unwrap();
-        let actual: Vec<u8> = sbox
-            .call(
+        let actual = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base as u64, expected.len() as u64, true),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
 
         assert_eq!(actual, expected);
     }
@@ -2225,7 +2152,7 @@ mod tests {
         unsafe { sbox.map_region(&region).unwrap() };
         assert_eq!(sbox.vm.get_mapped_regions().count(), 1);
         let orig_read = sbox
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     guest_base as u64,
@@ -2233,7 +2160,8 @@ mod tests {
                     true,
                 ),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
 
         // 3. Take snapshot 2 with 1 region mapped
         let snapshot2 = sbox.snapshot().unwrap();
@@ -2258,7 +2186,7 @@ mod tests {
 
         // Verify the region is the same
         let new_read = sbox
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     guest_base as u64,
@@ -2266,7 +2194,8 @@ mod tests {
                     false,
                 ),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(new_read, orig_read);
     }
 
@@ -2286,7 +2215,7 @@ mod tests {
 
         // do_map=true installs the guest PTE for the region.
         let orig_read = source
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     guest_base as u64,
@@ -2294,7 +2223,8 @@ mod tests {
                     true,
                 ),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
 
         let snapshot = source.snapshot().unwrap();
 
@@ -2309,7 +2239,7 @@ mod tests {
         // Snapshot PTEs resolve to GPAs in the snapshot blob, so the
         // data is readable without re-mapping.
         let new_read = target
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     guest_base as u64,
@@ -2317,7 +2247,8 @@ mod tests {
                     false,
                 ),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(new_read, orig_read);
     }
 
@@ -2802,16 +2733,16 @@ mod tests {
             .unwrap();
         let large = "x".repeat(4 * hyperlight_common::vmem::PAGE_SIZE);
 
-        assert_eq!(target.call::<String>("Echo", large.clone()).unwrap(), large);
+        assert_eq!(
+            target.call::<String>("Echo", large.as_str()).unwrap(),
+            large
+        );
         target.restore(snapshot).unwrap();
         assert_eq!(target.mem_mgr.layout.get_h2g_pool_pages(), 4);
-        let error = target.call::<String>("Echo", large).unwrap_err();
+        let error = target.call::<String>("Echo", large.as_str()).unwrap_err();
         assert!(error.to_string().contains("H2G capacity"));
         assert!(!target.status().is_poisoned());
-        assert_eq!(
-            target.call::<String>("Echo", "small".to_string()).unwrap(),
-            "small"
-        );
+        assert_eq!(target.call::<String>("Echo", "small").unwrap(), "small");
     }
 
     #[test]
@@ -3000,10 +2931,7 @@ mod tests {
         target.restore(snapshot).unwrap();
         assert_eq!(
             target
-                .call::<i64>(
-                    "CallGivenParamlessHostFuncThatReturnsI64",
-                    "Echo42".to_string(),
-                )
+                .call::<i64>("CallGivenParamlessHostFuncThatReturnsI64", "Echo42",)
                 .unwrap(),
             42
         );
@@ -3062,7 +2990,7 @@ mod tests {
         // SAFETY: `map_mem` is page-aligned and outlives every use of `target`.
         unsafe { target.map_region(&region).unwrap() };
         target
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     guest_base as u64,
@@ -3200,7 +3128,7 @@ mod tests {
         let source_region = region_for_memory(&source_mem, source_base, MemoryRegionFlags::READ);
         unsafe { source.map_region(&source_region).unwrap() };
         let orig_read = source
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     source_base as u64,
@@ -3208,7 +3136,8 @@ mod tests {
                     true,
                 ),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         source.call::<i32>("AddToStatic", 9i32).unwrap();
         let snapshot = source.snapshot().unwrap();
 
@@ -3227,7 +3156,7 @@ mod tests {
         assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 9);
 
         let new_read = target
-            .call::<Vec<u8>>(
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (
                     source_base as u64,
@@ -3235,7 +3164,8 @@ mod tests {
                     false,
                 ),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(new_read, orig_read);
     }
 
@@ -3347,7 +3277,7 @@ mod tests {
         // Simulate a partial abort
         sbox.mem_mgr.abort_buffer.extend_from_slice(&[0xAA; 1020]);
 
-        let res = sbox.call::<String>("Echo", "hello".to_string());
+        let res = sbox.call::<String>("Echo", "hello");
         assert!(
             res.is_ok(),
             "Expected Ok after stale abort buffer, got: {:?}",
@@ -3395,9 +3325,10 @@ mod tests {
     #[cfg(feature = "trace_guest")]
     fn assert_gva_read_matches(sbox: &mut Sandbox, gva: u64, len: usize) {
         // Guest reads via its own page tables
-        let expected: Vec<u8> = sbox
-            .call("ReadMappedBuffer", (gva, len as u64, true))
-            .unwrap();
+        let expected = sbox
+            .call::<Vec<Bytes>>("ReadMappedBuffer", (gva, len as u64, true))
+            .unwrap()
+            .concat();
         assert_eq!(expected.len(), len);
 
         // Host reads by walking the same page tables
@@ -3513,12 +3444,13 @@ mod tests {
         );
 
         // Read the content back from the guest
-        let actual: Vec<u8> = sbox
-            .call(
+        let actual = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, true),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
 
         assert_eq!(
             actual, expected_bytes,
@@ -3572,9 +3504,7 @@ mod tests {
         let snapshot = sbox.snapshot().unwrap();
 
         // Poison the sandbox
-        let _ = sbox
-            .call::<()>("guest_panic", "hello".to_string())
-            .unwrap_err();
+        let _ = sbox.call::<()>("guest_panic", "hello").unwrap_err();
         assert!(sbox.status().is_poisoned());
 
         // map_file_cow should fail with PoisonedSandbox
@@ -3613,18 +3543,20 @@ mod tests {
         sbox2.map_file_cow(&path, guest_base).unwrap();
 
         // Both should read the correct content
-        let actual1: Vec<u8> = sbox1
-            .call(
+        let actual1 = sbox1
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, true),
             )
-            .unwrap();
-        let actual2: Vec<u8> = sbox2
-            .call(
+            .unwrap()
+            .concat();
+        let actual2 = sbox2
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, true),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
 
         assert_eq!(
             actual1, expected_bytes,
@@ -3667,12 +3599,13 @@ mod tests {
                 let guest_base: u64 = 0x1_0000_0000;
                 sbox.map_file_cow(&path, guest_base).unwrap();
 
-                let actual: Vec<u8> = sbox
-                    .call(
+                let actual = sbox
+                    .call::<Vec<Bytes>>(
                         "ReadMappedBuffer",
                         (guest_base, expected_bytes.len() as u64, true),
                     )
-                    .unwrap();
+                    .unwrap()
+                    .concat();
 
                 assert_eq!(actual, *expected_bytes);
             }));
@@ -3727,12 +3660,13 @@ mod tests {
         sbox.map_file_cow(&path, guest_base).unwrap();
 
         // Verify we can read it
-        let actual: Vec<u8> = sbox
-            .call(
+        let actual = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, true),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(actual, expected_bytes);
 
         // 3. snapshot₂ — file mapped (data folded into snapshot)
@@ -3754,12 +3688,13 @@ mod tests {
             is_mapped,
             "Region should be mapped after restoring to snapshot₂"
         );
-        let actual2: Vec<u8> = sbox
-            .call(
+        let actual2 = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, false),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(
             actual2, expected_bytes,
             "Data should be intact after snapshot₂ restore"
@@ -3784,12 +3719,13 @@ mod tests {
         sbox.map_file_cow(&path, guest_base).unwrap();
 
         // Read the content to verify mapping works
-        let actual: Vec<u8> = sbox
-            .call(
+        let actual = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, true),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(actual, expected_bytes);
 
         // Take snapshot — folds file data into snapshot memory
@@ -3799,12 +3735,13 @@ mod tests {
         sbox.restore(snapshot).unwrap();
 
         // Data should still be readable from snapshot memory
-        let actual2: Vec<u8> = sbox
-            .call(
+        let actual2 = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, false),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
         assert_eq!(
             actual2, expected_bytes,
             "Data should be readable after restore from snapshot"
@@ -3840,12 +3777,13 @@ mod tests {
         let mut sbox = u_sbox.evolve().unwrap();
 
         // Verify the guest can read the mapped content.
-        let actual: Vec<u8> = sbox
-            .call(
+        let actual = sbox
+            .call::<Vec<Bytes>>(
                 "ReadMappedBuffer",
                 (guest_base, expected_bytes.len() as u64, true),
             )
-            .unwrap();
+            .unwrap()
+            .concat();
 
         assert_eq!(
             actual, expected_bytes,
@@ -4373,7 +4311,7 @@ mod tests {
                 assert_snapshot_msr_index_invalid(&err);
                 assert!(target.status().is_poisoned());
                 assert!(matches!(
-                    target.call::<String>("Echo", "hi".to_string()),
+                    target.call::<String>("Echo", "hi"),
                     Err(HyperlightError::PoisonedSandbox)
                 ));
             }
@@ -4498,19 +4436,23 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                sbox.call::<Vec<u8>>("ProbeReadableMSRs", (0u32, 4096u32))
+                sbox.call::<Vec<Bytes>>("ProbeReadableMSRs", (0u32, 4096u32))
                     .unwrap()
-                    .len(),
+                    .iter()
+                    .map(Bytes::len)
+                    .sum::<usize>(),
                 512
             );
             assert_eq!(
-                sbox.call::<Vec<u8>>("ProbeReadableMSRs", (KERNEL_GS_BASE, 1u32))
-                    .unwrap(),
+                sbox.call::<Vec<Bytes>>("ProbeReadableMSRs", (KERNEL_GS_BASE, 1u32))
+                    .unwrap()
+                    .concat(),
                 vec![1]
             );
             assert_eq!(
-                sbox.call::<Vec<u8>>("ProbeReadableMSRs", (KVM_CUSTOM_MSR, 1u32))
-                    .unwrap(),
+                sbox.call::<Vec<Bytes>>("ProbeReadableMSRs", (KVM_CUSTOM_MSR, 1u32))
+                    .unwrap()
+                    .concat(),
                 vec![0]
             );
             assert!(!sbox.status().is_poisoned());
@@ -5081,9 +5023,10 @@ mod tests {
                 let window_end = *window.end();
                 for chunk_start in window.step_by(PROBE_CHUNK_SIZE as usize) {
                     let chunk_len = PROBE_CHUNK_SIZE.min(window_end - chunk_start + 1);
-                    let bitmap: Vec<u8> = sbox
-                        .call("ProbeReadableMSRs", (chunk_start, chunk_len))
-                        .unwrap();
+                    let bitmap = sbox
+                        .call::<Vec<Bytes>>("ProbeReadableMSRs", (chunk_start, chunk_len))
+                        .unwrap()
+                        .concat();
                     assert_eq!(bitmap.len(), chunk_len.div_ceil(8) as usize);
                     readable_msrs.extend((0..chunk_len).filter_map(|offset| {
                         let byte = bitmap[offset as usize / 8];
@@ -5310,7 +5253,7 @@ mod tests {
             let mut sbox2 = SandboxBuilder::from_snapshot(snapshot).build().unwrap();
             super::assert_virtq_attached(&sbox2);
             assert_eq!(sbox2.call::<i32>("GetStatic", ()).unwrap(), 11);
-            let echoed: String = sbox2.call("Echo", "hi".to_string()).unwrap();
+            let echoed: String = sbox2.call("Echo", "hi").unwrap();
             assert_eq!(echoed, "hi");
         }
 
@@ -5399,7 +5342,7 @@ mod tests {
                     LevelFilter::ERROR,
                 ] {
                     let encoded: u64 = GuestLogFilter::from(level).into();
-                    sbox.call::<()>("LogMessage", ("hello".to_string(), encoded as i32))
+                    sbox.call::<()>("LogMessage", ("hello", encoded as i32))
                         .unwrap();
                 }
 
@@ -5468,7 +5411,7 @@ mod tests {
                     ] {
                         let encoded: u64 = GuestLogFilter::from(level).into();
                         sandbox
-                            .call::<()>("LogMessage", ("hello".to_string(), encoded as i32))
+                            .call::<()>("LogMessage", ("hello", encoded as i32))
                             .unwrap();
                     }
 
@@ -5537,7 +5480,7 @@ mod tests {
                 ] {
                     let encoded: u64 = GuestLogFilter::from(level).into();
                     sandbox
-                        .call::<()>("LogMessage", ("hello".to_string(), encoded as i32))
+                        .call::<()>("LogMessage", ("hello", encoded as i32))
                         .unwrap();
                 }
                 let count = (0..LOGGER.num_log_calls())
@@ -5578,7 +5521,7 @@ mod tests {
             let count_guest_logs = |sandbox: &mut Sandbox| {
                 LOGGER.clear_log_calls();
                 sandbox
-                    .call::<()>("LogMessage", ("hello".to_string(), encoded as i32))
+                    .call::<()>("LogMessage", ("hello", encoded as i32))
                     .unwrap();
                 (0..LOGGER.num_log_calls())
                     .filter_map(|i| LOGGER.get_log_call(i))
@@ -5612,7 +5555,7 @@ mod tests {
             let count_guest_logs = |sandbox: &mut Sandbox| {
                 LOGGER.clear_log_calls();
                 sandbox
-                    .call::<()>("LogMessage", ("hello".to_string(), encoded as i32))
+                    .call::<()>("LogMessage", ("hello", encoded as i32))
                     .unwrap();
                 (0..LOGGER.num_log_calls())
                     .filter_map(|i| LOGGER.get_log_call(i))
@@ -5848,10 +5791,7 @@ mod tests {
                 .unwrap();
 
             let got: i64 = sbox2
-                .call(
-                    "CallGivenParamlessHostFuncThatReturnsI64",
-                    "Echo42".to_string(),
-                )
+                .call("CallGivenParamlessHostFuncThatReturnsI64", "Echo42")
                 .unwrap();
             assert_eq!(got, 42);
         }

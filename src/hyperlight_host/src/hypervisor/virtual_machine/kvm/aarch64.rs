@@ -15,7 +15,7 @@ use tracing::{Span, instrument};
 use crate::hypervisor::regs::{CommonFpu, CommonRegisters, CommonSpecialRegisters};
 use crate::hypervisor::virtual_machine::{
     CreateVmError, HypervisorError, MapMemoryError, RegisterError, ResetVcpuError, RunVcpuError,
-    UnmapMemoryError, VirtualMachine, VmExit,
+    UnmapMemoryError, VirtualMachine, VmExit, io_out_value,
 };
 
 static KVM: LazyLock<std::result::Result<Kvm, CreateVmError>> =
@@ -240,7 +240,7 @@ impl VirtualMachine for KvmVm {
                             .map_err(|e| RunVcpuError::FlushMmioPending(format!("{:?}", e)))?;
                         Ok(VmExit::Halt())
                     } else {
-                        Ok(VmExit::IoOut(port as u16, data.to_vec()))
+                        Ok(VmExit::IoOut(port as u16, io_out_value(data)))
                     }
                 } else {
                     Ok(VmExit::MmioWrite(addr))

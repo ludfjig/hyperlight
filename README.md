@@ -28,7 +28,7 @@ let mut sandbox = SandboxBuilder::from_file(guest_path)
     .build()?;
 
 // Call a function inside the VM
-let greeting: String = sandbox.call("SayHello", "World".to_string())?;
+let greeting: String = sandbox.call("SayHello", "World")?;
 println!("{greeting}"); // "Hello, World! Today is Monday."
 ```
 
@@ -119,7 +119,6 @@ Or skip setup entirely with a codespace:
 | [src/hyperlight_component_macro](./src/hyperlight_component_macro) | Proc macros for WIT-based host/guest bindings                                        |
 | [src/hyperlight_component_util](./src/hyperlight_component_util)   | Shared implementation for WIT binding generation                                     |
 | [src/hyperlight_testing](./src/hyperlight_testing)                 | Shared test utilities                                                                |
-| [src/schema](./src/schema)                                         | FlatBuffer schema definitions                                                        |
 | [src/trace_dump](./src/trace_dump)                                 | Tool for dumping and visualizing trace data                                          |
 | [src/tests](./src/tests)                                           | Test guest programs (Rust and C)                                                     |
 

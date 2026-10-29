@@ -2,13 +2,12 @@
 // Copyright 2025 The Hyperlight Authors.
 
 use alloc::ffi::CString;
-use alloc::vec::Vec;
 use core::ffi::{CStr, c_char};
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ParameterValue};
 use hyperlight_guest::error::Result;
 
-use crate::types::{FfiByteChunks, FfiByteChunksOwner, FfiVec};
+use crate::types::{FfiByteChunks, FfiByteChunksOwner};
 
 /// A union of the value stored in a ParameterValue, used for FFI.
 /// On it's own, this union has no way to know which value type is stored
@@ -25,7 +24,6 @@ pub union FfiParameterValue {
     pub Double: f64,
     pub Bool: bool,
     pub String: *mut c_char,
-    pub VecBytes: FfiVec,
     pub ByteChunks: FfiByteChunks,
 }
 
@@ -41,7 +39,6 @@ pub struct FfiParameter {
 enum FfiParameterOwner {
     None,
     String { _value: CString },
-    VecBytes { _value: Vec<u8> },
     ByteChunks { _value: FfiByteChunksOwner },
 }
 
@@ -97,14 +94,6 @@ impl OwnedFfiParameter {
                     FfiParameterOwner::String { _value: value },
                 )
             }
-            ParameterValue::VecBytes(mut v) => {
-                let view = FfiVec::from_mut_slice(&mut v);
-                (
-                    ParameterType::VecBytes,
-                    FfiParameterValue { VecBytes: view },
-                    FfiParameterOwner::VecBytes { _value: v },
-                )
-            }
             ParameterValue::ByteChunks(v) => {
                 let owner = FfiByteChunksOwner::new(v);
                 (
@@ -146,9 +135,6 @@ impl FfiParameter {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            ParameterType::VecBytes => {
-                ParameterValue::VecBytes(unsafe { self.value.VecBytes.copy_to_vec() })
-            }
             ParameterType::ByteChunks => {
                 // SAFETY: required by the caller.
                 ParameterValue::ByteChunks(unsafe { self.value.ByteChunks.copy_to_bytes() })
@@ -160,6 +146,7 @@ impl FfiParameter {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use hyperlight_common::flatbuffer_wrappers::function_types::Bytes;
 

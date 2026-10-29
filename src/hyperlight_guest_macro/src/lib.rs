@@ -193,8 +193,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
 /// use hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue;
 /// #[dispatch]
-/// fn dispatch(fc: FunctionCall) -> Result<ReturnValue> {
-///     let name = &fc.function_name;
+/// fn dispatch(fc: FunctionCall<'_>) -> Result<ReturnValue> {
+///     let name = fc.function_name;
 ///     if name == "greet" {
 ///         return Ok(ReturnValue::String("Hello, world!".into()));
 ///     }
@@ -230,7 +230,7 @@ pub fn dispatch(_attr: TokenStream, item: TokenStream) -> TokenStream {
             mod wrapper {
                 use #crate_name::__private::{FunctionCall, HyperlightGuestError, ReturnValue};
                 #[unsafe(no_mangle)]
-                pub fn guest_dispatch_function(function_call: FunctionCall) -> ::core::result::Result<ReturnValue, HyperlightGuestError> {
+                pub fn guest_dispatch_function(function_call: FunctionCall<'_>) -> ::core::result::Result<ReturnValue, HyperlightGuestError> {
                     super::#ident(function_call)
                 }
             }
@@ -246,9 +246,9 @@ pub fn dispatch(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// If a name is provided as an argument, that name will be used to call the host function.
 /// Otherwise, the function's identifier will be used.
 ///
-/// The function arguments must be supported parameter types, and the return type must be
-/// a supported return type or a `Result<T, HyperlightGuestError>` with T being a supported
-/// return type.
+/// The function arguments must be arguments the host accepts: scalars, `&str`, `&[u8]` or
+/// `&[Bytes]`. The return type must be a supported return type or a
+/// `Result<T, HyperlightGuestError>` with T being a supported return type.
 ///
 /// # Panic
 /// If the return type is not a Result, the generated function will panic if the host function
@@ -258,14 +258,14 @@ pub fn dispatch(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```ignore
 /// use hyperlight_guest_bin::host_function;
 /// #[host_function]
-/// fn my_host_function(arg1: i32, arg2: String) -> i32;
+/// fn my_host_function(arg1: i32, arg2: &str) -> i32;
 /// ```
 ///
 /// or with a custom name:
 /// ```ignore
 /// use hyperlight_guest_bin::host_function;
 /// #[host_function("custom_name")]
-/// fn my_host_function(arg1: i32, arg2: String) -> i32;
+/// fn my_host_function(arg1: i32, arg2: &str) -> i32;
 /// ```
 ///
 /// or with a Result return type:

@@ -41,21 +41,28 @@ fn emit_export_extern_decl<'a, 'b, 'c>(
                         .iter()
                         .map(|p| emit_hl_marshal_param(s, kebab_to_var(p.name.name), &p.ty))
                         .collect::<Vec<_>>();
+                    let arg_ids = (0..marshal.len())
+                        .map(|i| format_ident!("arg{}", i))
+                        .collect::<Vec<_>>();
                     let unmarshal = emit_hl_unmarshal_result(s, ret.clone(), &ft.result);
                     quote! {
                         fn #n(&mut self, #(#param_decls),*) -> #result_decl {
                             let mut to_cleanup = Vec::<Box<dyn Drop>>::new();
-                            let marshalled = {
+                            #[allow(clippy::unused_unit)]
+                            let (#(#arg_ids,)*) = {
                                 let mut rts = self.rt
                                     .lock()
                                     .map_err(<::hyperlight_host::error::HyperlightError as From<_>>::from)?;
-                                #[allow(clippy::unused_unit)]
                                 (#(#marshal,)*)
                             };
-                            let #ret = ::hyperlight_host::sandbox::Callable::call::<::std::vec::Vec::<u8>>(&mut self.sb,
+                            let #ret = ::hyperlight_host::sandbox::Callable::call::<::std::vec::Vec<::hyperlight_host::func::Bytes>>(&mut self.sb,
                                 #hln,
-                                marshalled,
+                                (#(#arg_ids.as_slice(),)*),
                             )?;
+                            let #ret = match #ret.as_slice() {
+                                [chunk] => chunk.clone(),
+                                chunks => ::hyperlight_host::func::Bytes::from(chunks.concat()),
+                            };
                             #[allow(clippy::unused_unit)]
                             let mut rts = self.rt
                                 .lock()
@@ -228,11 +235,12 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                 .map(|p| {
                     let id = kebab_to_var(p.name.name);
                     (
-                        quote! { #id: ::std::vec::Vec<u8> },
-                        emit_hl_unmarshal_param(s, id, &p.ty),
+                        quote! { #id: ::std::vec::Vec<::hyperlight_host::func::Bytes> },
+                        (id.clone(), emit_hl_unmarshal_param(s, id, &p.ty)),
                     )
                 })
                 .unzip::<_, _, Vec<_>, Vec<_>>();
+            let (ids, pus) = pus.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
             let tp = s.cur_trait_path();
             let callname = match kebab_to_fn(ed.kebab_name) {
                 FnName::Plain(n) => quote! { #tp::#n },
@@ -259,6 +267,10 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                 let #outer_id = #orig_id.clone();
                 let captured_rts = rts.clone();
                 sb.register_host_function(#hln, move |#(#pds),*| {
+                    #(let #ids = match #ids.as_slice() {
+                        [chunk] => chunk.clone(),
+                        chunks => ::hyperlight_host::func::Bytes::from(chunks.concat()),
+                    };)*
                     let mut rts = captured_rts.lock()
                         .map_err(<::hyperlight_host::error::HyperlightError as From<_>>::from)?;
                     #inner_preamble
@@ -268,7 +280,7 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
                         ),
                         #(#pus),*
                     );
-                    Ok(#marshal_result)
+                    Ok(::std::vec![::hyperlight_host::func::Bytes::from(#marshal_result)])
                 })?;
             }
         }

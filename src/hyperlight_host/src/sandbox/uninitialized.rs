@@ -336,7 +336,9 @@ mod tests {
     use std::{fs, thread};
 
     use crossbeam_queue::ArrayQueue;
-    use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
+    use hyperlight_common::flatbuffer_wrappers::function_types::{
+        Bytes, ParameterValue, ReturnValue, smallvec,
+    };
     use hyperlight_testing::simple_guest_as_pathbuf;
 
     use crate::sandbox::SandboxConfiguration;
@@ -371,10 +373,10 @@ mod tests {
         let mut sandbox = uninitialized_sandbox.evolve().unwrap();
 
         let res = sandbox
-            .call::<Vec<u8>>("ReadFromUserMemory", (4u64, buffer.to_vec()))
+            .call::<Vec<Bytes>>("ReadFromUserMemory", (4u64, &buffer))
             .expect("Failed to call ReadFromUserMemory");
 
-        assert_eq!(res, buffer.to_vec());
+        assert_eq!(res.concat(), buffer);
     }
 
     #[test]
@@ -455,7 +457,7 @@ mod tests {
 
             let res = host_funcs
                 .unwrap()
-                .call_host_function("test0", vec![ParameterValue::Int(1)])
+                .call_host_function("test0", smallvec![ParameterValue::Int(1)])
                 .unwrap();
 
             assert_eq!(res, ReturnValue::Int(2));
@@ -482,7 +484,7 @@ mod tests {
                 .unwrap()
                 .call_host_function(
                     "test1",
-                    vec![ParameterValue::Int(1), ParameterValue::Int(2)],
+                    smallvec![ParameterValue::Int(1), ParameterValue::Int(2)],
                 )
                 .unwrap();
 
@@ -511,7 +513,7 @@ mod tests {
 
             assert!(host_funcs.is_ok());
 
-            let res = host_funcs.unwrap().call_host_function("test2", vec![]);
+            let res = host_funcs.unwrap().call_host_function("test2", smallvec![]);
             assert!(res.is_err());
         }
 
@@ -529,7 +531,7 @@ mod tests {
 
             assert!(host_funcs.is_ok());
 
-            let res = host_funcs.unwrap().call_host_function("test4", vec![]);
+            let res = host_funcs.unwrap().call_host_function("test4", smallvec![]);
             assert!(res.is_err());
         }
     }
@@ -1184,7 +1186,7 @@ mod tests {
             let result = host_funcs
                 .call_host_function(
                     "CustomAdd",
-                    vec![ParameterValue::Int(10), ParameterValue::Int(20)],
+                    smallvec![ParameterValue::Int(10), ParameterValue::Int(20)],
                 )
                 .expect("Failed to call CustomAdd");
 

@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
 use hyperlight_common::flatbuffer_wrappers::function_types::{
-    Bytes, ParameterType, ParameterValue, ReturnType, ReturnValue,
+    Bytes, ParameterValue, ParameterValueRef, ReturnValue,
 };
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
@@ -35,10 +35,8 @@ use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest::exit::{abort_with_code, abort_with_code_and_message};
 #[cfg(target_arch = "x86_64")]
 use hyperlight_guest_bin::exception::arch::{Context, ExceptionInfo};
-use hyperlight_guest_bin::guest_function::definition::{GuestFunc, GuestFunctionDefinition};
-use hyperlight_guest_bin::guest_function::register::register_function;
 use hyperlight_guest_bin::host_comm::{
-    call_host_function, print_output_with_host_print, read_n_bytes_from_user_memory,
+    call_host, call_host_dynamic, read_n_bytes_from_user_memory,
 };
 use hyperlight_guest_bin::memory::malloc;
 use hyperlight_guest_bin::{guest_function, guest_logger, host_function};
@@ -237,12 +235,12 @@ fn echo_float(value: f32) -> f32 {
 }
 
 #[host_function("HostPrint")]
-fn host_print(msg: String) -> i32;
+fn host_print(msg: &str) -> i32;
 
 #[instrument(skip_all, parent = Span::current(), level= "Trace")]
 #[guest_function("PrintOutput")]
 fn print_output(msg: String) -> i32 {
-    host_print(msg)
+    host_print(&msg)
 }
 
 #[guest_function("PrintUsingPrintf")]
@@ -251,47 +249,50 @@ fn print_using_printf(msg: String) -> i32 {
 }
 
 #[guest_function("SetByteArrayToZero")]
-fn set_byte_array_to_zero(mut vec: Vec<u8>) -> Vec<u8> {
-    vec.fill(0);
-    vec
+fn set_byte_array_to_zero(data: Vec<Bytes>) -> Vec<Bytes> {
+    vec![Bytes::from(vec![0; total_len(&data)])]
+}
+
+fn total_len(chunks: &[Bytes]) -> usize {
+    chunks.iter().map(Bytes::len).sum()
 }
 
 #[guest_function("PrintTwoArgs")]
 fn print_two_args(arg1: String, arg2: i32) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[guest_function("PrintThreeArgs")]
 fn print_three_args(arg1: String, arg2: i32, arg3: i64) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[guest_function("PrintFourArgs")]
 fn print_four_args(arg1: String, arg2: i32, arg3: i64, arg4: String) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[guest_function("PrintFiveArgs")]
 fn print_five_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[rustfmt::skip]
 #[guest_function("PrintSixArgs")]
 fn print_six_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String, arg6: bool) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5} arg6:{arg6}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[rustfmt::skip]
 #[guest_function("PrintSevenArgs")]
 fn print_seven_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String, arg6: bool, arg7: bool) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5} arg6:{arg6} arg7:{arg7}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[rustfmt::skip]
@@ -299,7 +300,7 @@ fn print_seven_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: Stri
 #[guest_function("PrintEightArgs")]
 fn print_eight_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String, arg6: bool, arg7: bool, arg8: u32) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5} arg6:{arg6} arg7:{arg7} arg8:{arg8}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[rustfmt::skip]
@@ -307,7 +308,7 @@ fn print_eight_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: Stri
 #[guest_function("PrintNineArgs")]
 fn print_nine_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String, arg6: bool, arg7: bool, arg8: u32, arg9: u64) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5} arg6:{arg6} arg7:{arg7} arg8:{arg8} arg9:{arg9}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[rustfmt::skip]
@@ -315,7 +316,7 @@ fn print_nine_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: Strin
 #[guest_function("PrintTenArgs")]
 fn print_ten_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String, arg6: bool, arg7: bool, arg8: u32, arg9: u64, arg10: i32) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5} arg6:{arg6} arg7:{arg7} arg8:{arg8} arg9:{arg9} arg10:{arg10}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[rustfmt::skip]
@@ -323,7 +324,7 @@ fn print_ten_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String
 #[guest_function("PrintElevenArgs")]
 fn print_eleven_args(arg1: String, arg2: i32, arg3: i64, arg4: String, arg5: String, arg6: bool, arg7: bool, arg8: u32, arg9: u64, arg10: i32, arg11: f32) -> i32 {
     let message = format!("Message: arg1:{arg1} arg2:{arg2} arg3:{arg3} arg4:{arg4} arg5:{arg5} arg6:{arg6} arg7:{arg7} arg8:{arg8} arg9:{arg9} arg10:{arg10} arg11:{arg11:.3}.");
-    host_print(message)
+    host_print(&message)
 }
 
 #[guest_function("BufferOverrun")]
@@ -429,12 +430,7 @@ fn echo(value: String) -> String {
 }
 
 #[guest_function("GetSizePrefixedBuffer")]
-fn get_size_prefixed_buffer(data: Vec<u8>) -> Vec<u8> {
-    data
-}
-
-#[guest_function("EchoGuestVecBytes")]
-fn echo_guest_vec_bytes(data: Vec<u8>) -> Vec<u8> {
+fn get_size_prefixed_buffer(data: Vec<Bytes>) -> Vec<Bytes> {
     data
 }
 
@@ -462,7 +458,7 @@ static mut RETAINED_HOST_CHUNKS: Option<Vec<Bytes>> = None;
 
 #[guest_function("RetainGuestByteChunks")]
 fn retain_guest_byte_chunks(data: Vec<Bytes>) -> i32 {
-    let len = data.iter().map(Bytes::len).sum::<usize>();
+    let len = total_len(&data);
     // SAFETY: the guest is single threaded, so the static has no concurrent access.
     unsafe { RETAINED_GUEST_CHUNKS = Some(data) };
     len as i32
@@ -483,16 +479,16 @@ fn release_guest_byte_chunks() -> i32 {
     // SAFETY: the guest is single threaded, so the static has no concurrent access.
     #[allow(static_mut_refs)]
     unsafe {
-        RETAINED_GUEST_CHUNKS.take().map_or(0, |chunks| {
-            chunks.iter().map(Bytes::len).sum::<usize>() as i32
-        })
+        RETAINED_GUEST_CHUNKS
+            .take()
+            .map_or(0, |chunks| total_len(&chunks) as i32)
     }
 }
 
 #[guest_function("RetainHostByteChunks")]
 fn retain_host_byte_chunks(data: Vec<Bytes>) -> Result<i32> {
-    let chunks = host_echo_byte_chunks(data)?;
-    let len = chunks.iter().map(Bytes::len).sum::<usize>();
+    let chunks = host_echo_byte_chunks(&data)?;
+    let len = total_len(&chunks);
     // SAFETY: the guest is single threaded, so the static has no concurrent access.
     unsafe { RETAINED_HOST_CHUNKS = Some(chunks) };
     Ok(len as i32)
@@ -513,9 +509,9 @@ fn release_host_byte_chunks() -> i32 {
     // SAFETY: the guest is single threaded, so the static has no concurrent access.
     #[allow(static_mut_refs)]
     unsafe {
-        RETAINED_HOST_CHUNKS.take().map_or(0, |chunks| {
-            chunks.iter().map(Bytes::len).sum::<usize>() as i32
-        })
+        RETAINED_HOST_CHUNKS
+            .take()
+            .map_or(0, |chunks| total_len(&chunks) as i32)
     }
 }
 
@@ -569,16 +565,16 @@ fn host_echo_f64(v: f64) -> Result<f64>;
 fn host_echo_bool(v: bool) -> Result<bool>;
 
 #[host_function("HostEchoString")]
-fn host_echo_string(v: String) -> Result<String>;
-
-#[host_function("HostEchoVecBytes")]
-fn host_echo_vec_bytes(v: Vec<u8>) -> Result<Vec<u8>>;
+fn host_echo_string(v: &str) -> Result<String>;
 
 #[host_function("HostEchoByteChunks")]
-fn host_echo_byte_chunks(v: Vec<Bytes>) -> Result<Vec<Bytes>>;
+fn host_echo_byte_chunks(v: &[Bytes]) -> Result<Vec<Bytes>>;
 
-#[host_function("HostOversizedVecBytes")]
-fn host_oversized_vec_bytes() -> Result<Vec<u8>>;
+#[host_function("HostEchoBytes")]
+fn host_echo_bytes(v: &[Bytes]) -> Result<Vec<Bytes>>;
+
+#[host_function("HostOversizedBytes")]
+fn host_oversized_bytes() -> Result<Vec<Bytes>>;
 
 #[host_function("HostNoOp")]
 fn host_noop() -> Result<()>;
@@ -586,28 +582,6 @@ fn host_noop() -> Result<()>;
 #[guest_function("RoundTripHostI32")]
 fn round_trip_host_i32(v: i32) -> Result<i32> {
     host_echo_i32(v)
-}
-
-#[guest_function("ConvertHostReturnWithHostCall")]
-fn convert_host_return_with_host_call(value: i32) -> Result<i32> {
-    struct Converted(i32);
-
-    impl TryFrom<ReturnValue> for Converted {
-        type Error = HyperlightGuestError;
-
-        fn try_from(value: ReturnValue) -> Result<Self> {
-            let value = i32::try_from(value)?;
-            host_noop()?;
-            Ok(Self(value))
-        }
-    }
-
-    let value: Converted = call_host_function(
-        "HostEchoI32",
-        Some(vec![ParameterValue::Int(value)]),
-        ReturnType::Int,
-    )?;
-    Ok(value.0)
 }
 
 #[guest_function("RoundTripHostU32")]
@@ -642,24 +616,32 @@ fn round_trip_host_bool(v: bool) -> Result<bool> {
 
 #[guest_function("RoundTripHostString")]
 fn round_trip_host_string(v: String) -> Result<String> {
-    host_echo_string(v)
+    host_echo_string(&v)
 }
 
-#[guest_function("RoundTripHostVecBytes")]
-fn round_trip_host_vec_bytes(v: Vec<u8>) -> Result<Vec<u8>> {
-    host_echo_vec_bytes(v)
+/// Echoes through the host with no other host call.
+#[guest_function("RoundTripHostBytes")]
+fn round_trip_host_bytes(v: Vec<Bytes>) -> Result<Vec<Bytes>> {
+    host_echo_bytes(&v)
+}
+
+/// Copies the host's reply, which frees its G2H slots before the result is sent.
+#[guest_function("RoundTripHostBytesCopied")]
+fn round_trip_host_bytes_copied(v: Vec<Bytes>) -> Result<Vec<Bytes>> {
+    let reply = host_echo_bytes(&v)?;
+    Ok(vec![Bytes::from(reply.concat())])
 }
 
 #[guest_function("RoundTripHostByteChunks")]
 fn round_trip_host_byte_chunks(v: Vec<Bytes>) -> Result<Vec<Bytes>> {
-    let chunks = host_echo_byte_chunks(v)?;
+    let chunks = host_echo_byte_chunks(&v)?;
     host_noop()?;
     Ok(chunks)
 }
 
-#[guest_function("GetOversizedHostVecBytes")]
-fn get_oversized_host_vec_bytes() -> Result<Vec<u8>> {
-    host_oversized_vec_bytes()
+#[guest_function("GetOversizedHostBytes")]
+fn get_oversized_host_bytes() -> Result<Vec<Bytes>> {
+    host_oversized_bytes()
 }
 
 #[guest_function("RoundTripHostNoOp")]
@@ -683,11 +665,11 @@ fn alloc_and_write_pattern(len: u64) {
 }
 
 #[guest_function("ReadPattern")]
-fn read_pattern() -> Vec<u8> {
+fn read_pattern() -> Vec<Bytes> {
     // SAFETY: the guest is single threaded, so the static has no concurrent access.
     #[allow(static_mut_refs)]
     unsafe {
-        HEAP_PATTERN.clone().unwrap_or_default()
+        vec![Bytes::from(HEAP_PATTERN.clone().unwrap_or_default())]
     }
 }
 
@@ -1026,14 +1008,24 @@ fn add_to_static_and_fail() -> Result<i32> {
 }
 
 #[guest_function("24K_in_8K_out")]
-fn twenty_four_k_in_eight_k_out(input: Vec<u8>) -> Vec<u8> {
-    assert!(input.len() == 24 * 1024, "Input must be 24K bytes");
-    input[..8 * 1024].to_vec()
+fn twenty_four_k_in_eight_k_out(input: Vec<Bytes>) -> Vec<Bytes> {
+    assert!(total_len(&input) == 24 * 1024, "Input must be 24K bytes");
+    let mut remaining = 8 * 1024;
+    input
+        .into_iter()
+        .map_while(|mut chunk| {
+            (remaining > 0).then(|| {
+                chunk.truncate(remaining);
+                remaining -= chunk.len();
+                chunk
+            })
+        })
+        .collect()
 }
 
 #[guest_function("CallGivenParamlessHostFuncThatReturnsI64")]
 fn call_given_paramless_hostfunc_that_returns_i64(hostfuncname: String) -> Result<i64> {
-    call_host_function::<i64>(&hostfuncname, None, ReturnType::Long)
+    call_host::<i64>(&hostfuncname, ())
 }
 
 #[guest_function("UseSSE2Registers")]
@@ -1129,16 +1121,16 @@ fn add(a: i32, b: i32) -> Result<i32> {
 
 // Does nothing, but used for testing large parameters
 #[guest_function("LargeParameters")]
-fn large_parameters(v: Vec<u8>, s: String) {
+fn large_parameters(v: Vec<Bytes>, s: String) {
     black_box((v, s));
 }
 
 #[guest_function("ReadFromUserMemory")]
-fn read_from_user_memory(num: u64, expected: Vec<u8>) -> Result<Vec<u8>> {
+fn read_from_user_memory(num: u64, expected: Vec<Bytes>) -> Result<Vec<Bytes>> {
     let bytes = read_n_bytes_from_user_memory(num).expect("Failed to read from user memory");
 
     // verify that the user memory contains the expected data
-    if bytes != expected {
+    if bytes != expected.concat() {
         error!("User memory does not contain the expected data");
         return Err(HyperlightGuestError::new(
             ErrorCode::GuestError,
@@ -1146,11 +1138,11 @@ fn read_from_user_memory(num: u64, expected: Vec<u8>) -> Result<Vec<u8>> {
         ));
     }
 
-    Ok(bytes)
+    Ok(vec![Bytes::from(bytes)])
 }
 
 #[guest_function("ReadMappedBuffer")]
-fn read_mapped_buffer(base: u64, len: u64, do_map: bool) -> Vec<u8> {
+fn read_mapped_buffer(base: u64, len: u64, do_map: bool) -> Vec<Bytes> {
     let base = base as usize as *const u8;
     let len = len as usize;
 
@@ -1174,7 +1166,7 @@ fn read_mapped_buffer(base: u64, len: u64, do_map: bool) -> Vec<u8> {
 
     let data = unsafe { core::slice::from_raw_parts(base, len) };
 
-    data.to_vec()
+    vec![Bytes::copy_from_slice(data)]
 }
 
 #[guest_function("CheckMapped")]
@@ -1301,7 +1293,7 @@ fn exec_mapped_buffer(base: u64, len: u64) -> bool {
 
 #[guest_function("CallHostExpectError")]
 fn call_host_expect_error(hostfuncname: String) -> Result<()> {
-    let res = call_host_function::<i32>(&hostfuncname, None, ReturnType::Int);
+    let res = call_host::<i32>(&hostfuncname, ());
 
     let Err(e) = res else {
         return Err(HyperlightGuestError::new(
@@ -1365,7 +1357,7 @@ fn msr_probe_gp_handler(
 
 #[guest_function("ProbeReadableMSRs")]
 #[cfg(target_arch = "x86_64")]
-fn probe_readable_msrs(start: u32, count: u32) -> Vec<u8> {
+fn probe_readable_msrs(start: u32, count: u32) -> Vec<Bytes> {
     const MAX_MSRS_PER_PROBE: u32 = 4096;
     const GP_VECTOR: usize = 13;
 
@@ -1407,7 +1399,7 @@ fn probe_readable_msrs(start: u32, count: u32) -> Vec<u8> {
 
     MSR_PROBE_ACTIVE.store(false, Ordering::Release);
     handler.store(0, Ordering::Release);
-    readable
+    vec![Bytes::from(readable)]
 }
 
 #[guest_function("IncrementActiveSsp")]
@@ -1649,54 +1641,47 @@ fn execute_vmlaunch() {
     }
 }
 
-#[hyperlight_guest_bin::main]
-#[instrument(skip_all, parent = Span::current(), level= "Trace")]
-fn main() {
-    let print_output_def = GuestFunctionDefinition::<GuestFunc>::new(
-        "PrintOutputWithHostPrint".to_string(),
-        Vec::from(&[ParameterType::String]),
-        ReturnType::Int,
-        print_output_with_host_print,
-    );
-    register_function(print_output_def);
+#[guest_function("PrintOutputWithHostPrint")]
+fn print_output_with_host_print(message: String) -> Result<i32> {
+    call_host("HostPrint", message.as_str())
 }
 
 #[host_function("HostMethod")]
-fn host_method(message: String) -> Result<i32>;
+fn host_method(message: &str) -> Result<i32>;
 
 #[guest_function("GuestMethod")]
 fn guest_function(message: String) -> Result<i32> {
     let message = format!("Hello from GuestFunction, {}", message);
-    host_method(message)
+    host_method(&message)
 }
 
 #[host_function("HostMethod1")]
-fn host_method_1(message: String) -> Result<i32>;
+fn host_method_1(message: &str) -> Result<i32>;
 
 #[guest_function("GuestMethod1")]
 fn guest_function1(message: String) -> Result<i32> {
     let message = format!("Hello from GuestFunction1, {}", message);
-    host_method_1(message)
+    host_method_1(&message)
 }
 
 #[guest_function("GuestMethod2")]
 fn guest_function2(message: String) -> Result<i32> {
     let message = format!("Hello from GuestFunction2, {}", message);
-    host_method_1(message)
+    host_method_1(&message)
 }
 
 #[guest_function("GuestMethod3")]
 fn guest_function3(message: String) -> Result<i32> {
     let message = format!("Hello from GuestFunction3, {}", message);
-    host_method_1(message)
+    host_method_1(&message)
 }
 
 #[host_function("HostMethod4")]
-fn host_method_4(message: String) -> Result<()>;
+fn host_method_4(message: &str) -> Result<()>;
 
 #[guest_function("GuestMethod4")]
 fn guest_function4() -> Result<()> {
-    host_method_4("Hello from GuestFunction4".to_string())
+    host_method_4("Hello from GuestFunction4")
 }
 
 #[guest_function("LogMessageWithSource")]
@@ -1721,10 +1706,10 @@ fn guest_log_message(message: String, source: String, level: i32) -> i32 {
 #[guest_function("CallErrorMethod")]
 fn call_error_method(message: String) -> Result<i32> {
     #[host_function("ErrorMethod")]
-    fn error_method(message: String) -> Result<i32>;
+    fn error_method(message: &str) -> Result<i32>;
 
     let message = format!("Error From Host: {}", message);
-    error_method(message)
+    error_method(&message)
 }
 
 #[guest_function("CallHostSpin")]
@@ -1736,16 +1721,16 @@ fn call_host_spin() -> Result<()> {
 }
 
 #[guest_function("HostCallLoop")]
-fn host_call_loop(host_func_name: String) -> Result<Vec<u8>> {
+fn host_call_loop(host_func_name: String) -> Result<Vec<Bytes>> {
     loop {
-        call_host_function::<()>(&host_func_name, None, ReturnType::Void).unwrap();
+        call_host::<()>(&host_func_name, ()).unwrap();
     }
 }
 
 // Calls the given host function (no param, no return value) and then spins indefinitely.
 #[guest_function("CallHostThenSpin")]
 fn call_host_then_spin(host_func_name: String) -> Result<()> {
-    call_host_function::<()>(&host_func_name, None, ReturnType::Void)?;
+    call_host::<()>(&host_func_name, ())?;
     #[expect(
         clippy::empty_loop,
         reason = "This function is used to keep the CPU busy"
@@ -1770,8 +1755,8 @@ fn fuzz_guest_trace(max_depth: u32, msg: String) -> u32 {
 }
 
 // Interprets the given guest function call as a host function call and dispatches it to the host.
-fn fuzz_host_function(func: FunctionCall) -> Result<ReturnValue> {
-    let mut params = func.parameters.unwrap();
+fn fuzz_host_function(func: FunctionCall<'_>) -> Result<ReturnValue> {
+    let mut params = func.parameters.into_vec();
     // first parameter must be string (the name of the host function to call)
     let host_func_name = match params.remove(0) {
         // TODO use `swap_remove` instead of `remove` if performance is an issue, but left out
@@ -1785,12 +1770,13 @@ fn fuzz_host_function(func: FunctionCall) -> Result<ReturnValue> {
         }
     };
 
-    call_host_function::<ReturnValue>(&host_func_name, Some(params), func.expected_return_type)
+    let params: Vec<ParameterValueRef<'_>> = params.iter().map(ParameterValue::as_ref).collect();
+    call_host_dynamic(&host_func_name, &params, func.expected_return_type)
 }
 
 #[hyperlight_guest_bin::dispatch]
 #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-fn dispatch(function_call: FunctionCall) -> Result<ReturnValue> {
+fn dispatch(function_call: FunctionCall<'_>) -> Result<ReturnValue> {
     if function_call.function_name == "FuzzHostFunc" {
         return fuzz_host_function(function_call);
     }
@@ -1806,14 +1792,10 @@ fn dispatch(function_call: FunctionCall) -> Result<ReturnValue> {
         1,
     );
 
-    let result = call_host_function::<i32>(
-        "HostPrint",
-        Some(Vec::from(&[ParameterValue::String(message.to_string())])),
-        ReturnType::Int,
-    )?;
-    let function_name = function_call.function_name.clone();
-    let param_len = function_call.parameters.clone().unwrap_or_default().len();
-    let call_type = function_call.function_call_type().clone();
+    let result = call_host::<i32>("HostPrint", message)?;
+    let function_name = function_call.function_name;
+    let param_len = function_call.parameters.len();
+    let call_type = function_call.function_call_type;
 
     if function_name != "ThisIsNotARealFunctionButTheNameIsImportant"
         || param_len != 0
@@ -1822,7 +1804,7 @@ fn dispatch(function_call: FunctionCall) -> Result<ReturnValue> {
     {
         return Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionNotFound,
-            function_name,
+            function_name.to_string(),
         ));
     }
 

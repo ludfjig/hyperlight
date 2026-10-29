@@ -14,6 +14,7 @@ pub mod mem;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+pub use codec::Request;
 pub use context::{DispatchAction, GuestContext, QueueConfig};
 pub(crate) use mem::GuestMemOps;
 

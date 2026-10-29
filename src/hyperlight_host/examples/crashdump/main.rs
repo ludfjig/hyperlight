@@ -374,9 +374,13 @@ mod tests {
         // contains the sentinel we wrote.
         // The also maps the file in so the guest can see it and we will be able to read it as well
         // in the crashdump  since we are only dumping the GVA
-        let result: Vec<u8> = sbox
-            .call("ReadMappedBuffer", (MAP_GUEST_BASE, len as u64, true))
-            .expect("ReadMappedBuffer should succeed");
+        let result = sbox
+            .call::<Vec<hyperlight_host::func::Bytes>>(
+                "ReadMappedBuffer",
+                (MAP_GUEST_BASE, len as u64, true),
+            )
+            .expect("ReadMappedBuffer should succeed")
+            .concat();
         let sentinel_str =
             std::str::from_utf8(TEST_SENTINEL).expect("TEST_SENTINEL is valid UTF-8");
         assert!(

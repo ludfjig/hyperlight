@@ -44,7 +44,7 @@ fn main() -> hyperlight_host::Result<()> {
     multi_use_sandbox_dbg
         .call::<i32>(
             "PrintOutput", // function must be defined in the guest binary
-            message.clone(),
+            message.as_str(),
         )
         .unwrap();
 
@@ -53,7 +53,7 @@ fn main() -> hyperlight_host::Result<()> {
     multi_use_sandbox
         .call::<i32>(
             "PrintOutput", // function must be defined in the guest binary
-            message.clone(),
+            message.as_str(),
         )
         .unwrap();
 

@@ -32,7 +32,7 @@ use crate::hypervisor::surrogate_process_manager::{
 };
 use crate::hypervisor::virtual_machine::{
     CreateVmError, HypervisorError, MapMemoryError, RegisterError, ResetVcpuError, RunVcpuError,
-    UnmapMemoryError, VirtualMachine, VmExit,
+    UnmapMemoryError, VirtualMachine, VmExit, io_out_value,
 };
 use crate::hypervisor::wrappers::HandleWrapper;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
@@ -626,7 +626,7 @@ impl VirtualMachine for WhpVm {
                         };
                         Ok(VmExit::IoOut(
                             port as u16,
-                            value.to_le_bytes()[..access_size].to_vec(),
+                            io_out_value(&value.to_le_bytes()[..access_size]),
                         ))
                     }
                 } else {

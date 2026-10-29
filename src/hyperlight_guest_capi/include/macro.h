@@ -8,13 +8,13 @@
 //
 // Parameters: 1. A function name
 //             2. The return type of the function. This must be one of the variant names in hl_ReturnType
-//                  Note: This macro does not work for functions that return VecBytes or ByteChunks. Instead,
+//                  Note: This macro does not work for functions that return ByteChunks. Instead,
 //                  use `hl_register_function_definition` directly. You'll also need to return
 //                  an hl_ReturnValue* using the hl_result_from_* functions.
 //                  See c_simpleguest/main.c for an example.
 //             3. The number of parameters the function takes
 //             4+ The types of the parameters the function takes. The must be one of the variant names
-//                in hl_ParameterType, for example i32, f64, boolean, string, vecbytes
+//                in hl_ParameterType, for example Int, Double, Bool, String, ByteChunks
 #define HYPERLIGHT_WRAP_FUNCTION(function, return_type, paramsc, ... ) HYPERLIGHT_WRAP_FUNCTION_##paramsc(function, return_type, __VA_ARGS__)
 
 #define HYPERLIGHT_WRAP_FUNCTION_0(function, return_type, ...) \

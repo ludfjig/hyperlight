@@ -64,7 +64,8 @@ pub unsafe extern "C" fn hl_result_from_String(value: *const c_char) -> Box<FfiR
 #[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `data` must reference `len` readable bytes when `len` is nonzero.
+/// `data` must reference `len` readable bytes when `len` is nonzero. The bytes
+/// are copied and returned as one chunk.
 pub unsafe extern "C" fn hl_result_from_Bytes(data: *const u8, len: usize) -> Box<FfiReturnValue> {
     let value = if len == 0 {
         Vec::new()
@@ -72,7 +73,7 @@ pub unsafe extern "C" fn hl_result_from_Bytes(data: *const u8, len: usize) -> Bo
         // SAFETY: callers provide `len` readable bytes.
         unsafe { core::slice::from_raw_parts(data, len) }.to_vec()
     };
-    Box::new(FfiReturnValue::vec_bytes(value))
+    Box::new(FfiReturnValue::bytes(value))
 }
 
 #[unsafe(no_mangle)]
@@ -136,10 +137,11 @@ pub extern "C" fn hl_get_host_return_value_as_String() -> *const c_char {
 }
 
 #[unsafe(no_mangle)]
+#[deprecated(note = "use hl_get_host_return_value_as_ByteChunks, which does not join the chunks")]
 pub extern "C" fn hl_get_host_return_value_as_VecBytes() -> Box<FfiVec> {
-    let vec_value: Vec<u8> = take_last_host_return();
-
-    Box::new(unsafe { FfiVec::from_vec(vec_value) })
+    let chunks: Vec<Bytes> = take_last_host_return();
+    // SAFETY: The returned view is never modified.
+    Box::new(unsafe { FfiVec::from_vec(chunks.concat()) })
 }
 
 #[unsafe(no_mangle)]

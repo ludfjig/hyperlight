@@ -95,29 +95,24 @@ what the host loads with `GuestBinary::FilePath(...)`.
 * `#![no_main]` because the entry point is `hyperlight_main`, not `main`.
 * `extern crate alloc` to use `Vec`, `String`, and other heap types.
 
-### Advanced: manual entry point and dispatch
+### Advanced: custom entry point and dispatch
 
-The macros are optional. A guest can define the underlying symbols directly,
-which is useful for advanced setup work or custom dispatch logic (for example
-the WIT-based guests in `src/tests/rust_guests/witguest`).
+The runtime provides default definitions for two guest symbols. Use the
+`#[main]` and `#[dispatch]` macros to replace them:
 
-The runtime provides weak default definitions for two guest symbols. A guest
-can override either definition:
+* `#[main]` marks a function that runs once at guest startup, before the host
+  makes any call. Use it to initialize global state.
+* `#[dispatch]` marks a function with the signature
+  `fn(FunctionCall<'_>) -> Result<ReturnValue>`. It handles calls whose name
+  matches no registered guest function, for example a runtime that resolves
+  names itself. The default returns `GuestFunctionNotFound`.
 
-* `pub extern "C" fn hyperlight_main()` runs once at guest startup. Use it to
-  register functions or initialize global state.
-* `pub extern "Rust" fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>>`
-  handles calls that do not match a registered guest function. Its default
-  implementation returns `GuestFunctionNotFound`.
+The macros define the `hyperlight_main` and `guest_dispatch_function` symbols.
+Defining these symbols by hand has the same effect.
 
-`hyperlight-guest-bin` exposes `#[main]` and `#[dispatch]` macros that generate
-these symbols from a regular Rust function, so most "advanced" guests still use
-the macros rather than defining the symbols directly. A generated or direct
-definition overrides the runtime's weak default.
-
-If you mix the manual form with `#[guest_function]`, registrations from the
-macro still happen automatically. Your `hyperlight_main` only needs to do
-whatever extra setup the macros do not cover.
+A dispatch function can call the host with `call_host_dynamic`, which takes
+argument and return types known only at runtime. Typed code uses
+`#[host_function]` or `call_host`.
 
 ### Troubleshooting
 

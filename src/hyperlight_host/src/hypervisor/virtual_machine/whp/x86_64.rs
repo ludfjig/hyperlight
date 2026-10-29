@@ -36,7 +36,7 @@ use crate::hypervisor::surrogate_process_manager::{
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::{self, TimerThread};
 use crate::hypervisor::virtual_machine::{
     CreateVmError, HypervisorError, MapMemoryError, RegisterError, RunVcpuError, UnmapMemoryError,
-    VirtualMachine, VmExit, XSAVE_MIN_SIZE,
+    VirtualMachine, VmExit, XSAVE_MIN_SIZE, io_out_value,
 };
 use crate::hypervisor::wrappers::HandleWrapper;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
@@ -581,7 +581,7 @@ impl VirtualMachine for WhpVm {
                     // 8 RAX bytes were returned, producing garbled output
                     // for single-byte console writes.
                     let data = rax.to_le_bytes();
-                    return Ok(VmExit::IoOut(port, data[..access_size].to_vec()));
+                    return Ok(VmExit::IoOut(port, io_out_value(&data[..access_size])));
                 },
                 WHvRunVpExitReasonX64Halt => {
                     // With software timer active, re-enter the guest.

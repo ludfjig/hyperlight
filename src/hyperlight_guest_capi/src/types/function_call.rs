@@ -31,12 +31,11 @@ pub(crate) struct OwnedFfiFunctionCall {
 }
 
 impl OwnedFfiFunctionCall {
-    pub(crate) fn from_function_call(value: FunctionCall) -> Result<Self> {
-        let function_name = CString::new(value.function_name.as_str())
-            .expect("Failed to convert function name to CString");
+    pub(crate) fn from_function_call(value: FunctionCall<'_>) -> Result<Self> {
+        let function_name =
+            CString::new(value.function_name).expect("Failed to convert function name to CString");
         let parameter_owners = value
             .parameters
-            .unwrap_or_default()
             .into_iter()
             .map(OwnedFfiParameter::from_parameter_value)
             .collect::<Result<Vec<_>>>()?;

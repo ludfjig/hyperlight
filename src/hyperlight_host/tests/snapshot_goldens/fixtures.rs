@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hyperlight_host::func::Registerable;
+use hyperlight_host::func::{Bytes, Registerable};
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox::snapshot::Snapshot;
 use hyperlight_host::{GuestBinary, Sandbox, UninitializedSandbox};
@@ -82,9 +82,9 @@ fn run_canonical_calls(sbox: &mut Sandbox) {
         .expect("RTH f64");
     sbox.call::<bool>("RoundTripHostBool", true)
         .expect("RTH bool");
-    sbox.call::<String>("RoundTripHostString", "hi".to_string())
+    sbox.call::<String>("RoundTripHostString", "hi")
         .expect("RTH string");
-    sbox.call::<Vec<u8>>("RoundTripHostVecBytes", vec![1u8, 2, 3])
+    sbox.call::<Vec<Bytes>>("RoundTripHostBytes", &[1u8, 2, 3])
         .expect("RTH vec");
     sbox.call::<()>("RoundTripHostNoOp", ()).expect("RTH noop");
 }
@@ -109,7 +109,7 @@ pub(crate) fn register_host_echo_fns<R: Registerable>(r: &mut R) {
         .unwrap();
     r.register_host_function("HostEchoString", |v: String| Ok(v))
         .unwrap();
-    r.register_host_function("HostEchoVecBytes", |v: Vec<u8>| Ok(v))
+    r.register_host_function("HostEchoBytes", |v: Vec<Bytes>| Ok(v))
         .unwrap();
     r.register_host_function("HostNoOp", || Ok(())).unwrap();
 }

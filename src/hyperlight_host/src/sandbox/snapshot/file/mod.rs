@@ -13,7 +13,6 @@ mod transport;
 
 use std::path::{Path, PathBuf};
 
-use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use hyperlight_common::vmem::PAGE_SIZE;
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageIndex, ImageIndexBuilder, ImageManifest,
@@ -611,10 +610,12 @@ impl Snapshot {
             ));
         }
 
-        let host_functions = match &self.state.host_functions.host_functions {
-            Some(v) => v.iter().map(HostFunction::from).collect(),
-            None => Vec::new(),
-        };
+        let host_functions = self
+            .state
+            .host_functions
+            .iter()
+            .map(HostFunction::from)
+            .collect();
 
         let l = &self.state.layout;
         Ok(OciSnapshotConfig {
@@ -719,7 +720,7 @@ impl Snapshot {
     /// let tag = OciTag::new("latest")?;
     /// let snapshot = Arc::new(Snapshot::load("./guest_snapshot", tag)?);
     /// let mut sandbox = Sandbox::from_snapshot(snapshot, HostFunctions::default(), None)?;
-    /// let result: String = sandbox.call("Echo", "hello".to_string())?;
+    /// let result: String = sandbox.call("Echo", "hello")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -954,18 +955,7 @@ impl Snapshot {
 
         // 9. Reconstitute host_functions metadata.
         let snapshot_generation = cfg.snapshot_generation;
-        let host_funcs_vec: Vec<
-            hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition,
-        > = cfg.host_functions.into_iter().map(Into::into).collect();
-        let host_functions = if host_funcs_vec.is_empty() {
-            HostFunctionDetails {
-                host_functions: None,
-            }
-        } else {
-            HostFunctionDetails {
-                host_functions: Some(host_funcs_vec),
-            }
-        };
+        let host_functions = cfg.host_functions.into_iter().map(Into::into).collect();
 
         Ok(Snapshot {
             state: std::sync::Arc::new(super::SnapshotState {

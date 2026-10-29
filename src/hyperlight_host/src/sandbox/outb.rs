@@ -49,7 +49,7 @@ pub enum HandleOutbError {
     MemProfile(String),
 }
 
-pub(crate) fn emit_guest_log(log_data: &GuestLogData) {
+pub(crate) fn emit_guest_log(log_data: &GuestLogData<'_>) {
     // Emit guest log data as a tracing event with structured fields.
     //
     // We match on the level at runtime because tracing macros determine their
@@ -61,10 +61,10 @@ pub(crate) fn emit_guest_log(log_data: &GuestLogData) {
     // receive these events thanks to the `tracing` crate's `log` feature,
     // which forwards tracing events to the `log` facade when no subscriber
     // is set.
-    let source_file = log_data.source_file.as_str();
+    let source_file = log_data.source_file;
     let line = log_data.line;
-    let source = log_data.source.as_str();
-    let message = log_data.message.as_str();
+    let source = log_data.source;
+    let message = log_data.message;
 
     match &log_data.level {
         LogLevel::Error | LogLevel::Critical => {
@@ -255,7 +255,7 @@ fn outb_virtq_call(
                     ));
                 }
 
-                let log = virtq::read_guest_log_data(&mut request)
+                let log = virtq::read_guest_log_data(&mut request, &mut mem_mgr.wire_buf)
                     .map_err(|error| HandleOutbError::ReadHostFunctionCall(error.to_string()))?;
 
                 emit_guest_log(&log);
@@ -286,22 +286,21 @@ fn outb_virtq_call(
         )
     })?;
 
-    let call = virtq::get_host_function_call(&mut request)
+    let call = virtq::get_host_function_call(&mut request, &mut mem_mgr.wire_buf)
         .map_err(|error| HandleOutbError::ReadHostFunctionCall(error.to_string()))?;
 
-    if call.function_call_type() != FunctionCallType::Host {
+    if call.function_call_type != FunctionCallType::Host {
         return Err(HandleOutbError::ReadHostFunctionCall(
             "G2H request does not target a host function".into(),
         ));
     }
 
-    let name = call.function_name;
-    let args = call.parameters.unwrap_or_default();
+    let args = call.parameters;
 
     let result = host_funcs
         .try_lock()
         .map_err(|err| HandleOutbError::LockFailed(file!(), line!(), err.to_string()))?
-        .call_host_function(&name, args)
+        .call_host_function(call.function_name, args)
         .map_err(|err| GuestError::new(ErrorCode::HostFunctionError, err.to_string()));
 
     let result = FunctionCallResult::new(result);
@@ -309,7 +308,7 @@ fn outb_virtq_call(
 
     // Capacity is checked before writing, so an oversized result leaves the
     // chain untouched and can be replaced with a bounded transport error.
-    if !virtq::try_write_response(&mut resp, header.cid, &result)
+    if !virtq::try_write_response(&mut resp, header.cid, &result, &mut mem_mgr.wire_buf)
         .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?
     {
         let fallback = FunctionCallResult::new(Err(GuestError::new(
@@ -319,7 +318,7 @@ fn outb_virtq_call(
 
         // The guest must receive a response for this correlation id. Failure
         // to fit even this small error makes the transport unusable.
-        if !virtq::try_write_response(&mut resp, header.cid, &fallback)
+        if !virtq::try_write_response(&mut resp, header.cid, &fallback, &mut mem_mgr.wire_buf)
             .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?
         {
             return Err(HandleOutbError::WriteHostFunctionResponse(format!(
@@ -344,15 +343,15 @@ mod tests {
     use super::{GuestLogData, emit_guest_log};
     use crate::testing::log_values::test_value_as_str;
 
-    fn new_guest_log_data(level: LogLevel) -> GuestLogData {
-        GuestLogData::new(
-            "test log".to_string(),
-            "test source".to_string(),
+    fn new_guest_log_data(level: LogLevel) -> GuestLogData<'static> {
+        GuestLogData {
+            message: "test log",
+            source: "test source",
             level,
-            "test caller".to_string(),
-            "test source file".to_string(),
-            123,
-        )
+            caller: "test caller",
+            source_file: "test source file",
+            line: 123,
+        }
     }
 
     // Verifies that guest log events are forwarded to a `log` logger when no
@@ -430,7 +429,7 @@ mod tests {
                 LogLevel::None,
             ];
             for level in levels {
-                let log_data: GuestLogData = new_guest_log_data(level);
+                let log_data = new_guest_log_data(level);
                 subscriber.clear();
                 emit_guest_log(&log_data);
 

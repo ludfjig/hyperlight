@@ -155,7 +155,7 @@ impl FfiByteChunks {
         }
     }
 
-    fn from_owned_chunks(chunks: Vec<Vec<u8>>) -> Self {
+    pub(crate) fn from_owned_chunks(chunks: Vec<Vec<u8>>) -> Self {
         let chunks: Vec<_> = chunks
             .into_iter()
             .map(FfiByteChunk::from_owned_vec)

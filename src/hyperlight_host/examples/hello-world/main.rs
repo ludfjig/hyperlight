@@ -19,7 +19,7 @@ fn main() -> hyperlight_host::Result<()> {
     sandbox
         .call::<i32>(
             "PrintOutput", // function must be defined in the guest binary
-            message,
+            message.as_str(),
         )
         .unwrap();
 

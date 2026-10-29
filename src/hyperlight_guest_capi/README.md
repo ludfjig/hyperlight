@@ -16,6 +16,7 @@ for (uintptr_t i = 0; i < value.count; i++) {
 The parameter view is valid until the guest function returns. A value from
 `hl_get_host_return_value_as_ByteChunks` remains valid until
 `hl_free_byte_chunks`. `hl_result_from_ByteChunks` copies the supplied spans.
+`hl_result_from_Bytes` copies one buffer into a `ByteChunks` result.
 
 # Important
 

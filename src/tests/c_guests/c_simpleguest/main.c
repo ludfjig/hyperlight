@@ -34,13 +34,20 @@ int next_random(void) { return rand(); }
 
 long next_random_long(void) { return random(); }
 
-hl_ReturnValue *set_byte_array_to_zero(const hl_FunctionCall* params) {
-  hl_Vec input = params->parameters[0].value.VecBytes;
-  uint8_t *x = malloc(input.len);
-  for (uintptr_t i = 0; i < input.len; i++) {
-    x[i] = 0;
+static uintptr_t total_len(hl_ByteChunks value) {
+  uintptr_t len = 0;
+  for (uintptr_t i = 0; i < value.count; i++) {
+    len += value.chunks[i].len;
   }
-  return hl_result_from_Bytes(x, input.len);
+  return len;
+}
+
+hl_ReturnValue *set_byte_array_to_zero(const hl_FunctionCall* params) {
+  uintptr_t len = total_len(params->parameters[0].value.ByteChunks);
+  uint8_t *x = calloc(len ? len : 1, 1);
+  hl_ReturnValue *result = hl_result_from_Bytes(x, len);
+  free(x);
+  return result;
 }
 
 int print_output(const char *message) {
@@ -240,8 +247,7 @@ int set_static(void) {
 }
 
 hl_ReturnValue *get_size_prefixed_buffer(const hl_FunctionCall* params) {
-  hl_Vec input = params->parameters[0].value.VecBytes;
-  return hl_result_from_Bytes(input.data, input.len);
+  return hl_result_from_ByteChunks(params->parameters[0].value.ByteChunks);
 }
 
 int guest_abort_with_code(int32_t code) {
@@ -265,10 +271,27 @@ int log_message(const char *message, int64_t level) {
   return -1;
 }
 
+// Returns the first 8 KiB of the input without joining the input chunks.
 hl_ReturnValue *twenty_four_k_in_eight_k_out(const hl_FunctionCall* params) {
-  hl_Vec input = params->parameters[0].value.VecBytes;
-  assert(input.len == 24 * 1024);
-  return hl_result_from_Bytes(input.data, 8 * 1024);
+  hl_ByteChunks input = params->parameters[0].value.ByteChunks;
+  assert(total_len(input) == 24 * 1024);
+
+  hl_ByteChunk *prefix = malloc(input.count * sizeof(hl_ByteChunk));
+  uintptr_t count = 0;
+  uintptr_t remaining = 8 * 1024;
+  for (uintptr_t i = 0; i < input.count && remaining > 0; i++) {
+    prefix[count] = input.chunks[i];
+    if (prefix[count].len > remaining) {
+      prefix[count].len = remaining;
+    }
+    remaining -= prefix[count].len;
+    count++;
+  }
+
+  hl_ReturnValue *result =
+      hl_result_from_ByteChunks((hl_ByteChunks){.chunks = prefix, .count = count});
+  free(prefix);
+  return result;
 }
 
 int guest_function(const char *from_host) {
@@ -477,7 +500,6 @@ HYPERLIGHT_WRAP_FUNCTION(guest_fn_checks_if_host_returns_double_value, Double, 2
 HYPERLIGHT_WRAP_FUNCTION(guest_fn_checks_if_host_returns_string_value, String, 0)
 HYPERLIGHT_WRAP_FUNCTION(guest_fn_checks_if_host_returns_bool_value, Bool, 2, Int, Int)
 HYPERLIGHT_WRAP_FUNCTION(echo, String, 1, String)
-// HYPERLIGHT_WRAP_FUNCTION(set_byte_array_to_zero, 1, VecBytes) is not valid for functions that return VecBytes
 HYPERLIGHT_WRAP_FUNCTION(guest_function, Int, 1, String)
 HYPERLIGHT_WRAP_FUNCTION(print_output, Int, 1, String)
 HYPERLIGHT_WRAP_FUNCTION(check_libc_stubs, Int, 0)
@@ -503,12 +525,10 @@ HYPERLIGHT_WRAP_FUNCTION(echo_double, Double, 1, Double)
 HYPERLIGHT_WRAP_FUNCTION(next_random, Int, 0)
 HYPERLIGHT_WRAP_FUNCTION(next_random_long, Long, 0)
 HYPERLIGHT_WRAP_FUNCTION(set_static, Int, 0)
-// HYPERLIGHT_WRAP_FUNCTION(get_size_prefixed_buffer, Int, 1, VecBytes) is not valid for functions that return VecBytes
 HYPERLIGHT_WRAP_FUNCTION(guest_abort_with_msg, Int, 2, Int, String)
 HYPERLIGHT_WRAP_FUNCTION(guest_abort_with_code, Int, 1, Int)
 HYPERLIGHT_WRAP_FUNCTION(execute_on_stack, Int, 0)
 HYPERLIGHT_WRAP_FUNCTION(log_message, Int, 2, String, Long)
-// HYPERLIGHT_WRAP_FUNCTION(twenty_four_k_in_eight_k_out, VecBytes, 1, VecBytes) is not valid for functions that return VecBytes
 HYPERLIGHT_WRAP_FUNCTION(read_stashed_host_return, Int, 0)
 
 void hyperlight_main(void)
@@ -518,9 +538,8 @@ void hyperlight_main(void)
     HYPERLIGHT_REGISTER_FUNCTION("GuestRetrievesStringValue", guest_fn_checks_if_host_returns_string_value);
     HYPERLIGHT_REGISTER_FUNCTION("GuestRetrievesBoolValue", guest_fn_checks_if_host_returns_bool_value);
     HYPERLIGHT_REGISTER_FUNCTION("Echo", echo);
-    // HYPERLIGHT_REGISTER_FUNCTION macro does not work for functions that return VecBytes,
-    // so we use hl_register_function_definition directly
-    hl_register_function_definition("SetByteArrayToZero", set_byte_array_to_zero, 1, (hl_ParameterType[]){hl_ParameterType_VecBytes}, hl_ReturnType_VecBytes);
+    // HYPERLIGHT_REGISTER_FUNCTION does not work for functions that return ByteChunks.
+    hl_register_function_definition("SetByteArrayToZero", set_byte_array_to_zero, 1, (hl_ParameterType[]){hl_ParameterType_ByteChunks}, hl_ReturnType_ByteChunks);
     HYPERLIGHT_REGISTER_FUNCTION("GuestMethod1", guest_function);
     HYPERLIGHT_REGISTER_FUNCTION("PrintOutput", print_output);
     HYPERLIGHT_REGISTER_FUNCTION("CheckLibcStubs", check_libc_stubs);
@@ -546,23 +565,21 @@ void hyperlight_main(void)
     HYPERLIGHT_REGISTER_FUNCTION("NextRandom", next_random);
     HYPERLIGHT_REGISTER_FUNCTION("NextRandomLong", next_random_long);
     HYPERLIGHT_REGISTER_FUNCTION("SetStatic", set_static);
-    // HYPERLIGHT_REGISTER_FUNCTION macro does not work for functions that return VecBytes,
-    // so we use hl_register_function_definition directly
-    hl_register_function_definition("GetSizePrefixedBuffer", get_size_prefixed_buffer, 1, (hl_ParameterType[]){hl_ParameterType_VecBytes}, hl_ReturnType_VecBytes);
+    // HYPERLIGHT_REGISTER_FUNCTION does not work for functions that return ByteChunks.
+    hl_register_function_definition("GetSizePrefixedBuffer", get_size_prefixed_buffer, 1, (hl_ParameterType[]){hl_ParameterType_ByteChunks}, hl_ReturnType_ByteChunks);
     HYPERLIGHT_REGISTER_FUNCTION("GuestAbortWithCode", guest_abort_with_code);
     HYPERLIGHT_REGISTER_FUNCTION("GuestAbortWithMessage", guest_abort_with_msg);
     HYPERLIGHT_REGISTER_FUNCTION("ExecuteOnStack", execute_on_stack);
     HYPERLIGHT_REGISTER_FUNCTION("LogMessage", log_message);
-    // HYPERLIGHT_REGISTER_FUNCTION macro does not work for functions that return VecBytes,
-    // so we use hl_register_function_definition directly
-    hl_register_function_definition("24K_in_8K_out", twenty_four_k_in_eight_k_out, 1, (hl_ParameterType[]){hl_ParameterType_VecBytes}, hl_ReturnType_VecBytes);
+    // HYPERLIGHT_REGISTER_FUNCTION does not work for functions that return ByteChunks.
+    hl_register_function_definition("24K_in_8K_out", twenty_four_k_in_eight_k_out, 1, (hl_ParameterType[]){hl_ParameterType_ByteChunks}, hl_ReturnType_ByteChunks);
     hl_register_function_definition("RoundTripHostByteChunks", round_trip_host_byte_chunks, 1, (hl_ParameterType[]){hl_ParameterType_ByteChunks}, hl_ReturnType_ByteChunks);
     hl_register_function_definition("RetainHostByteChunks", retain_host_byte_chunks, 1, (hl_ParameterType[]){hl_ParameterType_ByteChunks}, hl_ReturnType_Int);
     hl_register_function_definition("ReadRetainedHostByteChunks", read_retained_host_byte_chunks, 0, (hl_ParameterType[]){0}, hl_ReturnType_ByteChunks);
     hl_register_function_definition("ReleaseHostByteChunks", release_host_byte_chunks, 0, (hl_ParameterType[]){0}, hl_ReturnType_Int);
     hl_register_function_definition("ReturnNull", return_null, 0, (hl_ParameterType[]){0}, hl_ReturnType_Void);
     hl_register_function_definition("ReturnNullWithError", return_null_with_error, 0, (hl_ParameterType[]){0}, hl_ReturnType_Void);
-    hl_register_function_definition("ReturnValueWithError", return_value_with_error, 0, (hl_ParameterType[]){0}, hl_ReturnType_VecBytes);
+    hl_register_function_definition("ReturnValueWithError", return_value_with_error, 0, (hl_ParameterType[]){0}, hl_ReturnType_ByteChunks);
     hl_register_function_definition("StashHostReturnAndError", stash_host_return_and_error, 0, (hl_ParameterType[]){0}, hl_ReturnType_Void);
     HYPERLIGHT_REGISTER_FUNCTION("ReadStashedHostReturn", read_stashed_host_return);
 }

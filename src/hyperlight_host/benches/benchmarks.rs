@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use flatbuffers::FlatBufferBuilder;
 use hyperlight_common::flatbuffer_wrappers::ExternalValueSource;
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-use hyperlight_common::flatbuffer_wrappers::function_types::{Bytes, ParameterValue, ReturnType};
-use hyperlight_common::flatbuffer_wrappers::util::estimate_flatbuffer_capacity;
+use hyperlight_common::flatbuffer_wrappers::function_types::{
+    Bytes, ParameterValueRef, ReturnType,
+};
 use hyperlight_common::transport::ExternalValues;
 use hyperlight_common::vmem::PAGE_SIZE;
 use hyperlight_host::func::Registerable;
@@ -118,7 +118,7 @@ fn sandbox_lifecycle_benchmark(c: &mut Criterion) {
 
 fn bench_guest_call(b: &mut criterion::Bencher, size: SandboxSize) {
     let mut sbox = create_multiuse_sandbox_with_size(size);
-    b.iter(|| sbox.call::<String>("Echo", "hello\n".to_string()).unwrap());
+    b.iter(|| sbox.call::<String>("Echo", "hello\n").unwrap());
 }
 
 fn bench_guest_call_with_restore(b: &mut criterion::Bencher, size: SandboxSize) {
@@ -126,7 +126,7 @@ fn bench_guest_call_with_restore(b: &mut criterion::Bencher, size: SandboxSize) 
     let snapshot = sbox.snapshot().unwrap();
 
     b.iter(|| {
-        sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+        sbox.call::<String>("Echo", "hello\n").unwrap();
         sbox.restore(snapshot.clone()).unwrap();
     });
 }
@@ -154,7 +154,7 @@ fn bench_guest_call_different_thread(b: &mut criterion::Bencher, size: SandboxSi
             // Ensure vcpu is "bound" on this main thread
             {
                 let mut sbox = sbox.lock().unwrap();
-                sbox.call::<String>("Echo", "warmup\n".to_string()).unwrap();
+                sbox.call::<String>("Echo", "warmup\n").unwrap();
             }
 
             let barrier = Arc::new(Barrier::new(2));
@@ -167,7 +167,7 @@ fn bench_guest_call_different_thread(b: &mut criterion::Bencher, size: SandboxSi
                 let mut sbox = sbox_clone.lock().unwrap();
                 let start = Instant::now();
                 // Measure the first call after thread switch
-                sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+                sbox.call::<String>("Echo", "hello\n").unwrap();
                 start.elapsed()
             });
 
@@ -266,7 +266,7 @@ fn bench_snapshot_create(b: &mut criterion::Bencher, size: SandboxSize) {
 
         for _ in 0..iters {
             // Make a call to modify memory
-            sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+            sbox.call::<String>("Echo", "hello\n").unwrap();
 
             // Measure only the snapshot creation time
             let start = Instant::now();
@@ -289,7 +289,7 @@ fn bench_snapshot_restore(b: &mut criterion::Bencher, size: SandboxSize) {
 
         for _ in 0..iters {
             // Make a call to modify memory
-            sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+            sbox.call::<String>("Echo", "hello\n").unwrap();
 
             // Measure only the restore time
             let start = Instant::now();
@@ -375,7 +375,7 @@ fn retained_buffers_benchmark(c: &mut Criterion) {
                 let mut elapsed = Duration::ZERO;
 
                 for _ in 0..iterations {
-                    sandbox.call::<String>("Echo", "hello".to_string()).unwrap();
+                    sandbox.call::<String>("Echo", "hello").unwrap();
 
                     let start = Instant::now();
                     sandbox.restore(snapshot.clone()).unwrap();
@@ -387,10 +387,10 @@ fn retained_buffers_benchmark(c: &mut Criterion) {
         });
 
         group.bench_function(BenchmarkId::new("restore_and_first_request", name), |b| {
-            sandbox.call::<String>("Echo", "hello".to_string()).unwrap();
+            sandbox.call::<String>("Echo", "hello").unwrap();
             b.iter(|| {
                 sandbox.restore(snapshot.clone()).unwrap();
-                sandbox.call::<String>("Echo", "hello".to_string()).unwrap()
+                sandbox.call::<String>("Echo", "hello").unwrap()
             });
         });
     };
@@ -401,7 +401,7 @@ fn retained_buffers_benchmark(c: &mut Criterion) {
     let payload = vec![Bytes::from(vec![0xa5; 2 * PAGE_SIZE])];
 
     for func in ["RetainGuestByteChunks", "RetainHostByteChunks"] {
-        let retained: i32 = sandbox.call(func, payload.clone()).unwrap();
+        let retained: i32 = sandbox.call(func, payload.as_slice()).unwrap();
         assert_eq!(retained as usize, 2 * PAGE_SIZE);
     }
 
@@ -438,14 +438,14 @@ fn guest_call_benchmark_large_param(c: &mut Criterion) {
         .unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
 
-        b.iter_with_setup(
-            || (large_vec.clone(), large_string.clone()),
-            |(vec_clone, string_clone)| {
-                sandbox
-                    .call::<()>("LargeParameters", (vec_clone, string_clone))
-                    .unwrap()
-            },
-        );
+        b.iter(|| {
+            sandbox
+                .call::<()>(
+                    "LargeParameters",
+                    (large_vec.as_slice(), large_string.as_str()),
+                )
+                .unwrap()
+        });
     });
 
     group.finish();
@@ -471,28 +471,19 @@ impl<'a> BenchExternalSource<'a> {
 }
 
 impl ExternalValueSource for BenchExternalSource<'_> {
-    fn take_bytes(&mut self, length: usize) -> Result<Vec<u8>> {
-        let Some(BenchExternalValue::Bytes(value)) = self.value.take() else {
-            bail!("expected external bytes");
-        };
-        if value.len() != length {
-            bail!(
-                "external byte length mismatch: expected {length}, got {}",
-                value.len()
-            );
-        }
-        Ok(value.to_vec())
-    }
-
+    /// Contiguous values model the host, which copies out of guest memory.
+    /// Chunked values model the guest, which shares transport buffers.
     fn take_chunks(&mut self, length: usize) -> Result<Vec<Bytes>> {
-        let Some(BenchExternalValue::Chunks(value)) = self.value.take() else {
-            bail!("expected external byte chunks");
+        let value = match self.value.take() {
+            Some(BenchExternalValue::Bytes(value)) => vec![Bytes::copy_from_slice(value)],
+            Some(BenchExternalValue::Chunks(value)) => value.to_vec(),
+            None => bail!("missing external value"),
         };
         let actual = value.iter().map(Bytes::len).sum::<usize>();
         if actual != length {
-            bail!("external chunk length mismatch: expected {length}, got {actual}");
+            bail!("external length mismatch: expected {length}, got {actual}");
         }
-        Ok(value.to_vec())
+        Ok(value)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -503,18 +494,25 @@ impl ExternalValueSource for BenchExternalSource<'_> {
     }
 }
 
-fn codec_benchmark_call(parameter: ParameterValue) -> FunctionCall {
-    FunctionCall::new(
-        "TestFunction".to_string(),
-        Some(vec![
-            parameter,
-            ParameterValue::String("argument".to_string()),
-            ParameterValue::Int(42),
-            ParameterValue::Bool(true),
-        ]),
+fn encode_codec_call<'a, 'b>(
+    bytes: ParameterValueRef<'a>,
+    buffer: &'b mut Vec<u8>,
+    external_values: &mut ExternalValues<'a>,
+) -> &'b [u8] {
+    FunctionCall::encode(
+        "TestFunction",
         FunctionCallType::Guest,
         ReturnType::Int,
+        [
+            bytes,
+            ParameterValueRef::String("argument"),
+            ParameterValueRef::Int(42),
+            ParameterValueRef::Bool(true),
+        ],
+        buffer,
+        external_values,
     )
+    .unwrap()
 }
 
 fn function_call_codec_benchmark(c: &mut Criterion) {
@@ -526,33 +524,24 @@ fn function_call_codec_benchmark(c: &mut Criterion) {
         .map(|_| Bytes::from(vec![1; CHUNK_SIZE]))
         .collect::<Vec<_>>();
 
-    let vec_call = codec_benchmark_call(ParameterValue::VecBytes(vec_bytes.clone()));
-    let chunk_call = codec_benchmark_call(ParameterValue::ByteChunks(byte_chunks.clone()));
+    let vec_param = ParameterValueRef::ByteSlice(&vec_bytes);
+    let chunk_param = ParameterValueRef::ByteChunks(&byte_chunks);
     let mut group = c.benchmark_group("function_call_codec");
 
-    for (name, function_call) in [("vec_bytes", &vec_call), ("byte_chunks", &chunk_call)] {
+    for (name, param) in [("vec_bytes", vec_param), ("byte_chunks", chunk_param)] {
         group.bench_function(BenchmarkId::new("encode_control", name), |b| {
+            let mut buffer = Vec::new();
             b.iter(|| {
-                let estimated_capacity = estimate_flatbuffer_capacity(
-                    &function_call.function_name,
-                    function_call.parameters.as_deref().unwrap_or_default(),
-                );
-                let mut builder = FlatBufferBuilder::with_capacity(estimated_capacity);
                 let mut exts = ExternalValues::new();
 
-                let control = function_call.encode(&mut builder, &mut exts).unwrap();
+                let control = encode_codec_call(param, &mut buffer, &mut exts);
                 std::hint::black_box((control, exts.total_len()));
             });
         });
     }
 
-    let mut builder = FlatBufferBuilder::new();
-    let mut external_values = ExternalValues::new();
-
-    let vec_control = vec_call
-        .encode(&mut builder, &mut external_values)
-        .unwrap()
-        .to_vec();
+    let vec_control =
+        encode_codec_call(vec_param, &mut Vec::new(), &mut ExternalValues::new()).to_vec();
 
     group.bench_function("decode_vec_bytes_copy", |b| {
         b.iter(|| {
@@ -562,13 +551,8 @@ fn function_call_codec_benchmark(c: &mut Criterion) {
         });
     });
 
-    let mut builder = FlatBufferBuilder::new();
-    let mut external_values = ExternalValues::new();
-
-    let chunk_control = chunk_call
-        .encode(&mut builder, &mut external_values)
-        .unwrap()
-        .to_vec();
+    let chunk_control =
+        encode_codec_call(chunk_param, &mut Vec::new(), &mut ExternalValues::new()).to_vec();
 
     group.bench_function("decode_byte_chunks_owner_backed", |b| {
         b.iter(|| {
@@ -597,14 +581,13 @@ fn sample_workloads_benchmark(c: &mut Criterion) {
             .evolve()
             .unwrap();
 
-        b.iter_with_setup(
-            || vec![1; 24 * 1024],
-            |input| {
-                let ret: Vec<u8> = sandbox.call("24K_in_8K_out", (input,)).unwrap();
-                assert_eq!(ret.len(), 8 * 1024, "Expected output length to be 8K");
-                std::hint::black_box(ret);
-            },
-        );
+        let input = vec![1u8; 24 * 1024];
+        b.iter(|| {
+            let ret: Vec<Bytes> = sandbox.call("24K_in_8K_out", input.as_slice()).unwrap();
+            let len = ret.iter().map(Bytes::len).sum::<usize>();
+            assert_eq!(len, 8 * 1024, "Expected output length to be 8K");
+            std::hint::black_box(ret);
+        });
     }
 
     group.bench_function("24K_in_8K_out_c", |b| {
@@ -751,7 +734,7 @@ fn snapshot_file_benchmark(c: &mut Criterion) {
                 || (),
                 |_| {
                     let mut sbox = create_multiuse_sandbox_with_size(size);
-                    sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+                    sbox.call::<String>("Echo", "hello\n").unwrap();
                     sbox
                 },
                 criterion::BatchSize::PerIteration,
@@ -774,7 +757,7 @@ fn snapshot_file_benchmark(c: &mut Criterion) {
                         None,
                     )
                     .unwrap();
-                    sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+                    sbox.call::<String>("Echo", "hello\n").unwrap();
                     sbox
                 },
                 criterion::BatchSize::PerIteration,
@@ -799,7 +782,7 @@ fn snapshot_file_benchmark(c: &mut Criterion) {
                             None,
                         )
                         .unwrap();
-                        sbox.call::<String>("Echo", "hello\n".to_string()).unwrap();
+                        sbox.call::<String>("Echo", "hello\n").unwrap();
                         sbox
                     },
                     criterion::BatchSize::PerIteration,

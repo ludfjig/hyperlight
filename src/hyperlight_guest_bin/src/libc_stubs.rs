@@ -2,12 +2,9 @@
 // Copyright 2025 The Hyperlight Authors.
 
 use alloc::string::String;
-use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
-
-use crate::host_comm::call_host_function;
+use crate::host_comm::call_host;
 use crate::libc::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, EBADF, EINVAL, EIO, ENOSYS, c_int, c_long, c_void, clockid_t,
     errno, timespec,
@@ -70,11 +67,7 @@ unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize
         unsafe { core::slice::from_raw_parts(buf as *const u8, count) }
     };
     let s = String::from_utf8_lossy(slice);
-    match call_host_function::<i32>(
-        "HostPrint",
-        Some(vec![ParameterValue::String(s.into_owned())]),
-        ReturnType::Int,
-    ) {
+    match call_host::<i32>("HostPrint", s.as_ref()) {
         Ok(_) => count as isize,
         Err(_) => {
             set_errno(EIO);

@@ -41,10 +41,10 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
             let marshal = ft
                 .params
                 .iter()
-                .map(|p| {
-                    let me = emit_hl_marshal_param(s, kebab_to_var(p.name.name), &p.ty);
-                    quote! { args.push(::hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue::VecBytes(#me)); }
-                })
+                .map(|p| emit_hl_marshal_param(s, kebab_to_var(p.name.name), &p.ty))
+                .collect::<Vec<_>>();
+            let arg_ids = (0..marshal.len())
+                .map(|i| format_ident!("arg{}", i))
                 .collect::<Vec<_>>();
             let unmarshal = emit_hl_unmarshal_result(s, ret.clone(), &ft.result);
             let fnname = kebab_to_fn(ed.kebab_name);
@@ -58,14 +58,16 @@ fn emit_import_extern_decl<'a, 'b, 'c>(
             };
             let decl = quote! {
                 fn #n(&mut self, #(#param_decls),*) -> #result_decl {
-                    let mut args = ::alloc::vec::Vec::new();
-                    #(#marshal)*
-                    let #ret = ::hyperlight_guest_bin::host_comm::call_host_function::<::alloc::vec::Vec<u8>>(
+                    #(let #arg_ids = #marshal;)*
+                    let #ret = ::hyperlight_guest_bin::host_comm::call_host::<::alloc::vec::Vec<::hyperlight_common::func::Bytes>>(
                         #hln,
-                        Some(args),
-                        ::hyperlight_common::flatbuffer_wrappers::function_types::ReturnType::VecBytes,
+                        (#(#arg_ids.as_slice(),)*),
                     );
                     let ::core::result::Result::Ok(#ret) = #ret else { panic!("bad return from guest {:?}", #ret) };
+                    let #ret = match #ret.as_slice() {
+                        [chunk] => chunk.clone(),
+                        chunks => ::hyperlight_common::func::Bytes::from(chunks.concat()),
+                    };
                     #[allow(clippy::unused_unit)]
                     #unmarshal
                 }
@@ -167,15 +169,17 @@ fn emit_export_extern_decl<'a, 'b, 'c>(
                     panic!("resources exported from wasm not yet supported")
                 }
             };
-            let pts = ft.params.iter().map(|_| quote! { ::hyperlight_common::flatbuffer_wrappers::function_types::ParameterType::VecBytes }).collect::<Vec<_>>();
-            let (pds, pus) = ft.params.iter().enumerate()
-                .map(|(i, p)| {
+            let (pds, pus) = ft
+                .params
+                .iter()
+                .map(|p| {
                     let id = kebab_to_var(p.name.name);
-                    let pd = quote! { let ::hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue::VecBytes(#id) = &fc.parameters.as_ref().unwrap()[#i] else { panic!("invariant violation: host passed non-VecBytes core hyperlight argument"); }; };
-                    let pu = emit_hl_unmarshal_param(s, id, &p.ty);
-                    (pd, pu)
+                    let pd = quote! { #id: ::alloc::vec::Vec<::hyperlight_common::func::Bytes> };
+                    let pu = emit_hl_unmarshal_param(s, id.clone(), &p.ty);
+                    (pd, (id, pu))
                 })
                 .unzip::<_, _, Vec<_>, Vec<_>>();
+            let (ids, pus) = pus.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
             let get_instance = path
                 .iter()
                 .map(|export| {
@@ -194,22 +198,20 @@ fn emit_export_extern_decl<'a, 'b, 'c>(
             let marshal_result = emit_hl_marshal_result(s, ret.clone(), &ft.result);
             let trait_path = s.cur_trait_path();
             quote! {
-                fn #n<T: Guest>(fc: ::hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall) -> ::hyperlight_guest::error::Result<::hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue> {
+                fn #n<T: Guest>(#(#pds),*) -> ::hyperlight_guest::error::Result<::alloc::vec::Vec<::hyperlight_common::func::Bytes>> {
+                    // Unmarshalling reads one slice. Values spanning several
+                    // transport buffers are joined.
+                    #(let #ids = match #ids.as_slice() {
+                        [chunk] => chunk.clone(),
+                        chunks => ::hyperlight_common::func::Bytes::from(chunks.concat()),
+                    };)*
                     <T as Guest>::with_guest_state(|state| {
-                        #(#pds)*
                         #(#get_instance)*
                         let #ret = #trait_path::#n(state, #(#pus,)*);
-                        ::core::result::Result::Ok(::hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue::VecBytes(#marshal_result))
+                        ::core::result::Result::Ok(::alloc::vec![::hyperlight_common::func::Bytes::from(#marshal_result)])
                     })
                 }
-                ::hyperlight_guest_bin::guest_function::register::register_function(
-                    ::hyperlight_guest_bin::guest_function::definition::GuestFunctionDefinition::new(
-                        ::alloc::string::ToString::to_string(#fname),
-                        ::alloc::vec![#(#pts),*],
-                        ::hyperlight_common::flatbuffer_wrappers::function_types::ReturnType::VecBytes,
-                        #n::<T>
-                    )
-                );
+                ::hyperlight_guest_bin::guest_function::register::register_fn(#fname, #n::<T>);
             }
         }
         ExternDesc::Type(_) => {
@@ -354,7 +356,7 @@ pub fn emit_toplevel<'a, 'b, 'c>(s: &'c mut State<'a, 'b>, n: &str, ct: &'c Comp
         /// Because Hyperlight guest functions can't close over any
         /// state, this function is used on each guest call to acquire
         /// any state that the guest functions might need.
-        pub trait Guest: #ns::#export_trait<::hyperlight_common::component::Positive, Host> {
+        pub trait Guest: 'static + #ns::#export_trait<::hyperlight_common::component::Positive, Host> {
             fn with_guest_state<R, F: FnOnce(&mut Self) -> R>(f: F) -> R;
         }
         /// Register all guest functions.

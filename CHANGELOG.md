@@ -6,17 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 * `Sandbox::snapshot_with_options` takes a snapshot with `SnapshotOptions`. `SnapshotOptions::scratch_size` gives a restored sandbox a different scratch size. A guest can boot with the scratch its initialisation needs and run guest function calls from a snapshot with only the scratch they need, so each restore costs less. It can also give a guest more scratch than it booted with.
+* Add guest `call_host_dynamic` for calling host functions whose signature is only known at runtime.
 
 ### Changed
+* **Breaking:** Take arguments to `Sandbox::call`, `Callable::call`, guest `call_host`, and `#[host_function]` stubs by reference (`&str`, `&[u8]`, `&[Bytes]`). Passing an owned `String`, `Vec<u8>`, `Bytes`, or `Vec<Bytes>` is now a compile error that suggests the borrowed form.
+* **Breaking:** Make `Vec<Bytes>` the only byte type for parameters and return values, replacing `Vec<u8>` (`VecBytes`). Guests now receive large byte values without copying.
+* **Breaking:** Change `Callable::call` to take `impl AsParameters`.
+* **Breaking:** Require `'static` on the WIT `Guest` trait.
 * Core dumps no longer record the guest binary path. The process name and command line are always `<unknown>`, as they already were for sandboxes created from snapshots by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/1975
 
 * **Breaking:** Generated libc bindings use `usize` for `size_t` arguments and return values, including `strlen` and `memcpy`. Rust callers that use `u64` or `c_ulong` need explicit conversions. The C ABI is unchanged.
 
 * **Breaking:** The transport arena sits one unmapped guard page below the reserved scratch-top pages, at an address independent of the scratch size, and the page tables at the scratch base. The guest's page allocator stops at the arena GPA the host publishes in the scratch-top metadata, so guests must be rebuilt. `hyperlight_common::layout::scratch_allocator_limit_gpa` is renamed `scratch_reserved_top_gpa`, the start of the reserved pages. An allocator that stops there runs into the arena. The minimum scratch size grows by that guard page. Snapshot ABI 7: existing snapshots must be regenerated.
 
+### Deprecated
+* Deprecate guest `call_host_function`, `print_output_with_host_print`, `register_function`, and `FunctionCall::function_call_type()` in favour of `call_host`, `call_host_dynamic`, `#[guest_function]`, `register_fn`, and the `function_call_type` field.
+* Deprecate C API `hl_get_host_return_value_as_VecBytes` in favour of `hl_get_host_return_value_as_ByteChunks`.
+
 ### Removed
+* **Breaking:** Remove `SupportedParameterType::into_value` and `ParameterTuple::into_value`. Arguments are now encoded by reference through `AsParameter` and `AsParameters`.
+* **Breaking:** Remove the deprecated `Sandbox::call_guest_function_by_name`. Use `call` with `snapshot` and `restore` instead.
+* **Breaking:** Remove C API `hl_ParameterType_VecBytes` and `hl_ReturnType_VecBytes`. `hl_result_from_Bytes` now returns `ByteChunks`.
+* **Breaking:** Remove `TryFrom<ParameterValue>` and `TryFrom<ReturnValue>` for primitive types. Use `SupportedParameterType::from_value` and `SupportedReturnType::from_value` instead.
+* **Breaking:** Remove `FunctionCall::new` and the `FunctionCall::encode` method. `FunctionCall::encode` is now an associated function that takes borrowed parts.
+* **Breaking:** Remove `HostFunctionDefinition`, `HostFunctionDetails`, `GuestFunctionDefinition::verify_parameters`, and `From<ErrorCode> for String`.
 
 ### Fixed
+* Fix guest functions with more than 11 parameters failing on every call. The limit is now 32, matching registration.
 
 * Guest libc accepts null buffers for zero-length writes.
 

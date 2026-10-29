@@ -13,9 +13,9 @@ pub use bytes::Buf;
 use bytes::Bytes;
 
 use crate::flatbuffer_wrappers::{ExternalValueSink, ExternalValueSource};
-use crate::virtq::{MemOps, RecvChain, Segments, VirtqError, zeroed_vec};
+use crate::virtq::{MemOps, RecvChain, Segments, VirtqError};
 
-/// Length of a FlatBuffer size prefix.
+/// Length of a control message size prefix.
 pub const SIZE_PREFIX_LEN: usize = core::mem::size_of::<u32>();
 
 /// Message types for the virtqueue wire protocol.
@@ -197,7 +197,7 @@ impl<'a> EncodedMessage<'a> {
         &self.header
     }
 
-    /// Size-prefixed FlatBuffer control data.
+    /// Size-prefixed control data.
     pub const fn control(&self) -> &[u8] {
         self.control
     }
@@ -307,7 +307,7 @@ impl Buf for EncodedMessageBuf<'_> {
     }
 }
 
-/// Borrowed external values collected while encoding a FlatBuffer.
+/// Borrowed external values collected while encoding control data.
 #[derive(Debug, Default)]
 pub struct ExternalValues<'a> {
     chunks: Vec<&'a [u8]>,
@@ -365,27 +365,17 @@ impl<'a> ExternalValueSink<'a> for ExternalValues<'a> {
 
 /// Copies values so later shared-memory writes cannot change decoded arguments.
 impl<M: MemOps> ExternalValueSource for RecvChain<M> {
-    fn take_bytes(&mut self, length: usize) -> Result<Vec<u8>> {
-        let mut value = external_buffer(length, self.remaining())?;
-        self.read_exact(&mut value)?;
-        Ok(value)
-    }
-
+    /// One copy into a single chunk.
     fn take_chunks(&mut self, length: usize) -> Result<Vec<Bytes>> {
         if length == 0 {
             return Ok(Vec::new());
         }
 
-        let mut value = external_buffer(length, self.remaining())?;
         let mut chunks = Vec::new();
-
         chunks
             .try_reserve_exact(1)
             .map_err(|_| VirtqError::Bookkeeping)?;
-
-        self.read_exact(&mut value)?;
-
-        chunks.push(Bytes::from(value));
+        chunks.push(Bytes::from(read_external(self, length)?));
         Ok(chunks)
     }
 
@@ -395,21 +385,6 @@ impl<M: MemOps> ExternalValueSource for RecvChain<M> {
 }
 
 impl ExternalValueSource for Segments {
-    fn take_bytes(&mut self, length: usize) -> Result<Vec<u8>> {
-        let segments = take_external_segments(self, length)?;
-        let mut value = Vec::new();
-
-        value
-            .try_reserve_exact(length)
-            .map_err(|_| VirtqError::Bookkeeping)?;
-
-        for seg in segments.iter() {
-            value.extend_from_slice(seg);
-        }
-
-        Ok(value)
-    }
-
     fn take_chunks(&mut self, length: usize) -> Result<Vec<Bytes>> {
         Ok(take_external_segments(self, length)?.into_chunks())
     }
@@ -419,7 +394,11 @@ impl ExternalValueSource for Segments {
     }
 }
 
-fn external_buffer(length: usize, remaining: usize) -> Result<Vec<u8>> {
+/// Copy one external value out of the chain into new host-owned storage.
+///
+/// The length is checked against the chain before allocating.
+fn read_external<M: MemOps>(chain: &mut RecvChain<M>, length: usize) -> Result<Vec<u8>> {
+    let remaining = chain.remaining();
     if length > remaining {
         return Err(VirtqError::ReceiveTooShort {
             requested: length,
@@ -427,7 +406,16 @@ fn external_buffer(length: usize, remaining: usize) -> Result<Vec<u8>> {
         }
         .into());
     }
-    Ok(zeroed_vec(length)?)
+
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| VirtqError::Bookkeeping)?;
+    chain.read_exact_uninit(&mut value.spare_capacity_mut()[..length])?;
+    // SAFETY: `read_exact_uninit` initialized the first `length` bytes, which
+    // fit the reserved capacity.
+    unsafe { value.set_len(length) };
+    Ok(value)
 }
 
 fn take_external_segments(segments: &mut Segments, length: usize) -> Result<Segments> {
@@ -447,16 +435,14 @@ fn finish_external_values(remaining: usize) -> Result<()> {
     Ok(())
 }
 
-/// Decode a FlatBuffer size prefix.
+/// Decode a control message size prefix.
 pub fn size_prefix_payload_len(prefix: &[u8]) -> Option<usize> {
-    // TODO: this is flatbuffer-specific and should be moved probably somewhere else.
     let prefix = <[u8; SIZE_PREFIX_LEN]>::try_from(prefix).ok()?;
     usize::try_from(u32::from_le_bytes(prefix)).ok()
 }
 
-/// Add the FlatBuffer size prefix to a payload length.
+/// Add the control message size prefix to a payload length.
 pub const fn size_prefixed_len(payload_len: usize) -> Option<usize> {
-    // TODO: this is flatbuffer-specific and should be moved probably somewhere else.
     SIZE_PREFIX_LEN.checked_add(payload_len)
 }
 
@@ -597,27 +583,24 @@ mod tests {
     }
 
     #[test]
-    fn segments_source_flattens_only_contiguous_values() {
+    fn segments_source_shares_segments() {
         let first = Bytes::from_static(b"ab");
         let second = Bytes::from_static(b"cd");
         let second_ptr = second.as_ptr();
         let mut source = Segments::new([first, second]);
 
-        assert!(source.take_bytes(usize::MAX).is_err());
         assert!(source.take_chunks(usize::MAX).is_err());
-        assert!(source.take_bytes(0).unwrap().is_empty());
         assert!(source.take_chunks(0).unwrap().is_empty());
         assert_eq!(source.len(), 4);
         assert!(source.finish().is_err());
 
-        let contiguous = source.take_bytes(3).unwrap();
-        let chunks = source.take_chunks(1).unwrap();
+        let split = source.take_chunks(3).unwrap();
+        let last = source.take_chunks(1).unwrap();
         source.finish().unwrap();
 
-        assert_eq!(contiguous, b"abc");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].as_ref(), b"d");
-        assert_eq!(chunks[0].as_ptr(), second_ptr.wrapping_add(1));
+        assert_eq!(split, [Bytes::from_static(b"ab"), Bytes::from_static(b"c")]);
+        assert_eq!(last, [Bytes::from_static(b"d")]);
+        assert_eq!(last[0].as_ptr(), second_ptr.wrapping_add(1));
     }
 
     #[test]
@@ -632,12 +615,12 @@ mod tests {
         );
 
         for _ in 0..count {
-            assert_eq!(source.take_bytes(1).unwrap(), b"a");
+            assert_eq!(source.take_chunks(1).unwrap(), [Bytes::from_static(b"a")]);
             assert_eq!(
                 source.take_chunks(2).unwrap(),
                 [Bytes::from_static(b"b"), Bytes::from_static(b"c")]
             );
-            assert_eq!(source.take_bytes(1).unwrap(), b"d");
+            assert_eq!(source.take_chunks(1).unwrap(), [Bytes::from_static(b"d")]);
         }
 
         source.finish().unwrap();

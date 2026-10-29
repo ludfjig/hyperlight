@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::func::Registerable;
+use crate::func::{Bytes, Registerable};
 use crate::mem::shared_mem::SharedMemory;
 use crate::sandbox::snapshot::{OciDigest, OciReference, OciTag, Snapshot};
 use crate::{GuestBinary, HostFunctions, Sandbox, SandboxBuilder, UninitializedSandbox};
@@ -203,7 +203,7 @@ fn round_trip_save_load_call() {
     let mut sbox2 =
         Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
 
-    let result: String = sbox2.call("Echo", "hello\n".to_string()).unwrap();
+    let result: String = sbox2.call("Echo", "hello\n").unwrap();
     assert_eq!(result, "hello\n");
 }
 
@@ -290,7 +290,7 @@ fn save_self_heals_same_length_wrong_content_snapshot_blob() {
     let loaded = Snapshot::checked_load(&oci, OciTag::new("latest").unwrap()).unwrap();
     let mut sbox2 =
         Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
-    let result: String = sbox2.call("Echo", "hello\n".to_string()).unwrap();
+    let result: String = sbox2.call("Echo", "hello\n").unwrap();
     assert_eq!(result, "hello\n");
 }
 
@@ -312,10 +312,10 @@ fn snapshot_and_pt_size_round_trip() {
 #[test]
 fn snapshot_generation_round_trip() {
     let mut sbox = create_test_sandbox();
-    sbox.call::<String>("Echo", "a".to_string()).unwrap();
+    sbox.call::<String>("Echo", "a").unwrap();
     let snap1 = sbox.snapshot().unwrap();
-    sbox.call::<String>("Echo", "b".to_string()).unwrap();
-    sbox.call::<String>("Echo", "c".to_string()).unwrap();
+    sbox.call::<String>("Echo", "b").unwrap();
+    sbox.call::<String>("Echo", "c").unwrap();
     let snap3 = sbox.snapshot().unwrap();
     let gen1 = snap1.snapshot_generation();
     let gen3 = snap3.snapshot_generation();
@@ -550,7 +550,10 @@ fn restore_missing_transport_preserves_target() {
     let args = (guest_base, hyperlight_common::vmem::PAGE_SIZE as u64, true);
     let expected = vec![0x5a; hyperlight_common::vmem::PAGE_SIZE];
     assert_eq!(
-        target.call::<Vec<u8>>("ReadMappedBuffer", args).unwrap(),
+        target
+            .call::<Vec<Bytes>>("ReadMappedBuffer", args)
+            .unwrap()
+            .concat(),
         expected
     );
 
@@ -568,7 +571,10 @@ fn restore_missing_transport_preserves_target() {
     assert!(Arc::ptr_eq(target.snapshot.as_ref().unwrap(), &cached));
     assert_eq!(target.mem_mgr.snapshot_count, generation);
     assert_eq!(
-        target.call::<Vec<u8>>("ReadMappedBuffer", args).unwrap(),
+        target
+            .call::<Vec<Bytes>>("ReadMappedBuffer", args)
+            .unwrap()
+            .concat(),
         expected
     );
     assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 5);
@@ -601,7 +607,10 @@ fn load_noncanonical_transport_preserves_target() {
     let args = (guest_base, hyperlight_common::vmem::PAGE_SIZE as u64, true);
     let expected = vec![0x5a; hyperlight_common::vmem::PAGE_SIZE];
     assert_eq!(
-        target.call::<Vec<u8>>("ReadMappedBuffer", args).unwrap(),
+        target
+            .call::<Vec<Bytes>>("ReadMappedBuffer", args)
+            .unwrap()
+            .concat(),
         expected
     );
     let cached = target.snapshot().unwrap();
@@ -620,7 +629,10 @@ fn load_noncanonical_transport_preserves_target() {
     assert_eq!(target.mem_mgr.snapshot_count, generation);
 
     assert_eq!(
-        target.call::<Vec<u8>>("ReadMappedBuffer", args).unwrap(),
+        target
+            .call::<Vec<Bytes>>("ReadMappedBuffer", args)
+            .unwrap()
+            .concat(),
         expected
     );
     assert_eq!(target.call::<i32>("GetStatic", ()).unwrap(), 5);
@@ -1481,9 +1493,9 @@ fn save_appends_into_existing_layout_with_new_tag() {
 #[test]
 fn save_replaces_descriptor_for_same_tag() {
     let mut sbox = create_test_sandbox();
-    sbox.call::<String>("Echo", "first".to_string()).unwrap();
+    sbox.call::<String>("Echo", "first").unwrap();
     let snap_first = sbox.snapshot().unwrap();
-    sbox.call::<String>("Echo", "second".to_string()).unwrap();
+    sbox.call::<String>("Echo", "second").unwrap();
     let snap_second = sbox.snapshot().unwrap();
     let gen_second = snap_second.snapshot_generation();
 
@@ -1657,11 +1669,11 @@ fn save_shares_blobs_across_tags_with_identical_content() {
 fn save_replace_in_middle_preserves_other_tags() {
     let mut sbox = create_test_sandbox();
     let snap_a = sbox.snapshot().unwrap();
-    sbox.call::<String>("Echo", "x".to_string()).unwrap();
+    sbox.call::<String>("Echo", "x").unwrap();
     let snap_b = sbox.snapshot().unwrap();
-    sbox.call::<String>("Echo", "y".to_string()).unwrap();
+    sbox.call::<String>("Echo", "y").unwrap();
     let snap_c = sbox.snapshot().unwrap();
-    sbox.call::<String>("Echo", "z".to_string()).unwrap();
+    sbox.call::<String>("Echo", "z").unwrap();
     let snap_b2 = sbox.snapshot().unwrap();
     let gen_b2 = snap_b2.snapshot_generation();
 
@@ -2413,7 +2425,7 @@ fn load_round_trips() {
     let loaded = Snapshot::load(&path, OciTag::new("latest").unwrap()).unwrap();
     let mut sbox2 =
         Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
-    let result: String = sbox2.call("Echo", "hi\n".to_string()).unwrap();
+    let result: String = sbox2.call("Echo", "hi\n").unwrap();
     assert_eq!(result, "hi\n");
 }
 
@@ -3082,7 +3094,7 @@ fn save_replaces_symlink_snapshot_blob_with_regular_file() {
     let loaded = Snapshot::checked_load(&path, OciTag::new("latest").unwrap()).unwrap();
     let mut sbox =
         Sandbox::from_snapshot(Arc::new(loaded), HostFunctions::default(), None).unwrap();
-    let result: String = sbox.call("Echo", "hello\n".to_string()).unwrap();
+    let result: String = sbox.call("Echo", "hello\n").unwrap();
     assert_eq!(result, "hello\n");
 }
 
@@ -3174,7 +3186,7 @@ fn persisted_non_default_layout_loads_and_runs() {
     assert_eq!(restored.call::<i32>("GetStatic", ()).unwrap(), 42);
     let large = "x".repeat(0x5000);
     assert_eq!(
-        restored.call::<String>("Echo", large.clone()).unwrap(),
+        restored.call::<String>("Echo", large.as_str()).unwrap(),
         large
     );
     assert_eq!(
@@ -3200,7 +3212,7 @@ fn round_trip_preserves_transport_layout() {
     // Span several buffers in both directions.
     let payload = "x".repeat(20 * 1024);
     assert_eq!(
-        sbox.call::<String>("Echo", payload.clone()).unwrap(),
+        sbox.call::<String>("Echo", payload.as_str()).unwrap(),
         payload
     );
 
@@ -3382,7 +3394,7 @@ fn oci_loaded_snapshot_supports_full_lifecycle() {
 #[test]
 fn save_returns_manifest_digest_that_loads() {
     let mut sbox = create_test_sandbox();
-    sbox.call::<String>("Echo", "x".to_string()).unwrap();
+    sbox.call::<String>("Echo", "x").unwrap();
     let snap = sbox.snapshot().unwrap();
     let expected_gen = snap.snapshot_generation();
 
@@ -3439,10 +3451,10 @@ fn save_returns_digest_matching_index_manifest_descriptor() {
 #[test]
 fn checked_load_by_digest_selects_correct_manifest_among_tags() {
     let mut sbox = create_test_sandbox();
-    sbox.call::<String>("Echo", "a".to_string()).unwrap();
+    sbox.call::<String>("Echo", "a").unwrap();
     let snap_a = sbox.snapshot().unwrap();
     let gen_a = snap_a.snapshot_generation();
-    sbox.call::<String>("Echo", "b".to_string()).unwrap();
+    sbox.call::<String>("Echo", "b").unwrap();
     let snap_b = sbox.snapshot().unwrap();
     let gen_b = snap_b.snapshot_generation();
 

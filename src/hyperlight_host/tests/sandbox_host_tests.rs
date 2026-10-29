@@ -5,9 +5,9 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use hyperlight_common::func::Bytes;
+use hyperlight_common::func::{AsParameters, Bytes};
 use hyperlight_host::sandbox::SandboxConfiguration;
-use hyperlight_host::{HyperlightError, Result, SandboxBuilder, new_error};
+use hyperlight_host::{HyperlightError, Result, Sandbox, SandboxBuilder, new_error};
 use hyperlight_testing::simple_guest_as_pathbuf;
 
 pub mod common; // pub to disable dead_code warning
@@ -29,15 +29,59 @@ fn pass_byte_array() {
     with_all_sandboxes(|mut sandbox| {
         const LEN: usize = 10;
         let bytes = vec![1u8; LEN];
-        let res: Vec<u8> = sandbox
-            .call("SetByteArrayToZero", bytes.clone())
-            .expect("Expected VecBytes");
-        assert_eq!(res, [0; LEN]);
+        let res: Vec<Bytes> = sandbox
+            .call("SetByteArrayToZero", bytes.as_slice())
+            .expect("Expected ByteChunks");
+        assert_eq!(res.concat(), [0; LEN]);
 
         sandbox
-            .call::<i32>("SetByteArrayToZeroNoLength", bytes.clone())
+            .call::<i32>("SetByteArrayToZeroNoLength", bytes.as_slice())
             .unwrap_err(); // missing length param
     });
+}
+
+#[test]
+fn borrowed_parameters_round_trip() {
+    let (tx, rx) = channel();
+    let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+        .host_print(move |msg: String| {
+            tx.send(msg).unwrap();
+            0
+        })
+        .build()
+        .unwrap();
+    let text = String::from("borrowed");
+    let bytes = vec![7u8; 9 * 1024];
+
+    let echo: String = sandbox.call("Echo", text.as_str()).unwrap();
+    assert_eq!(echo, text);
+
+    let echo: Vec<Bytes> = sandbox
+        .call("EchoGuestByteChunks", bytes.as_slice())
+        .unwrap();
+    assert_eq!(echo.concat(), bytes);
+
+    let len: i32 = sandbox.call("ByteChunksLen", bytes.as_slice()).unwrap();
+    assert_eq!(len as usize, bytes.len());
+    let len: i32 = sandbox.call("ByteChunksLen", &[7u8; 9 * 1024]).unwrap();
+    assert_eq!(len as usize, bytes.len());
+
+    let _: i32 = sandbox
+        .call("PrintTwoArgs", (text.as_str(), 5_i32))
+        .unwrap();
+    assert_eq!(rx.try_recv().unwrap(), "Message: arg1:borrowed arg2:5.");
+}
+
+#[test]
+fn as_parameters_forwards_to_call() {
+    fn forward<A: AsParameters>(sandbox: &mut Sandbox, args: A) -> Result<String> {
+        sandbox.call("Echo", args)
+    }
+
+    let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+        .build()
+        .unwrap();
+    assert_eq!(forward(&mut sandbox, "borrowed").unwrap(), "borrowed");
 }
 
 #[test]
@@ -53,7 +97,7 @@ fn fragmented_control_round_trip_releases_buffers() {
             .unwrap();
 
         for _ in 0..3 {
-            let output: String = sbox.call("Echo", input.clone()).unwrap();
+            let output: String = sbox.call("Echo", input.as_str()).unwrap();
             assert_eq!(output, input);
         }
 
@@ -99,11 +143,9 @@ fn float_roundtrip() {
         for f in doubles.iter() {
             let res: f64 = sandbox.call("EchoDouble", *f).unwrap();
 
-            // Use == for comparison (handles -0.0 == 0.0) with special case for NaN.
-            // Note: FlatBuffers doesn't preserve -0.0 (-0.0 round-trips to 0.0) because FlatBuffers skips
-            // storing values equal to the default (as an optimization), and -0.0 == 0.0 in IEEE 754.
-            assert!(
-                (res.is_nan() && f.is_nan()) || res == *f,
+            assert_eq!(
+                res.to_bits(),
+                f.to_bits(),
                 "Expected {:?} but got {:?}",
                 f,
                 res
@@ -112,11 +154,9 @@ fn float_roundtrip() {
         for f in floats.iter() {
             let res: f32 = sandbox.call("EchoFloat", *f).unwrap();
 
-            // Use == for comparison (handles -0.0 == 0.0) with special case for NaN.
-            // Note: FlatBuffers doesn't preserve -0.0 (-0.0 round-trips to 0.0) because FlatBuffers skips
-            // storing values equal to the default (as an optimization), and -0.0 == 0.0 in IEEE 754.
-            assert!(
-                (res.is_nan() && f.is_nan()) || res == *f,
+            assert_eq!(
+                res.to_bits(),
+                f.to_bits(),
                 "Expected {:?} but got {:?}",
                 f,
                 res
@@ -160,11 +200,11 @@ fn multiple_parameters() {
     };
 
     let args = (
-        ("1".to_string(), "arg1:1"),
+        ("1", "arg1:1"),
         (2_i32, "arg2:2"),
         (3_i64, "arg3:3"),
-        ("4".to_string(), "arg4:4"),
-        ("5".to_string(), "arg5:5"),
+        ("4", "arg4:4"),
+        ("5", "arg5:5"),
         (true, "arg6:true"),
         (false, "arg7:false"),
         (8_u32, "arg8:8"),
@@ -220,7 +260,7 @@ fn incorrect_parameter_type() {
 #[test]
 fn incorrect_parameter_num() {
     with_all_sandboxes(|mut sandbox| {
-        let res = sandbox.call::<i32>("Echo", ("1".to_string(), 2_i32));
+        let res = sandbox.call::<i32>("Echo", ("1", 2_i32));
         assert!(matches!(
             res.unwrap_err(),
             HyperlightError::GuestError(
@@ -254,28 +294,6 @@ fn custom_guest_dispatch_is_working() {
 }
 
 #[test]
-fn host_return_conversion_can_call_host() {
-    // The guest's TryFrom implementation calls HostNoOp while converting an integer.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let callback_calls = calls.clone();
-    let mut sbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
-        .host_function("HostEchoI32", |value: i32| value)
-        .host_function("HostNoOp", move || {
-            callback_calls.fetch_add(1, Ordering::Relaxed);
-        })
-        .build()
-        .unwrap();
-
-    let value: i32 = sbox.call("ConvertHostReturnWithHostCall", 42).unwrap();
-    assert_eq!(value, 42);
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
-
-    // Both calls release their transport state for the next guest entry.
-    sbox.call::<()>("RoundTripHostNoOp", ()).unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 2);
-}
-
-#[test]
 fn c_registered_null_returns_guest_error() {
     with_c_sandbox(|mut sbox| {
         // A registered callback has no implicit "function not found" fallback.
@@ -287,7 +305,7 @@ fn c_registered_null_returns_guest_error() {
         ));
 
         // A callback error leaves the sandbox usable.
-        let value: String = sbox.call("Echo", "ready".to_string()).unwrap();
+        let value: String = sbox.call("Echo", "ready").unwrap();
         assert_eq!(value, "ready");
     });
 }
@@ -304,7 +322,7 @@ fn c_registered_error_overrides_null() {
         ));
 
         // The next dispatch must not inherit the consumed error.
-        let value: String = sbox.call("Echo", "ready".to_string()).unwrap();
+        let value: String = sbox.call("Echo", "ready").unwrap();
         assert_eq!(value, "ready");
     });
 }
@@ -321,7 +339,7 @@ fn c_fallback_error_overrides_null() {
         ));
 
         // The next dispatch must not inherit the consumed error.
-        let value: String = sbox.call("Echo", "ready".to_string()).unwrap();
+        let value: String = sbox.call("Echo", "ready").unwrap();
         assert_eq!(value, "ready");
     });
 }
@@ -334,7 +352,7 @@ fn c_registered_error_drops_returned_value() {
             // Eight ignored 16 KiB results exceed this heap if their payloads leak.
             for _ in 0..8 {
                 let error = sbox
-                    .call::<Vec<u8>>("ReturnValueWithError", ())
+                    .call::<Vec<Bytes>>("ReturnValueWithError", ())
                     .unwrap_err();
                 assert!(matches!(
                     error,
@@ -344,7 +362,7 @@ fn c_registered_error_drops_returned_value() {
             }
 
             // The final error must also leave the next dispatch usable.
-            let value: String = sbox.call("Echo", "ready".to_string()).unwrap();
+            let value: String = sbox.call("Echo", "ready").unwrap();
             assert_eq!(value, "ready");
         },
     );
@@ -358,7 +376,7 @@ fn c_fallback_error_drops_returned_value() {
             // Eight ignored 16 KiB results exceed this heap if their payloads leak.
             for _ in 0..8 {
                 let error = sbox
-                    .call::<Vec<u8>>("FallbackValueWithError", ())
+                    .call::<Vec<Bytes>>("FallbackValueWithError", ())
                     .unwrap_err();
                 assert!(matches!(
                     error,
@@ -368,7 +386,7 @@ fn c_fallback_error_drops_returned_value() {
             }
 
             // The final error must also leave the next dispatch usable.
-            let value: String = sbox.call("Echo", "ready".to_string()).unwrap();
+            let value: String = sbox.call("Echo", "ready").unwrap();
             assert_eq!(value, "ready");
         },
     );
@@ -441,17 +459,15 @@ fn simple_test_helper() {
             .host_print(writer.clone())
             .build()
             .unwrap();
-        let res: i32 = sandbox.call("PrintOutput", message.to_string()).unwrap();
+        let res: i32 = sandbox.call("PrintOutput", message).unwrap();
         assert_eq!(res, 5);
 
-        let res: String = sandbox.call("Echo", message2.to_string()).unwrap();
+        let res: String = sandbox.call("Echo", message2).unwrap();
         assert_eq!(res, "world");
 
         let buffer = [1u8, 2, 3, 4, 5, 6];
-        let res: Vec<u8> = sandbox
-            .call("GetSizePrefixedBuffer", buffer.to_vec())
-            .unwrap();
-        assert_eq!(res, buffer);
+        let res: Vec<Bytes> = sandbox.call("GetSizePrefixedBuffer", &buffer).unwrap();
+        assert_eq!(res.concat(), buffer);
     });
 
     let expected_calls = 2; // Once per guest (rust + c)
@@ -502,9 +518,7 @@ fn callback_test_helper() {
 
         // call guest function that calls host function
         let msg = "Hello world";
-        init_sandbox
-            .call::<i32>("GuestMethod1", msg.to_string())
-            .unwrap();
+        init_sandbox.call::<i32>("GuestMethod1", msg).unwrap();
 
         let messages = rx.try_iter().collect::<Vec<_>>();
         assert_eq!(messages, [format!("Hello from GuestFunction1, {msg}")]);
@@ -520,22 +534,21 @@ fn callback_test() {
 fn host_external_bytes_round_trip() {
     with_rust_uninit_sandbox(|mut sandbox| {
         sandbox
-            .register("HostEchoVecBytes", |value: Vec<u8>| value)
-            .unwrap();
-
-        sandbox
             .register("HostEchoByteChunks", |value: Vec<Bytes>| value)
+            .unwrap();
+        sandbox
+            .register("HostEchoBytes", |value: Vec<Bytes>| value)
             .unwrap();
 
         sandbox.register("HostNoOp", || {}).unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
         let expected: Vec<u8> = (0..6 * 1024).map(|index| (index % 251) as u8).collect();
 
-        let contiguous: Vec<u8> = sandbox
-            .call("RoundTripHostVecBytes", expected.clone())
+        let contiguous: Vec<Bytes> = sandbox
+            .call("RoundTripHostBytes", expected.as_slice())
             .unwrap();
 
-        assert_eq!(contiguous, expected);
+        assert_eq!(contiguous.concat(), expected);
 
         let input = vec![
             Bytes::copy_from_slice(&expected[..2047]),
@@ -545,13 +558,9 @@ fn host_external_bytes_round_trip() {
 
         for _ in 0..2 {
             let chunks: Vec<Bytes> = sandbox
-                .call("RoundTripHostByteChunks", input.clone())
+                .call("RoundTripHostByteChunks", input.as_slice())
                 .unwrap();
-            let flattened: Vec<u8> = chunks
-                .iter()
-                .flat_map(|chunk| chunk.iter().copied())
-                .collect();
-            assert_eq!(flattened, expected);
+            assert_eq!(chunks.concat(), expected);
         }
     });
 }
@@ -562,37 +571,34 @@ fn guest_external_bytes_round_trip_and_retention() {
         let mut sandbox = sandbox.evolve().unwrap();
         let expected: Vec<u8> = (0..9 * 1024).map(|index| (index % 251) as u8).collect();
 
-        let contiguous: Vec<u8> = sandbox.call("EchoGuestVecBytes", expected.clone()).unwrap();
-        assert_eq!(contiguous, expected);
+        let contiguous: Vec<Bytes> = sandbox
+            .call("EchoGuestByteChunks", expected.as_slice())
+            .unwrap();
+        assert_eq!(contiguous.concat(), expected);
 
         let input = vec![
             Bytes::copy_from_slice(&expected[..2047]),
             Bytes::copy_from_slice(&expected[2047..4097]),
             Bytes::copy_from_slice(&expected[4097..]),
         ];
-        let chunks: Vec<Bytes> = sandbox.call("EchoGuestByteChunks", input.clone()).unwrap();
-        assert_eq!(
-            chunks
-                .iter()
-                .flat_map(|chunk| chunk.iter().copied())
-                .collect::<Vec<_>>(),
-            expected
-        );
+        let chunks: Vec<Bytes> = sandbox
+            .call("EchoGuestByteChunks", input.as_slice())
+            .unwrap();
+        assert_eq!(chunks.concat(), expected);
 
         let retained: Vec<u8> = (0..12_000).map(|index| (index % 251) as u8).collect();
         let retained_len: i32 = sandbox
-            .call(
-                "RetainGuestByteChunks",
-                vec![Bytes::copy_from_slice(&retained)],
-            )
+            .call("RetainGuestByteChunks", retained.as_slice())
             .unwrap();
         assert_eq!(retained_len as usize, retained.len());
 
         let released_len: i32 = sandbox.call("ReleaseGuestByteChunks", ()).unwrap();
         assert_eq!(released_len as usize, retained.len());
 
-        let retried: Vec<u8> = sandbox.call("EchoGuestVecBytes", expected.clone()).unwrap();
-        assert_eq!(retried, expected);
+        let retried: Vec<Bytes> = sandbox
+            .call("EchoGuestByteChunks", expected.as_slice())
+            .unwrap();
+        assert_eq!(retried.concat(), expected);
     });
 }
 
@@ -606,14 +612,11 @@ fn h2g_capacity_failure_does_not_poison_sandbox() {
         let retained = vec![0u8; 12_000];
 
         sandbox
-            .call::<i32>(
-                "RetainGuestByteChunks",
-                vec![Bytes::copy_from_slice(&retained)],
-            )
+            .call::<i32>("RetainGuestByteChunks", retained.as_slice())
             .unwrap();
 
         let error = sandbox
-            .call::<Vec<u8>>("EchoGuestVecBytes", vec![0u8; 9 * 1024])
+            .call::<Vec<Bytes>>("EchoGuestByteChunks", &[0u8; 9 * 1024])
             .unwrap_err();
 
         assert!(error.to_string().contains("H2G capacity"));
@@ -635,15 +638,12 @@ fn retained_sub_page_h2g_slot_keeps_neighbors_available() {
 
         // Every H2G slot shares the retained slot's page.
         let retained: i32 = sandbox
-            .call(
-                "RetainGuestByteChunks",
-                vec![Bytes::copy_from_slice(&expected)],
-            )
+            .call("RetainGuestByteChunks", expected.as_slice())
             .unwrap();
         assert_eq!(retained as usize, expected.len());
 
         let snapshot = sandbox.snapshot().unwrap();
-        let echo: String = sandbox.call("Echo", "source".to_string()).unwrap();
+        let echo: String = sandbox.call("Echo", "source").unwrap();
         assert_eq!(echo, "source");
 
         let released: i32 = sandbox.call("ReleaseGuestByteChunks", ()).unwrap();
@@ -653,7 +653,7 @@ fn retained_sub_page_h2g_slot_keeps_neighbors_available() {
             sandbox.restore(snapshot.clone()).unwrap();
 
             // The host writes this request beside the retained slot before guest entry.
-            let echo: String = sandbox.call("Echo", "restored".to_string()).unwrap();
+            let echo: String = sandbox.call("Echo", "restored").unwrap();
             assert_eq!(echo, "restored");
 
             let actual: Vec<Bytes> = sandbox.call("ReadRetainedGuestByteChunks", ()).unwrap();
@@ -678,7 +678,7 @@ fn assert_g2h_reply_capacity_failure_is_recoverable(queue_size: usize, pool_page
         let calls = Arc::new(AtomicUsize::new(0));
         let host_calls = Arc::clone(&calls);
         sandbox
-            .register("HostEchoVecBytes", move |value: Vec<u8>| {
+            .register("HostEchoBytes", move |value: Vec<Bytes>| {
                 host_calls.fetch_add(1, Ordering::Relaxed);
                 value
             })
@@ -686,7 +686,7 @@ fn assert_g2h_reply_capacity_failure_is_recoverable(queue_size: usize, pool_page
         let mut sandbox = sandbox.evolve().unwrap();
 
         let error = sandbox
-            .call::<Vec<u8>>("RoundTripHostVecBytes", vec![0; 4096])
+            .call::<Vec<Bytes>>("RoundTripHostBytes", &[0u8; 4096])
             .unwrap_err();
 
         assert!(
@@ -696,11 +696,11 @@ fn assert_g2h_reply_capacity_failure_is_recoverable(queue_size: usize, pool_page
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
         let expected = vec![1u8; 32];
-        let result: Vec<u8> = sandbox
-            .call("RoundTripHostVecBytes", expected.clone())
+        let result: Vec<Bytes> = sandbox
+            .call("RoundTripHostBytes", expected.as_slice())
             .unwrap();
 
-        assert_eq!(result, expected);
+        assert_eq!(result.concat(), expected);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     });
 }
@@ -730,18 +730,18 @@ fn g2h_reply_capacity_retained_buffers_are_recoverable() {
             })
             .unwrap();
         sandbox
-            .register("HostEchoVecBytes", |value: Vec<u8>| value)
+            .register("HostEchoBytes", |value: Vec<Bytes>| value)
             .unwrap();
         sandbox.register("HostNoOp", || {}).unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
 
         let retained: i32 = sandbox
-            .call("RetainHostByteChunks", Vec::<Bytes>::new())
+            .call("RetainHostByteChunks", &[] as &[Bytes])
             .unwrap();
         assert_eq!(retained, 8);
 
         let error = sandbox
-            .call::<Vec<u8>>("RoundTripHostVecBytes", Vec::<u8>::new())
+            .call::<Vec<Bytes>>("RoundTripHostBytes", &[] as &[Bytes])
             .unwrap_err();
         assert!(
             matches!(&error, HyperlightError::GuestError(_, message) if message.contains("G2H call retry")),
@@ -753,10 +753,10 @@ fn g2h_reply_capacity_retained_buffers_are_recoverable() {
         assert_eq!(released, retained);
 
         let expected = vec![1u8; 32];
-        let result: Vec<u8> = sandbox
-            .call("RoundTripHostVecBytes", expected.clone())
+        let result: Vec<Bytes> = sandbox
+            .call("RoundTripHostBytes", expected.as_slice())
             .unwrap();
-        assert_eq!(result, expected);
+        assert_eq!(result.concat(), expected);
     });
 }
 
@@ -779,7 +779,7 @@ fn retained_g2h_reply_on_every_page_keeps_neighbors_available() {
         let mut sandbox = sandbox.evolve().unwrap();
 
         let retained: i32 = sandbox
-            .call("RetainHostByteChunks", Vec::<Bytes>::new())
+            .call("RetainHostByteChunks", &[] as &[Bytes])
             .unwrap();
         assert_eq!(retained, 6000);
 
@@ -809,16 +809,40 @@ fn g2h_reply_capacity_uses_available_upper_buffers() {
 
         // The request uses one descriptor. The response needs three upper-tier buffers.
         let expected = vec![1u8; 9 * 1024];
-        let host_result = expected.clone();
+        let host_result = vec![Bytes::from(expected.clone())];
         sandbox
-            .register("HostEchoVecBytes", move |_: Vec<u8>| host_result.clone())
+            .register("HostEchoBytes", move |_: Vec<Bytes>| host_result.clone())
             .unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
 
-        let result: Vec<u8> = sandbox
-            .call("RoundTripHostVecBytes", Vec::<u8>::new())
+        let result: Vec<Bytes> = sandbox
+            .call("RoundTripHostBytesCopied", &[] as &[Bytes])
             .unwrap();
-        assert_eq!(result, expected);
+        assert_eq!(result.concat(), expected);
+    });
+}
+
+/// A guest returning the host's reply without copying holds the reply's G2H
+/// slots while its result is sent, so the pool must fit both.
+#[test]
+fn g2h_forwarded_reply_needs_capacity_for_reply_and_result() {
+    let mut cfg = SandboxConfiguration::default();
+    cfg.set_g2h_buffer_size(4096);
+    cfg.set_g2h_queue_size(8);
+    cfg.set_g2h_pool_pages(8);
+
+    with_rust_uninit_sandbox_cfg(cfg, |mut sandbox| {
+        sandbox.set_max_guest_log_level(tracing_core::LevelFilter::OFF);
+
+        let expected = vec![1u8; 9 * 1024];
+        let host_result = vec![Bytes::from(expected.clone())];
+        sandbox
+            .register("HostEchoBytes", move |_: Vec<Bytes>| host_result.clone())
+            .unwrap();
+        let mut sandbox = sandbox.evolve().unwrap();
+
+        let result: Vec<Bytes> = sandbox.call("RoundTripHostBytes", &[] as &[Bytes]).unwrap();
+        assert_eq!(result.concat(), expected);
     });
 }
 
@@ -826,14 +850,16 @@ fn g2h_reply_capacity_uses_available_upper_buffers() {
 fn oversized_host_response_returns_transport_error() {
     with_rust_uninit_sandbox(|mut sandbox| {
         sandbox
-            .register("HostOversizedVecBytes", || vec![0u8; 64 * 1024])
+            .register("HostOversizedBytes", || {
+                vec![Bytes::from(vec![0u8; 64 * 1024])]
+            })
             .unwrap();
 
         sandbox.register("HostNoOp", || {}).unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
 
         let error = sandbox
-            .call::<Vec<u8>>("GetOversizedHostVecBytes", ())
+            .call::<Vec<Bytes>>("GetOversizedHostBytes", ())
             .unwrap_err();
 
         assert!(matches!(
@@ -918,9 +944,7 @@ fn host_function_error() {
         let snapshot = init_sandbox.snapshot().unwrap();
 
         for _ in 0..1000 {
-            let res = init_sandbox
-                .call::<i32>("GuestMethod1", msg.to_string())
-                .unwrap_err();
+            let res = init_sandbox.call::<i32>("GuestMethod1", msg).unwrap_err();
             assert!(
                 matches!(&res, HyperlightError::GuestError(_, msg) if msg == "Host function error!") // rust guest
                 || matches!(&res, HyperlightError::GuestAborted(_, msg) if msg.contains("Host function error!")), // c guest

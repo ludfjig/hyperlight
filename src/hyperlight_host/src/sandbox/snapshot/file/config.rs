@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ReturnType};
-use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
 use hyperlight_common::vmem::PAGE_SIZE;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +12,7 @@ use crate::hypervisor::regs::CommonSpecialRegisters;
 #[cfg(target_arch = "x86_64")]
 use crate::hypervisor::regs::MsrEntry;
 use crate::mem::layout::SandboxMemoryLayout;
+use crate::sandbox::host_funcs::HostFunctionDefinition;
 
 // --- Arch and hypervisor identifiers --------------------------------
 
@@ -264,7 +264,6 @@ enum ParameterTypeRepr {
     Double,
     String,
     Bool,
-    VecBytes,
     ByteChunks,
 }
 
@@ -282,7 +281,6 @@ enum ReturnTypeRepr {
     String,
     Bool,
     Void,
-    VecBytes,
     ByteChunks,
 }
 
@@ -297,7 +295,6 @@ impl From<&ParameterType> for ParameterTypeRepr {
             ParameterType::Double => Self::Double,
             ParameterType::String => Self::String,
             ParameterType::Bool => Self::Bool,
-            ParameterType::VecBytes => Self::VecBytes,
             ParameterType::ByteChunks => Self::ByteChunks,
         }
     }
@@ -314,7 +311,6 @@ impl From<ParameterTypeRepr> for ParameterType {
             ParameterTypeRepr::Double => Self::Double,
             ParameterTypeRepr::String => Self::String,
             ParameterTypeRepr::Bool => Self::Bool,
-            ParameterTypeRepr::VecBytes => Self::VecBytes,
             ParameterTypeRepr::ByteChunks => Self::ByteChunks,
         }
     }
@@ -332,7 +328,6 @@ impl From<&ReturnType> for ReturnTypeRepr {
             ReturnType::String => Self::String,
             ReturnType::Bool => Self::Bool,
             ReturnType::Void => Self::Void,
-            ReturnType::VecBytes => Self::VecBytes,
             ReturnType::ByteChunks => Self::ByteChunks,
         }
     }
@@ -350,7 +345,6 @@ impl From<ReturnTypeRepr> for ReturnType {
             ReturnTypeRepr::String => Self::String,
             ReturnTypeRepr::Bool => Self::Bool,
             ReturnTypeRepr::Void => Self::Void,
-            ReturnTypeRepr::VecBytes => Self::VecBytes,
             ReturnTypeRepr::ByteChunks => Self::ByteChunks,
         }
     }
@@ -358,14 +352,13 @@ impl From<ReturnTypeRepr> for ReturnType {
 
 impl From<&HostFunctionDefinition> for HostFunction {
     fn from(d: &HostFunctionDefinition) -> Self {
-        let parameter_types = d
-            .parameter_types
-            .as_ref()
-            .map(|v| v.iter().map(ParameterTypeRepr::from).collect())
-            .unwrap_or_default();
         Self {
             function_name: d.function_name.clone(),
-            parameter_types,
+            parameter_types: d
+                .parameter_types
+                .iter()
+                .map(ParameterTypeRepr::from)
+                .collect(),
             return_type: ReturnTypeRepr::from(&d.return_type),
         }
     }
@@ -375,7 +368,7 @@ impl From<HostFunction> for HostFunctionDefinition {
     fn from(r: HostFunction) -> Self {
         Self {
             function_name: r.function_name,
-            parameter_types: Some(r.parameter_types.into_iter().map(Into::into).collect()),
+            parameter_types: r.parameter_types.into_iter().map(Into::into).collect(),
             return_type: r.return_type.into(),
         }
     }
@@ -766,7 +759,6 @@ mod tests {
             ParameterType::Double,
             ParameterType::String,
             ParameterType::Bool,
-            ParameterType::VecBytes,
             ParameterType::ByteChunks,
         ];
         for p in variants {
@@ -789,7 +781,6 @@ mod tests {
             ReturnType::String,
             ReturnType::Bool,
             ReturnType::Void,
-            ReturnType::VecBytes,
             ReturnType::ByteChunks,
         ];
         for r in variants {

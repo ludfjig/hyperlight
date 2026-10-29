@@ -2,8 +2,6 @@
 // Copyright 2025 The Hyperlight Authors.
 
 use alloc::format;
-use alloc::string::ToString;
-use alloc::vec::Vec;
 
 use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
 use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
@@ -29,9 +27,18 @@ impl log::Log for GuestLogger {
     }
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
+            let args = record.args();
+            let formatted;
+            let message = match args.as_str() {
+                Some(message) => message,
+                None => {
+                    formatted = format!("{args}");
+                    formatted.as_str()
+                }
+            };
             log_message(
                 record.level().into(),
-                format!("{}", record.args()).as_str(),
+                message,
                 record.module_path().unwrap_or("Unknown"),
                 record.target(),
                 record.file().unwrap_or("Unknown"),
@@ -52,20 +59,17 @@ pub fn log_message(
     line: u32,
 ) {
     let _send_to_host = || {
-        let log = GuestLogData::new(
-            message.to_string(),
-            module_path.to_string(),
+        let log = GuestLogData {
+            message,
+            source: module_path,
             level,
-            target.to_string(),
-            file.to_string(),
+            caller: target,
+            source_file: file,
             line,
-        );
-        let bytes: Vec<u8> = log
-            .try_into()
-            .expect("Failed to convert GuestLogData to bytes");
+        };
 
         transport::with_ctx(|ctx| {
-            ctx.emit_log(&bytes)
+            ctx.emit_log(&log)
                 .expect("Unable to send log data via virtq");
         });
     };

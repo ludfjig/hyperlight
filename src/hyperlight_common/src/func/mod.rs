@@ -23,16 +23,20 @@ pub(crate) mod ret_type;
 pub use error::Error;
 /// Re-export for `HostFunction` trait
 pub use functions::Function;
-pub use param_type::{ParameterTuple, SupportedParameterType};
+pub use param_type::{AsParameter, AsParameters, ParameterTuple, SupportedParameterType};
 pub use ret_type::{ResultType, SupportedReturnType};
 
-/// Re-export for chunk-preserving byte values
+/// Re-export for byte values
 pub use crate::flatbuffer_wrappers::function_types::Bytes;
 /// Re-export for `ParameterValue` enum
 pub use crate::flatbuffer_wrappers::function_types::ParameterValue;
+/// Re-export for `ParameterValueRef` enum
+pub use crate::flatbuffer_wrappers::function_types::ParameterValueRef;
 /// Re-export for `ReturnType` enum
 pub use crate::flatbuffer_wrappers::function_types::ReturnType;
 /// Re-export for `ReturnType` enum
 pub use crate::flatbuffer_wrappers::function_types::ReturnValue;
+/// Re-export for decoded call parameters
+pub use crate::flatbuffer_wrappers::function_types::{Parameters, smallvec};
 
 mod utils;

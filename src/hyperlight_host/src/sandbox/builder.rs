@@ -59,7 +59,7 @@ impl Source {
 ///     .host_function("Add", |a: i32, b: i32| a + b)
 ///     .build()?;
 ///
-/// let result: String = sandbox.call("Echo", "hello".to_string())?;
+/// let result: String = sandbox.call("Echo", "hello")?;
 /// # Ok(())
 /// # }
 /// ```
@@ -80,7 +80,7 @@ impl Source {
 ///     .host_function("Add", |a: i32, b: i32| a + b)
 ///     .build()?;
 ///
-/// let result: String = restored.call("Echo", "hello".to_string())?;
+/// let result: String = restored.call("Echo", "hello")?;
 /// # Ok(())
 /// # }
 /// ```
@@ -499,7 +499,7 @@ mod tests {
         let path = simple_guest_as_string().unwrap();
         let mut sandbox = SandboxBuilder::from_file(path).build().unwrap();
 
-        let result = sandbox.call::<String>("Echo", "hello".to_string()).unwrap();
+        let result = sandbox.call::<String>("Echo", "hello").unwrap();
         assert_eq!(result, "hello");
     }
 
@@ -508,7 +508,7 @@ mod tests {
         let bytes = std::fs::read(simple_guest_as_string().unwrap()).unwrap();
         let mut sandbox = SandboxBuilder::from_bytes(bytes).build().unwrap();
 
-        let result = sandbox.call::<String>("Echo", "hello".to_string()).unwrap();
+        let result = sandbox.call::<String>("Echo", "hello").unwrap();
         assert_eq!(result, "hello");
     }
 
@@ -520,9 +520,7 @@ mod tests {
 
         let mut restored = SandboxBuilder::from_snapshot(snapshot).build().unwrap();
 
-        let result = restored
-            .call::<String>("Echo", "hello".to_string())
-            .unwrap();
+        let result = restored.call::<String>("Echo", "hello").unwrap();
         assert_eq!(result, "hello");
     }
 

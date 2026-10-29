@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-use alloc::vec::Vec;
 use core::fmt;
+use core::mem::MaybeUninit;
 
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -123,6 +123,49 @@ impl<M: MemOps> RecvChain<M> {
         Ok(self)
     }
 
+    /// Read exactly `buf.len()` bytes into possibly uninitialized memory.
+    ///
+    /// Every byte of `buf` is initialized on `Ok`. On error, the cursor may
+    /// have advanced and `buf` may be partly written.
+    pub fn read_exact_uninit(
+        &mut self,
+        buf: &mut [MaybeUninit<u8>],
+    ) -> Result<&mut Self, VirtqError> {
+        if buf.len() > self.remaining() {
+            return Err(VirtqError::ReceiveTooShort {
+                requested: buf.len(),
+                remaining: self.remaining(),
+            });
+        }
+
+        let mut dst = buf;
+        while !dst.is_empty() {
+            let Some(elem) = self.state.current_elem() else {
+                return Err(VirtqError::MemoryReadError);
+            };
+
+            let desc_len = elem.len as usize;
+            let desc_offset = self.state.desc_offset();
+            let len = (desc_len - desc_offset).min(dst.len());
+            let (current, rest) = dst.split_at_mut(len);
+
+            let addr = elem
+                .addr
+                .checked_add(desc_offset as u64)
+                .ok_or(VirtqError::MemoryReadError)?;
+
+            self.state
+                .mem
+                .read_uninit(addr, current)
+                .map_err(|_| VirtqError::MemoryReadError)?;
+
+            self.state.advance(len);
+            dst = rest;
+        }
+
+        Ok(self)
+    }
+
     /// Copy the complete payload into descriptor-preserving owned segments.
     ///
     /// This does not change the stateful read position. Each call takes a new
@@ -202,7 +245,9 @@ pub enum ReplyChain<M: MemOps> {
 pub type PolledChain<M> = (RecvChain<M>, ReplyChain<M>);
 
 /// An exact batch returned by [`VirtqConsumer::poll_batch`].
-pub type PolledChains<M> = Vec<PolledChain<M>>;
+///
+/// Requests commonly need one or two chains, which fit inline.
+pub type PolledChains<M> = SmallVec<[PolledChain<M>; 2]>;
 
 impl<M: MemOps> ReplyChain<M> {
     /// The token identifying this reply.
@@ -1008,15 +1053,14 @@ mod tests {
 
         let mut consumer = VirtqConsumer::new(ring.layout(), mem.clone(), TestNotifier::new());
         let (mut recv, reply) = poll_data(&mut consumer);
-        let contiguous = recv.take_bytes(3).unwrap();
-        let chunks = recv.take_chunks(5).unwrap();
+        let first = recv.take_chunks(3).unwrap();
+        let second = recv.take_chunks(5).unwrap();
         recv.finish().unwrap();
 
         mem.write(payload_addr, b"xxxxxxxx").unwrap();
 
-        assert_eq!(contiguous, b"abc");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].as_ref(), b"defgh");
+        assert_eq!(first, [Bytes::from_static(b"abc")]);
+        assert_eq!(second, [Bytes::from_static(b"defgh")]);
         consumer.complete(recv, reply).unwrap();
     }
 
@@ -1029,24 +1073,19 @@ mod tests {
         producer.submit(chain).unwrap();
 
         let (mut recv, reply) = poll_data(&mut consumer);
-        for error in [
-            recv.take_bytes(usize::MAX).unwrap_err(),
-            recv.take_chunks(usize::MAX).unwrap_err(),
-        ] {
-            assert!(matches!(
-                error.downcast_ref::<VirtqError>(),
-                Some(VirtqError::ReceiveTooShort {
-                    requested: usize::MAX,
-                    remaining: 4,
-                })
-            ));
-        }
+        let error = recv.take_chunks(usize::MAX).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<VirtqError>(),
+            Some(VirtqError::ReceiveTooShort {
+                requested: usize::MAX,
+                remaining: 4,
+            })
+        ));
 
-        assert!(recv.take_bytes(0).unwrap().is_empty());
         assert!(recv.take_chunks(0).unwrap().is_empty());
         assert_eq!(recv.remaining(), 4);
         assert!(recv.finish().is_err());
-        assert_eq!(recv.take_bytes(4).unwrap(), b"data");
+        assert_eq!(recv.take_chunks(4).unwrap(), [Bytes::from_static(b"data")]);
         recv.finish().unwrap();
 
         consumer.complete(recv, reply).unwrap();
