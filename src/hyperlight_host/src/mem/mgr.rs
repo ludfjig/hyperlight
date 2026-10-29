@@ -404,7 +404,7 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
 
         if matches!(host_mgr.next_action, NextAction::Initialise(_)) {
             let cp = MailboxValue::CheckpointPending.as_bytes();
-            let mbx = host_mgr.layout.get_transport_arena().mbx_offset();
+            let mbx = host_mgr.layout.mbx_scratch_offset();
 
             host_mgr.scratch_mem.copy_from_slice(cp, mbx)?;
             host_mgr.create_virtq_consumers()?;
@@ -426,6 +426,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
         #[cfg(target_arch = "x86_64")] msrs: Vec<crate::hypervisor::regs::MsrEntry>,
         next_action: NextAction,
         host_functions: HostFunctionDetails,
+        scratch_size: usize,
     ) -> Result<Snapshot> {
         let virtq = match (&self.g2h_consumer, &self.h2g_consumer) {
             (Some(_), Some(_)) => Some(VirtqSnapshot::capture(&self.layout, &self.scratch_mem)?),
@@ -449,6 +450,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
             self.snapshot_count + 1,
             host_functions,
             virtq,
+            scratch_size,
         )?;
         self.snapshot_count = snapshot.snapshot_generation();
         Ok(snapshot)
@@ -651,7 +653,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
     ///
     /// The pending marker distinguishes a completed checkpoint from an early halt.
     pub(crate) fn begin_snapshot_checkpoint(&mut self) -> Result<()> {
-        let offset = self.layout.get_transport_arena().mbx_offset();
+        let offset = self.layout.mbx_scratch_offset();
         let cp = MailboxValue::CheckpointPending.as_bytes();
         self.scratch_mem.copy_from_slice(cp, offset)?;
 
@@ -674,7 +676,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
 
         let status = self
             .scratch_mem
-            .read::<u64>(self.layout.get_transport_arena().mbx_offset())
+            .read::<u64>(self.layout.mbx_scratch_offset())
             .map_err(|error| HyperlightError::TransportError(error.to_string()))?;
 
         match MailboxValue::try_from(status) {
@@ -757,7 +759,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
         } else if matches!(snapshot.next_action(), NextAction::Initialise(_)) {
             self.scratch_mem.copy_from_slice(
                 MailboxValue::CheckpointPending.as_bytes(),
-                self.layout.get_transport_arena().mbx_offset(),
+                self.layout.mbx_scratch_offset(),
             )?;
             self.create_virtq_consumers()?;
         }
@@ -1219,7 +1221,7 @@ mod tests {
         let mut mgr = manager(&case);
         let buffer = case.h2g_desc(0).addr;
 
-        let mbx = mgr.layout.get_transport_arena().mbx_offset();
+        let mbx = mgr.layout.mbx_scratch_offset();
         let cp = MailboxValue::CheckpointComplete.as_bytes();
 
         mgr.scratch_mem.copy_from_slice(cp, mbx).unwrap();
@@ -1259,7 +1261,7 @@ mod tests {
         let mut mgr = manager(&case);
         mgr.g2h_consumer = Some(case.g2h_consumer());
         mgr.begin_snapshot_checkpoint().unwrap();
-        let mbx = mgr.layout.get_transport_arena().mbx_offset();
+        let mbx = mgr.layout.mbx_scratch_offset();
         mgr.scratch_mem
             .copy_from_slice(MailboxValue::CheckpointComplete.as_bytes(), mbx)
             .unwrap();
@@ -1276,7 +1278,7 @@ mod tests {
             let queue = TestCase::new();
             let mut mgr = manager(&queue);
             mgr.g2h_consumer = Some(queue.g2h_consumer());
-            let mbx = mgr.layout.get_transport_arena().mbx_offset();
+            let mbx = mgr.layout.mbx_scratch_offset();
             mgr.scratch_mem.write::<u64>(mbx, status).unwrap();
             let error = mgr.finish_snapshot_checkpoint().unwrap_err();
 
